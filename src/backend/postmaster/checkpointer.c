@@ -795,6 +795,14 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 
 /*
  * Process any new interrupts.
+ *
+ * 【中文总述】
+ * checkpointer 的主中断处理函数，统一处理三类事件：
+ *   1. ProcSignalBarrierPending → ProcessProcSignalBarrier()（进程屏障同步）
+ *   2. ConfigReloadPending → 重载 postgresql.conf 并同步 GUC 到共享内存
+ *   3. LogMemoryContextPending → 输出本进程内存上下文统计
+ * 【调用链】CheckpointerMain() 主循环每轮开头调用此函数；
+ *   ProcessProcSignalBarrier() → 阻塞所有信号 → 执行待处理的屏障回调
  */
 static void
 ProcessCheckpointerInterrupts(void)
@@ -837,6 +845,18 @@ ProcessCheckpointerInterrupts(void)
  * configuration, occur on regular intervals and don't contain important
  * information.  This avoids generating archives with a few unimportant
  * records.
+ *
+ * 【中文总述】
+ * 检查 archive_timeout 是否到期，到期则强制切换 WAL 段并触发归档。
+ * 切换条件：
+ *   1. archive_timeout > 0 且不在恢复模式中
+ *   2. 自上次切换以来的时间 >= XLogArchiveTimeout
+ *   3. 期间写入了"重要"WAL 记录（XLOG_MARK_UNIMPORTANT 标记的跳过，
+ *      如快照等不重要的记录）
+ * 切换后更新 last_xlog_switch_time，避免在系统空闲时反复触发。
+ * 【调用链】CheckpointerMain() 主循环 → CheckArchiveTimeout() →
+ *   RequestXLogSwitch() → XLogSwitch() → 写 CHECKPOINT/FULL_PAGE_WRITE 等
+ *   记录 → 触发归档进程 pgarch 归档
  */
 static void
 CheckArchiveTimeout(void)
@@ -898,6 +918,14 @@ CheckArchiveTimeout(void)
  * Returns true if a fast checkpoint request is pending.  (Note that this does
  * not check the *current* checkpoint's FAST flag, but whether there is one
  * pending behind it.)
+ *
+ * 【中文】检查是否有"快速检查点"请求挂起。
+ * 注意：这里查的是 ckpt_flags 中 CHECKPOINT_FAST 标志是否被置位，
+ * 即是否有后端请求了快速检查点（不按 checkpoint_completion_target 节流，
+ * 立即开始刷脏页），而不是查当前正在执行的检查点本身是否是快速模式。
+ * 【调用链】CheckpointerMain() 主循环 → FastCheckpointRequested()
+ *   → 读取 CheckpointerShmem->ckpt_flags & CHECKPOINT_FAST
+ *   → 不需要加 ckpt_lck 锁（只查单标志位，天然原子）
  */
 static bool
 FastCheckpointRequested(void)
@@ -995,6 +1023,20 @@ CheckpointWriteDelay(int flags, double progress)
  * Compares the current progress against the time/segments elapsed since last
  * checkpoint, and returns true if the progress we've made this far is greater
  * than the elapsed time/segments.
+ *
+ * 【中文总述】
+ * 判断当前 checkpoint 的刷脏页进度是否"跟得上"预定的时间表。
+ * 原理：将 checkpoint_completion_target（默认 0.9）乘到进度上，
+ * 然后同时对比"已写入的 WAL 段数比例"和"已过去的时间比例"，
+ * 只有两者都达标才认为在计划内（任一个落后就返回 false，
+ * 触发 CheckpointWriteDelay 节流等待）。
+ * 恢复模式下用重放位点（GetXLogReplayRecPtr）代替插入位点，
+ * 与正常 checkpoint 的进度口径保持一致。
+ * 【调用链】CheckpointWriteDelay() → IsCheckpointOnSchedule()
+ *   → GetInsertRecPtr() / GetXLogReplayRecPtr() 取当前 WAL 位点
+ *   → 与 ckpt_start_recptr 算出已写入段数比例
+ *   → 与 ckpt_start_time 算出已过去时间比例
+ *   → 两者都 ≥ progress × CheckPointCompletionTarget 则返回 true
  */
 static bool
 IsCheckpointOnSchedule(double progress)
@@ -1075,6 +1117,13 @@ IsCheckpointOnSchedule(double progress)
  */
 
 /* SIGINT: set flag to trigger writing of shutdown checkpoint */
+/* 【中文】SIGINT 信号处理函数：将 ShutdownXLOGPending 置位，
+ * 通知 CheckpointerMain() 主循环在下一轮执行关闭检查点。
+ * 正常关闭流程：postmaster 先停所有后端 → 发 SIGINT 给 checkpointer
+ * → checkpointer 写关闭检查点（记录关闭时的 WAL 位点）→ 再发 SIGUSR2 退出。
+ * 【调用链】CheckpointerMain() 主循环检测到 ShutdownXLOGPending 后
+ *   → CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN) 写关闭检查点
+ *   → 通知 postmaster 关闭完成 */
 static void
 ReqShutdownXLOG(SIGNAL_ARGS)
 {
@@ -1131,6 +1180,18 @@ CheckpointerShmemInit(void *arg)
  *		Primary entry point for manual CHECKPOINT commands
  *
  * This is mainly a wrapper for RequestCheckpoint().
+ *
+ * 【中文总述】
+ * SQL 命令 CHECKPOINT 的入口函数。解析命令选项（mode=fast/spread、
+ * flush_unlogged），权限校验后调用 RequestCheckpoint()。
+ * 选项含义：
+ *   - mode=fast：立即执行，不按 checkpoint_completion_target 节流
+ *   - mode=spread：按 checkpoint_completion_target 节流刷脏页（默认）
+ *   - flush_unlogged：对未日志化（UNLOGGED）表也强制刷盘
+ *   - 非恢复模式下自动加 CHECKPOINT_FORCE 标志
+ * 【调用链】SQL 解析器 → ExecCheckpoint() → RequestCheckpoint()
+ *   → 设置共享内存 ckpt_flags + 信号唤醒 checkpointer
+ *   → checkpointer 执行 CreateCheckPoint() → 刷脏页 + 写 WAL + 更新 pg_control
  */
 void
 ExecCheckpoint(ParseState *pstate, CheckPointStmt *stmt)
