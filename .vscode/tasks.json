@@ -1,0 +1,183 @@
+{
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "install_depends",     // 1、apt 安装编译所需依赖
+            "command": "apt-get update && sudo apt install -y gcc libsystemd-dev libxml2-dev libssl-dev libicu-dev zlib1g-dev libreadline-dev pkg-config bison flex gdb lldb python3 python2 python3-lldb-14", // 新增了gcc bison flex gdb lldb python 依赖
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Task install depends."
+        },
+        {
+            "type": "shell",
+            "label": "build_env",           // 建立build和数据库数据存放目录
+            "command": "sudo",
+            "args": [
+                "bash", "-c",
+                "mkdir -p ${workspaceFolder}/build && mkdir -p ${workspaceFolder}/build/data && chown -R postgres:postgres /home/postgres"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Task add folders."
+        },
+        {
+            "type": "shell",
+            "label": "build_config",        // 生成构建配置，以 debug 模式构建
+            "command": "../configure",
+            "args": [
+                "--prefix=${workspaceFolder}/build",
+                "--with-icu",
+                "--with-openssl",
+                "--with-systemd",
+                "--with-libxml",
+                "--enable-debug",
+                "--enable-cassert",
+                "--enable-depend",
+                "CFLAGS= -ggdb -O0 -g3 -Wall  -fno-omit-frame-pointer" // 新增 g3 参数，支持调试器
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build"
+            },
+            "detail": "Task Build MakeFile."
+        },
+        {
+            "type": "shell",
+            "label": "make",
+            "command": "make",
+            "args": [
+                "-j12"                      // 使用12核构建、主机性能不足时会造成卡顿
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build"
+            },
+            "detail": "Task build."
+        },
+        {
+            "type": "shell",
+            "label": "make_install",        // 安装数据库， make install
+            "command": "make",
+            "args": [
+                "install"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build"
+            },
+            "detail": "Task install database."
+        },
+        // {
+        //     "label": "setup_postgres_user", // 为 PG 新建一个用户，名为 postgres，赋予该用户 数据目录 的权限
+        //     "type": "shell",
+        //     "command": "sudo",
+        //     "args": [
+        //         "bash", "-c",
+        //         "if ! id postgres &>/dev/null; then sudo useradd -m -s /bin/bash postgres && sudo chown -R postgres:postgres build/pgsql/data && sudo chmod -R 700 build/pgsql/data; else sudo chown -R postgres:postgres build/pgsql/data && sudo chmod -R 777 build/pgsql/data; fi"
+        //     ],
+        //     "detail": "Create the postgres user and set up the necessary directories"
+        // },
+        {
+            "label": "init_db",             // 初始化 PG db 到当前目录的 pgsql/data 文件夹下
+            "type": "shell",
+            "command": "sudo",
+            "args": [
+                "-u", "postgres",           // 指定以 postgres 用户执行，如果你已经有其它用户，可以直接将 postgres 替换为你的用户，以避免权限问题。如果修改了，还需要同步修改 setup_postgres_user 任务中的 postgres
+                "build/bin/initdb",
+                "-D", "build/data"
+            ],
+            // "dependsOn": "setup_postgres_user",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Initialize PostgreSQL database with initdb"
+        },
+        {
+            "type": "shell",
+            "label": "clean_db",            // 5、卸载现在安装的本数据库，然后删除所有相关文件
+            "command": "make uninstall && make clean && rm -rf ../pgsql && rm -rf ../build",
+            "options": {
+                "cwd": "${workspaceFolder}/build"
+            },
+            "detail": "Task clean database."
+        },
+        {
+            "type": "shell",
+            "label": "build_db_conf",       // 2、构建DB配置，包含了 build_env 和 build_config 两个子任务
+            "dependsOn": [
+                "build_env",
+                "build_config"
+            ],
+            "dependsOrder": "sequence",
+            "detail": "Task add folders."
+        },
+        {
+            "type": "shell",
+            "label": "build_db",            // 3、构建数据库，包含了 编译、安装、初始化、配置监听端口、配饰系统环境变量、启动数据库主程序 子任务
+            "dependsOn": [
+                "make",
+                "make_install",
+                "init_db",
+                "config_listen_port",
+                "add_env_to_postgres",
+                "start_or_restart_pg"
+            ],
+            "dependsOrder": "sequence",
+            "detail": "Main task, build and start pg main program."
+        },
+        {
+            "type": "shell",
+            "label": "rebuild_db",          // 4、重新构建数据库并重启
+            "dependsOn": [
+                "make",
+                "make_install",
+                "start_or_restart_pg"
+            ],
+            "dependsOrder": "sequence",
+            "detail": "Task add folders."
+        },
+
+        {
+            "label": "switch_to_postgres",
+            "type": "shell",
+            "command": "sudo -u postgres bash -c 'echo Switched to postgres user.'",
+            "problemMatcher": []
+        },
+        {
+            "type": "shell",
+            "label": "config_listen_port",            // 配置数据库监听端口为5432，配置并重启后生效，可以直接使用 psql 作为客户端程序连接数据库
+            "command": "echo -e '\n# start listening ,config by dingning\nlisten_addresses = 'localhost'\nport = 5432' | sudo tee -a postgresql.conf",
+            "options": {
+                "cwd": "${workspaceFolder}/build/data"
+            },
+            "detail": "Task config pg's listening port in data/postgresql.conf."
+        },
+        {
+            "type": "shell",                          // export postgres 用户的环境变量，使其可以直接使用 psql 而不是 /pgsql/bin.psql 连接数据库
+            "label": "export_sys_env",
+            "command": "sudo -u postgres sh -c 'export PATH=${workspaceFolder}/build/bin && export PGHOST=127.0.0.1 && export PGPORT=5432 && export LD_LIBRARY_PATH=${workspaceFolder}/build/lib'",
+            "options": {
+                "cwd": "${workspaceFolder}/build/data"
+            },
+            "detail": "Task config pg's system environment variable."
+        },
+        {
+            "type": "shell",
+            "label": "add_env_to_postgres",          // 添加环境变量到 postgres 用户的启动脚本
+            "command": "sudo -u postgres bash -c \"echo -e '\\n# PostgreSQL environment variables\\nexport PATH=${workspaceFolder}/build/bin\\nexport PGHOST=127.0.0.1\\nexport PGPORT=5432\\nexport LD_LIBRARY_PATH=${workspaceFolder}/build/lib\\nexport PGHOME=${workspaceFolder}/build\\nexport PGDATA=${workspaceFolder}/build/data' >> ~/.bashrc && source ~/.bashrc\"",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Add PostgreSQL environment variables to the postgres user's .bashrc file."
+        },
+        {
+            "type": "shell",
+            "label": "start_or_restart_pg",          // 启动 pg，日志文件写入 ${workspaceFolder}/pgsql/data/postmaster.log, 如果已经启动则重启
+            "command": "sudo -u postgres sh -c 'build/bin/pg_ctl -D build/data -l ${workspaceFolder}/build/data/postmaster.log status > /dev/null 2>&1 && build/bin/pg_ctl -D build/data -l ${workspaceFolder}/build/data/postmaster.log restart || build/bin/pg_ctl -D build/data -l ${workspaceFolder}/build/data/postmaster.log start'",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Start pg, if pg has been started, restart it."
+        }
+    ],
+    "version": "2.0.0"
+}

@@ -1,0 +1,1 @@
+/home/postgres/Learn-PG/src/test/locale/koi8-to-win1251/Makefile

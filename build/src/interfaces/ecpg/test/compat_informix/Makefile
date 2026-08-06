@@ -1,0 +1,1 @@
+/home/postgres/Learn-PG/src/interfaces/ecpg/test/compat_informix/Makefile

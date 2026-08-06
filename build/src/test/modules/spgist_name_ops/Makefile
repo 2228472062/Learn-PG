@@ -1,0 +1,1 @@
+/home/postgres/Learn-PG/src/test/modules/spgist_name_ops/Makefile

@@ -1,0 +1,1 @@
+/home/postgres/Learn-PG/src/test/modules/test_dsm_registry/Makefile

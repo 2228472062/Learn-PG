@@ -1,0 +1,1 @@
+/home/postgres/Learn-PG/build/../src/interfaces/ecpg/ecpglib/typename.c
