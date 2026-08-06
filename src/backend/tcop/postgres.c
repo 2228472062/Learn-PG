@@ -1026,6 +1026,26 @@ pg_plan_queries(List *querytrees, const char *query_string, int cursorOptions,
  *
  * Execute a "simple Query" protocol message.
  */
+/*
+ * exec_simple_query -- 简单查询协议（Q 消息）的执行入口
+ *
+ * 【中文总述】
+ * 客户端一条 Q 消息 = 一串 SQL（可用分号分隔多条）。
+ * 本函数处理流程：
+ *   1. 启动事务命令（start_xact_command），丢弃旧的无名预备语句
+ *   2. pg_parse_query() 词法/语法分析 → 原始语法树列表（RawStmt*）
+ *   3. 对每一条原始语句循环执行（多条语句共享一个事务，
+ *      除非中间夹着 BEGIN/COMMIT——这就是"隐式事务块"）：
+ *      a. 分析+重写：pg_analyze_and_rewrite_fixedparams()
+ *         （绑定视图/规则展开、权限检查、常量折叠等）
+ *      b. 生成计划：pg_plan_queries()（优化器）
+ *      c. 创建无名 Portal（portal = 可执行的查询实例）
+ *      d. PortalStart + PortalRun 真正执行（执行器）
+ *      e. 向客户端发送 CommandComplete，消息间 CommandCounterIncrement
+ *   4. 结束时发送 ReadyForQuery（由 PostgresMain 发）
+ * 注意：Q 消息包含多条语句时，用"隐式事务块"保证要么整体成功
+ * 要么整体回滚（除非显式写了 COMMIT）。
+ */
 static void
 exec_simple_query(const char *query_string)
 {
@@ -1060,6 +1080,8 @@ exec_simple_query(const char *query_string)
 	 * BEGIN/COMMIT/ABORT statement; we have to force a new xact command after
 	 * one of those, else bad things will happen in xact.c. (Note that this
 	 * will normally change current memory context.)
+	 *
+	 * 【中文】启动一个事务命令（若是隐式事务，这里建立底层 xact）。
 	 */
 	start_xact_command();
 
@@ -1068,6 +1090,9 @@ exec_simple_query(const char *query_string)
 	 * it seems best to define simple-Query mode as if it used the unnamed
 	 * statement and portal; this ensures we recover any storage used by prior
 	 * unnamed operations.)
+	 *
+	 * 【中文】丢弃之前遗留的无名预备语句/门户（简单查询模式
+	 * 统一使用无名语句，保证每次 Q 都是全新的）。
 	 */
 	drop_unnamed_stmt();
 
@@ -1079,6 +1104,9 @@ exec_simple_query(const char *query_string)
 	/*
 	 * Do basic parsing of the query or queries (this should be safe even if
 	 * we are in aborted transaction state!)
+	 * 【中文】词法/语法分析：SQL 文本 → 原始语法树列表。
+	 * 此阶段只做语法层面检查，不访问数据库，
+	 * 因此即使处于已中止事务中也是安全的。
 	 */
 	parsetree_list = pg_parse_query(query_string);
 
@@ -1110,11 +1138,15 @@ exec_simple_query(const char *query_string)
 	 * portions of the list be separate transactions.  To represent this
 	 * behavior properly in the transaction machinery, we use an "implicit"
 	 * transaction block.
+	 *
+	 * 【中文】多条 SQL 在同一 Q 消息里时，用"隐式事务块"把它们
+	 * 包成一个事务（除非里面显式写了 BEGIN/COMMIT 拆开）。
 	 */
 	use_implicit_block = (list_length(parsetree_list) > 1);
 
 	/*
 	 * Run through the raw parsetree(s) and process each one.
+	 * 【中文】对每条语句循环执行（一条消息可含多条 SQL）。
 	 */
 	foreach(parsetree_item, parsetree_list)
 	{
@@ -1154,6 +1186,9 @@ exec_simple_query(const char *query_string)
 		 * try to do database accesses, which may fail in abort state. (It
 		 * might be safe to allow some additional utility commands in this
 		 * state, but not many...)
+		 *
+		 * 【中文】事务块已中止时，只放行 COMMIT/ROLLBACK，
+		 * 其他命令报 "current transaction is aborted"。
 		 */
 		if (IsAbortedTransactionBlockState() &&
 			!IsTransactionExitStmt(parsetree->stmt))
@@ -1198,6 +1233,12 @@ exec_simple_query(const char *query_string)
 		 * last (or only) parsetree, just use MessageContext, which will be
 		 * reset shortly after completion anyway.  In event of an error, the
 		 * per_parsetree_context will be deleted when MessageContext is reset.
+		 *
+		 * 【中文】分析+重写+规划，这是"优化"阶段：
+		 *  - pg_analyze_and_rewrite_fixedparams()：语义分析（类型检查、
+		 *    权限检查、视图/规则展开、常量折叠）
+		 *  - pg_plan_queries()：生成执行计划（含并行计划）
+		 * 多条语句时为每条建独立内存上下文，用后即释放。
 		 */
 		if (lnext(parsetree_list, parsetree_item) != NULL)
 		{
@@ -1235,6 +1276,11 @@ exec_simple_query(const char *query_string)
 		/*
 		 * Create unnamed portal to run the query or queries in. If there
 		 * already is one, silently drop it.
+		 *
+		 * 【中文】创建无名 Portal 并执行：
+		 *  Portal 是"已准备好、可以执行"的查询实例；
+		 *  PortalStart 初始化执行状态，PortalRun 真正驱动执行器
+		 *  跑完整个计划（含输出结果到客户端）。
 		 */
 		portal = CreatePortal("", true, true);
 		/* Don't display the portal in pg_cursors */
@@ -1293,6 +1339,9 @@ exec_simple_query(const char *query_string)
 
 		/*
 		 * Run the portal to completion, and then drop it (and the receiver).
+		 * 【中文】执行！PortalRun 驱动执行器运行计划
+		 * （SELECT 结果通过 receiver 送往客户端），
+		 * 完成后销毁 Portal 与结果接收器。
 		 */
 		(void) PortalRun(portal,
 						 FETCH_ALL,
@@ -1315,6 +1364,10 @@ exec_simple_query(const char *query_string)
 			 * clients who will expect either a command-complete message or an
 			 * error, not one and then the other.  Also, if we're using an
 			 * implicit transaction block, we must close that out first.
+			 *
+			 * 【中文】最后一条语句：先收尾事务命令再发送
+			 * CommandComplete——保证"要么成功要么报错"的次序
+			 * 不会让客户端困惑。
 			 */
 			if (use_implicit_block)
 				EndImplicitTransactionBlock();
@@ -1325,6 +1378,8 @@ exec_simple_query(const char *query_string)
 			/*
 			 * If this was a transaction control statement, commit it. We will
 			 * start a new xact command for the next command.
+			 * 【中文】遇到 BEGIN/COMMIT 等事务控制语句时，
+			 * 结束当前事务命令，下一条语句另起新事务。
 			 */
 			finish_xact_command();
 		}
@@ -1356,6 +1411,9 @@ exec_simple_query(const char *query_string)
 		 * one EndCommand report for each raw parsetree, thus one for each SQL
 		 * command the client sent, regardless of rewriting. (But a command
 		 * aborted by error will not send an EndCommand report at all.)
+		 *
+		 * 【中文】向客户端发送 CommandComplete（如 "SELECT 3"、
+		 * "INSERT 0 1"）——每条 SQL 一个，无论重写展开成多少条。
 		 */
 		EndCommand(&qc, dest, false);
 
@@ -1373,6 +1431,7 @@ exec_simple_query(const char *query_string)
 
 	/*
 	 * If there were no parsetrees, return EmptyQueryResponse message.
+	 * 【中文】空查询串（如只发了一个分号）→ 返回 EmptyQueryResponse。
 	 */
 	if (!parsetree_list)
 		NullCommand(dest);
@@ -2147,6 +2206,19 @@ exec_bind_message(StringInfo input_message)
  *
  * Process an "Execute" message for a portal
  */
+/*
+ * exec_execute_message -- 扩展协议 Execute（E）消息的执行入口
+ *
+ * 【中文总述】
+ * 执行一个已由 Parse+Bind 准备好的门户（portal）。
+ * 与 exec_simple_query 的差异：
+ *  - 计划在 Parse 阶段就已生成，这里直接跑（可反复执行同一计划）
+ *  - 支持 max_rows 限制单次返回行数（游标式分段取数）
+ *  - 不隐式提交事务，提交与否由后续的 Sync（或事务语句）决定；
+ *    但事务控制语句与需要立即提交的语句除外
+ *  - 事务语句/立即提交 → 发 CommandComplete；
+ *    未执行完（被 max_rows 截断）→ 发 PortalSuspended
+ */
 static void
 exec_execute_message(const char *portal_name, long max_rows)
 {
@@ -2170,10 +2242,12 @@ exec_execute_message(const char *portal_name, long max_rows)
 	ListCell   *lc;
 
 	/* Adjust destination to tell printtup.c what to do */
+	/* 【中文】远程执行目的地（处理 RowDescription 的发送方式） */
 	dest = whereToSendOutput;
 	if (dest == DestRemote)
 		dest = DestRemoteExecute;
 
+	/* 【中文】按名字找到门户；不存在则报 UNDEFINED_CURSOR 错误 */
 	portal = GetPortalByName(portal_name);
 	if (!PortalIsValid(portal))
 		ereport(ERROR,
@@ -2256,6 +2330,7 @@ exec_execute_message(const char *portal_name, long max_rows)
 	/*
 	 * Ensure we are in a transaction command (this should normally be the
 	 * case already due to prior BIND).
+	 * 【中文】确保处于事务命令中（通常 Bind 阶段已建好）。
 	 */
 	start_xact_command();
 
@@ -2264,6 +2339,9 @@ exec_execute_message(const char *portal_name, long max_rows)
 	 * then we are only fetching more rows rather than completely re-executing
 	 * the query from the start. atStart is never reset for a v3 portal, so we
 	 * are safe to use this check.
+	 *
+	 * 【中文】对同一门户重复 Execute 时，只是"继续取剩下的行"
+	 * （游标语义），而非从头重跑——execute_is_fetch 用于日志显示。
 	 */
 	execute_is_fetch = !portal->atStart;
 
@@ -2317,6 +2395,12 @@ exec_execute_message(const char *portal_name, long max_rows)
 	if (max_rows <= 0)
 		max_rows = FETCH_ALL;
 
+	/*
+	 * 【中文】驱动执行器运行门户。返回 completed：
+	 *  - true：全部执行完 → 发 CommandComplete（事务语句即时提交）
+	 *  - false：被 max_rows 截断 → 发 PortalSuspended（"还有更多，
+	 *    发下一条 Execute 继续取"），游标式取数的机制就在于此。
+	 */
 	completed = PortalRun(portal,
 						  max_rows,
 						  true, /* always top level */
@@ -4360,6 +4444,30 @@ PostgresSingleUserMain(int argc, char *argv[],
  * if reasonably possible.
  * ----------------------------------------------------------------
  */
+/*
+ * PostgresMain -- 后端进程的主函数：认证、连库、服务查询的主循环
+ *
+ * 【中文总述】
+ * 由 BackendMain 调用，是"一个后端进程的一生"的舞台：
+ *
+ *   1. 信号处理：SIGINT=取消当前查询、SIGTERM=优雅退出、
+ *      SIGQUIT=快速死（walsender 走 WalSndSignals）
+ *   2. BaseInit() + 生成随机取消密钥（发给客户端的 CancelRequest 凭证）
+ *   3. InitPostgres()：核心初始化——
+ *      - 基于 pg_hba.conf 完成客户端认证
+ *      - 连接并锁定目标数据库、初始化 GUC、加载扩展/语言/对象
+ *   4. 发送 BackendKeyData（PID + 取消密钥）给客户端
+ *   5. sigsetjmp 建立最外层错误恢复点（longjmp 回来时中止事务、
+ *      清理错误状态后回到空闲循环）
+ *   6. 进入 for(;;) 主循环：
+ *       - 空闲时发送 ReadyForQuery，并处理 idle/notify/统计上报
+ *       - ReadCommand() 阻塞读取客户端下一条命令消息
+ *       - 按消息类型分发：
+ *         简单查询 Q → exec_simple_query()
+ *         扩展协议 P/B/E/D/C/S → exec_parse/bind/execute_message 等
+ *         快速路径 F、同步 S、终止 X、EOF
+ * 一个循环 = 处理一条消息；ReadyForQuery 在每条命令后发一次。
+ */
 void
 PostgresMain(const char *dbname, const char *username)
 {
@@ -4394,9 +4502,12 @@ PostgresMain(const char *dbname, const char *username)
 		WalSndSignals();
 	else
 	{
+		/* SIGHUP: 重读配置文件（PGC_SIGHUP 级参数） */
 		pqsignal(SIGHUP, SignalHandlerForConfigReload);
 		pqsignal(SIGINT, StatementCancelHandler);	/* cancel current query */
+		/* 【中文】SIGINT: 取消当前正在执行的查询 */
 		pqsignal(SIGTERM, die); /* cancel current query and exit */
+		/* 【中文】SIGTERM: 取消当前查询并正常退出 */
 
 		/*
 		 * In a postmaster child backend, replace SignalHandlerForCrashExit
@@ -4405,6 +4516,9 @@ PostgresMain(const char *dbname, const char *username)
 		 * In a standalone backend, SIGQUIT can be generated from the keyboard
 		 * easily, while SIGTERM cannot, so we make both signals do die()
 		 * rather than quickdie().
+		 *
+		 * 【中文】postmaster 子进程中 SIGQUIT=quickdie（马上死，
+		 * 先给客户端发一句崩溃消息）；单用户后端则与 SIGTERM 一样优雅退出。
 		 */
 		if (IsUnderPostmaster)
 			pqsignal(SIGQUIT, quickdie);	/* hard crash time */
@@ -4432,6 +4546,7 @@ PostgresMain(const char *dbname, const char *username)
 	}
 
 	/* Early initialization */
+	/* 【中文】基础初始化（共享内存访问、GUC 访问等基础设施） */
 	BaseInit();
 
 	/* We need to allow SIGINT, etc during the initial transaction */
@@ -4440,6 +4555,10 @@ PostgresMain(const char *dbname, const char *username)
 	/*
 	 * Generate a random cancel key, if this is a backend serving a
 	 * connection. InitPostgres() will advertise it in shared memory.
+	 *
+	 * 【中文】为连接生成随机的"取消密钥"。客户端发取消请求时要
+	 * 携带 PID+密钥，服务端据此验证——防止任何人随便取消别人的查询。
+	 * InitPostgres() 会把它登记到共享内存。
 	 */
 	Assert(MyCancelKeyLength == 0);
 	if (whereToSendOutput == DestRemote)
@@ -4465,6 +4584,12 @@ PostgresMain(const char *dbname, const char *username)
 	 * involves database access should be there, not here.
 	 *
 	 * Honor session_preload_libraries if not dealing with a WAL sender.
+	 *
+	 * 【中文】核心初始化 InitPostgres()：
+	 *  - 客户端认证（pg_hba.conf 匹配 + 各认证方式）
+	 *  - 打开并锁定目标数据库（阻止数据库被 DROP）
+	 *  - 初始化本会话的 GUC、语言环境、系统目录访问
+	 *  - 加载会话级预加载库
 	 */
 	InitPostgres(dbname, InvalidOid,	/* database to connect to */
 				 username, InvalidOid,	/* role to connect as */
@@ -4474,6 +4599,7 @@ PostgresMain(const char *dbname, const char *username)
 	/*
 	 * If the PostmasterContext is still around, recycle the space; we don't
 	 * need it anymore after InitPostgres completes.
+	 * 【中文】认证完成后不再需要 PostmasterContext，回收其内存。
 	 */
 	if (PostmasterContext)
 	{
@@ -4481,11 +4607,12 @@ PostgresMain(const char *dbname, const char *username)
 		PostmasterContext = NULL;
 	}
 
-	SetProcessingMode(NormalProcessing);
+	SetProcessingMode(NormalProcessing);	/* 【中文】进入"正常处理"模式 */
 
 	/*
 	 * Now all GUC states are fully set up.  Report them to client if
 	 * appropriate.
+	 * 【中文】把需要同步的 GUC 参数（含已改变的）发给客户端。
 	 */
 	BeginReportingGUCOptions();
 
@@ -4504,6 +4631,8 @@ PostgresMain(const char *dbname, const char *username)
 
 	/*
 	 * Send this backend's cancellation info to the frontend.
+	 * 【中文】把本后端的 PID + 取消密钥发给客户端
+	 * （客户端保存它，供 pg_cancel_backend 对应的 CancelRequest 使用）。
 	 */
 	if (whereToSendOutput == DestRemote)
 	{
@@ -4527,6 +4656,9 @@ PostgresMain(const char *dbname, const char *username)
 	 *
 	 * MessageContext is reset once per iteration of the main loop, ie, upon
 	 * completion of processing of each command message from the client.
+	 *
+	 * 【中文】创建 MessageContext：主循环每处理完一条客户端消息
+	 * 就整体重置一次，是"每条消息的临时工作区"。
 	 */
 	MessageContext = AllocSetContextCreate(TopMemoryContext,
 										   "MessageContext",
@@ -4578,6 +4710,18 @@ PostgresMain(const char *dbname, const char *username)
 		 * AbortTransaction() instead.  The only stuff done directly here
 		 * should be stuff that is guaranteed to apply *only* for outer-level
 		 * error recovery, such as adjusting the FE/BE protocol status.
+		 *
+		 * 【中文】== 错误恢复分支 ==
+		 * 任意一条命令执行中抛出 ERROR（经 ereport 升级为 FATAL 之外的
+		 * 错误）都会 longjmp 回到这里，依次执行：
+		 *  - 清除所有超时与取消标志
+		 *  - 重置 libpq 状态（pq_comm_reset）
+		 *  - 把错误报告给客户端/日志（EmitErrorReport）
+		 *  - AbortCurrentTransaction() 中止当前事务（回滚）
+		 *  - 清理 Portal/复制槽/JIT 状态
+		 *  - 恢复 MessageContext、FlushErrorState
+		 *  - 扩展协议期间出错 → 置 ignore_till_sync（跳过消息直到 Sync）
+		 * 之后继续走下面的"发送 ReadyForQuery"再进入主循环。
 		 */
 
 		/* Since not using PG_TRY, must reset error stack by hand */
@@ -4684,6 +4828,7 @@ PostgresMain(const char *dbname, const char *username)
 	}
 
 	/* We can now handle ereport(ERROR) */
+	/* 【中文】从此刻起本函数内的 ERROR 都会跳回上面的 longjmp 点 */
 	PG_exception_stack = &local_sigjmp_buf;
 
 	if (!ignore_till_sync)
@@ -4701,6 +4846,7 @@ PostgresMain(const char *dbname, const char *username)
 		/*
 		 * At top of loop, reset extended-query-message flag, so that any
 		 * errors encountered in "idle" state don't provoke skip.
+		 * 【中文】主循环每轮开头重置"扩展协议处理中"标志。
 		 */
 		doing_extended_query_message = false;
 
@@ -4714,6 +4860,8 @@ PostgresMain(const char *dbname, const char *username)
 		/*
 		 * Release storage left over from prior query cycle, and create a new
 		 * query input buffer in the cleared MessageContext.
+		 * 【中文】清空 MessageContext（上一轮消息的全部临时内存一次回收），
+		 * 建立本轮消息的输入缓冲区。
 		 */
 		MemoryContextSwitchTo(MessageContext);
 		MemoryContextReset(MessageContext);
@@ -4726,28 +4874,35 @@ PostgresMain(const char *dbname, const char *username)
 		 */
 		InvalidateCatalogSnapshotConditionally();
 
-		/*
-		 * (1) If we've reached idle state, tell the frontend we're ready for
-		 * a new query.
-		 *
-		 * Note: this includes fflush()'ing the last of the prior output.
-		 *
-		 * This is also a good time to flush out collected statistics to the
-		 * cumulative stats system, and to update the PS stats display.  We
-		 * avoid doing those every time through the message loop because it'd
-		 * slow down processing of batched messages, and because we don't want
-		 * to report uncommitted updates (that confuses autovacuum).  The
-		 * notification processor wants a call too, if we are not in a
-		 * transaction block.
-		 *
-		 * Also, if an idle timeout is enabled, start the timer for that.
-		 */
-		if (send_ready_for_query)
+			/*
+			 * (1) If we've reached idle state, tell the frontend we're ready
+			 * for a new query.
+			 *
+			 * Note: this includes fflush()'ing the last of the prior output.
+			 *
+			 * This is also a good time to flush out collected statistics to the
+			 * cumulative stats system, and to update the PS stats display.  We
+			 * avoid doing those every time through the message loop because it'd
+			 * slow down processing of batched messages, and because we don't want
+			 * to report uncommitted updates (that confuses autovacuum).  The
+			 * notification processor wants a call too, if we are not in a
+			 * transaction block.
+			 *
+			 * Also, if an idle timeout is enabled, start the timer for that.
+			 *
+			 * 【中文】(1) 空闲时向客户端发送 ReadyForQuery（Z 消息）——
+			 * 宣告"我准备好了"，同时冲刷上一条命令的剩余输出。
+			 * 顺带处理：notify 消息投递、统计信息上报、ps 显示、
+			 * idle 超时计时、GUC 变更上报、连接建立耗时日志。
+			 */
+			if (send_ready_for_query)
 		{
 			if (IsAbortedTransactionBlockState())
 			{
 				set_ps_display("idle in transaction (aborted)");
 				pgstat_report_activity(STATE_IDLEINTRANSACTION_ABORTED, NULL);
+				/* 【中文】事务块内出错后进入"idle in transaction (aborted)"
+				 * 状态，仅接受 COMMIT/ROLLBACK */
 
 				/* Start the idle-in-transaction timer */
 				if (IdleInTransactionSessionTimeout > 0
@@ -4869,11 +5024,15 @@ PostgresMain(const char *dbname, const char *username)
 		 * come in while we are waiting for client input. (This must be
 		 * conditional since we don't want, say, reads on behalf of COPY FROM
 		 * STDIN doing the same thing.)
+		 * 【中文】(2) 打开 DoingCommandRead：等待客户端输入期间
+		 * 允许立刻处理异步信号（如取消请求）。
 		 */
 		DoingCommandRead = true;
 
 		/*
 		 * (3) read a command (loop blocks here)
+		 * 【中文】(3) 阻塞读取客户端下一条命令消息
+		 * （有数据到达/EOF/信号时返回；消息类型在 firstchar 里）。
 		 */
 		firstchar = ReadCommand(&input_message);
 
@@ -4921,6 +5080,9 @@ PostgresMain(const char *dbname, const char *username)
 		/*
 		 * (7) process the command.  But ignore it if we're skipping till
 		 * Sync.
+		 * 【中文】(7) 按消息类型分发处理（本循环的核心）。
+		 * 若处于 ignore_till_sync（扩展协议中途出错），
+		 * 丢弃除 Sync 之外的所有消息（先 continue 跳过）。
 		 */
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
@@ -4932,6 +5094,7 @@ PostgresMain(const char *dbname, const char *username)
 					const char *query_string;
 
 					/* Set statement_timestamp() */
+					/* 【中文】记录语句开始时间（statement_timestamp() 的来源） */
 					SetCurrentStatementStartTimestamp();
 
 					query_string = pq_getmsgstring(&input_message);
@@ -4943,6 +5106,8 @@ PostgresMain(const char *dbname, const char *username)
 							exec_simple_query(query_string);
 					}
 					else
+						/* 【中文】简单查询协议：一条消息=一串 SQL，
+						 * 走 exec_simple_query() */
 						exec_simple_query(query_string);
 
 					valgrind_report_error_query(query_string);
@@ -4963,6 +5128,10 @@ PostgresMain(const char *dbname, const char *username)
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
+					/* 【中文】扩展协议 Parse：解析 SQL 并生成
+					 * 预备语句（prepared statement），只做
+					 * parse→analyze→rewrite→plan，暂不执行。
+					 * 命名语句可跨消息复用，无名语句是 ""。 */
 					stmt_name = pq_getmsgstring(&input_message);
 					query_string = pq_getmsgstring(&input_message);
 					numParams = pq_getmsgint(&input_message, 2);
@@ -4990,6 +5159,8 @@ PostgresMain(const char *dbname, const char *username)
 				/*
 				 * this message is complex enough that it seems best to put
 				 * the field extraction out-of-line
+				 * 【中文】扩展协议 Bind：把参数值绑定到预备语句，
+				 * 创建门户（portal，即"可执行的查询实例"）。
 				 */
 				exec_bind_message(&input_message);
 
@@ -5006,6 +5177,8 @@ PostgresMain(const char *dbname, const char *username)
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
+					/* 【中文】扩展协议 Execute：执行门户
+					 * （可指定每次取多少行，配合流式取数）。 */
 					portal_name = pq_getmsgstring(&input_message);
 					max_rows = pq_getmsgint(&input_message, 4);
 					pq_getmsgend(&input_message);
@@ -5144,6 +5317,9 @@ PostgresMain(const char *dbname, const char *username)
 				 * If pipelining was used, we may be in an implicit
 				 * transaction block. Close it before calling
 				 * finish_xact_command.
+				 * 【中文】扩展协议 Sync：表示本批消息结束。
+				 * 提交/结束事务（含流水线产生的隐式事务块），
+				 * 发送 ReadyForQuery，清除 ignore_till_sync。
 				 */
 				EndImplicitTransactionBlock();
 				finish_xact_command();
@@ -5168,6 +5344,10 @@ PostgresMain(const char *dbname, const char *username)
 				/*
 				 * Reset whereToSendOutput to prevent ereport from attempting
 				 * to send any more messages to client.
+				 * 【中文】客户端断开（EOF）或发送 Terminate（X）：
+				 * 禁止再向客户端发消息，然后 proc_exit 正常退出。
+				 * 其他清理工作（统计上报、锁释放等）由
+				 * on_proc_exit/on_shmem_exit 回调完成。
 				 */
 				if (whereToSendOutput == DestRemote)
 					whereToSendOutput = DestNone;

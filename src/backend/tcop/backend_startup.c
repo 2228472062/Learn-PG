@@ -72,6 +72,19 @@ static bool validate_log_connections_options(List *elemlist, uint32 *flags);
  * Initialize the connection, read the startup packet, authenticate the
  * client, and start the main processing loop.
  */
+/*
+ * BackendMain -- 后端子进程（fork 出来的孩子）的真正入口
+ *
+ * 【中文总述】
+ * 由 postmaster_child_launch() fork 后进入，全程运行在子进程里：
+ *   1. （EXEC_BACKEND 平台）重新初始化 SSL 库
+ *   2. BackendInitialize()：libpq 初始化、接收客户端启动包
+ *      （含 SSL/协议协商、取消请求处理）、拒绝连接判断
+ *   3. InitProcess()：在共享内存中注册本进程的 PGPROC 槽位
+ *      ——之后才能使用 LWLocks 和共享内存
+ *   4. 切换到 TopMemoryContext，进入 PostgresMain()
+ *      （认证、连库、主查询循环都在那里）
+ */
 void
 BackendMain(const void *startup_data, size_t startup_data_len)
 {
@@ -107,20 +120,29 @@ BackendMain(const void *startup_data, size_t startup_data_len)
 #endif
 
 	/* Perform additional initialization and collect startup packet */
+	/* 【中文】接收客户端启动包 + 各种前置初始化（见 BackendInitialize 注释） */
 	BackendInitialize(MyClientSocket, bsdata->canAcceptConnections);
 
 	/*
 	 * Create a per-backend PGPROC struct in shared memory.  We must do this
 	 * before we can use LWLocks or access any shared memory.
+	 *
+	 * 【中文】在共享内存中创建本进程的 PGPROC 结构
+	 * （进程在锁/信号/统计等子系统中的身份标识）。
+	 * 必须在此之前未触碰共享内存——这也是上面的启动包超时
+	 * 可以直接 _exit(1) 的前提（不产生任何需要清理的外部状态）。
 	 */
 	InitProcess();
 
 	/*
 	 * Make sure we aren't in PostmasterContext anymore.  (We can't delete it
 	 * just yet, though, because InitPostgres will need the HBA data.)
+	 * 【中文】不再使用 PostmasterContext（但还不能删除，
+	 * 因为 InitPostgres 认证时还要用里面的 HBA 数据）。
 	 */
 	MemoryContextSwitchTo(TopMemoryContext);
 
+	/* 【中文】进入 PostgresMain：认证、连接数据库、主查询循环 */
 	PostgresMain(MyProcPort->database_name, MyProcPort->user_name);
 }
 
@@ -136,6 +158,18 @@ BackendMain(const void *startup_data, size_t startup_data_len)
  * shared memory not have been touched yet; see comments within.
  * In the EXEC_BACKEND case, we are physically attached to shared memory
  * but have not yet set up most of our local pointers to shmem structures.
+ *
+ * 【中文总述】后端子进程的初始化 + 协议握手阶段：
+ *   1. libpq 初始化（pq_init），此后可以向客户端发消息
+ *   2. 设置 SIGTERM/超时处理器——在收齐启动包前如果被杀掉，
+ *      可以直接 _exit(1)，因为尚未触碰共享内存、无需清理
+ *   3. 解析客户端地址/端口用于日志和 ps 显示
+ *   4. ProcessSSLStartup()：直连 SSL 握手（先于启动包）
+ *   5. ProcessStartupPacket()：接收启动包（含 SSL/GSS 协商、
+ *      取消请求、用户名/数据库名/GUC 选项提取）
+ *   6. 根据 canAcceptConnections 拒绝不该接受的连接
+ *   7. 设置 ps 显示标题（postgres: user dbname host）
+ * 注意：认证（InitPostgres 里）要到 PostgresMain 才进行。
  */
 static void
 BackendInitialize(ClientSocket *client_sock, CAC_state cac)
@@ -174,10 +208,11 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	 * aren't in the postmaster process anymore.
 	 */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-	port = MyProcPort = pq_init(client_sock);
+	port = MyProcPort = pq_init(client_sock);	/* 【中文】初始化 libpq 通讯层 */
 	MemoryContextSwitchTo(oldcontext);
 
 	whereToSendOutput = DestRemote; /* now safe to ereport to client */
+	/* 【中文】此后报错可以直接发送给客户端 */
 
 	/* set these to empty in case they are needed before we set them up */
 	port->remote_host = "";
@@ -280,16 +315,21 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	 * Note: because PostgresMain will call InitializeTimeouts again, the
 	 * registration of STARTUP_PACKET_TIMEOUT will be lost.  This is okay
 	 * since we never use it again after this function.
+	 *
+	 * 【中文】启动"收启动包超时"计时器（AuthenticationTimeout），
+	 * 防止坏客户端无限占用连接；超时后直接 _exit(1)。
 	 */
 	RegisterTimeout(STARTUP_PACKET_TIMEOUT, StartupPacketTimeoutHandler);
 	enable_timeout_after(STARTUP_PACKET_TIMEOUT, AuthenticationTimeout * 1000);
 
 	/* Handle direct SSL handshake */
+	/* 【中文】处理直连 SSL 握手（客户端第一条消息若是 TLS ClientHello） */
 	status = ProcessSSLStartup(port);
 
 	/*
 	 * Receive the startup packet (which might turn out to be a cancel request
 	 * packet).
+	 * 【中文】接收启动包（也可能是取消请求包，见 ProcessStartupPacket）。
 	 */
 	if (status == STATUS_OK)
 		status = ProcessStartupPacket(port);
@@ -374,6 +414,9 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	/*
 	 * Now that we have the user and database name, we can set the process
 	 * title for ps.  It's good to do this as early as possible in startup.
+	 *
+	 * 【中文】拿到用户名/数据库名后立刻设置进程标题
+	 * （ps 里显示的 postgres: user dbname host 就是这个来的）。
 	 */
 	initStringInfo(&ps_data);
 	if (am_walsender)
@@ -482,6 +525,22 @@ reject:
  * if we detect a communications failure.)
  *
  */
+/*
+ * ProcessStartupPacket -- 读取并解析客户端的启动包（协议握手核心）
+ *
+ * 【中文总述】
+ * 客户端发来的第一个包，可能属于三种类型：
+ *   1. 协议版本号（0x00030000 = 3.0 等）→ 正常启动包，
+ *      解析出用户名、数据库名、GUC 参数（-c 选项）、replication 标记等，
+ *      存入 Port 结构供认证（InitPostgres）和连接使用
+ *   2. CANCEL_REQUEST_CODE（80877102）→ 取消请求包，
+ *      交给 ProcessCancelRequestPacket 处理（不做认证、不回复），
+ *      处理完连接即结束
+ *   3. NEGOTIATE_SSL_CODE（80877103）/ NEGOTIATE_GSS_CODE → SSL/GSS
+ *      加密协商请求，回复 'S'/'N'/'G' 后回到 retry 重新收启动包
+ * 解析完成后把前端协议版本记录到 FrontendProtocol
+ * （决定之后所有消息的编码格式）。
+ */
 static int
 ProcessStartupPacket(Port *port)
 {
@@ -569,9 +628,12 @@ retry:
 	/*
 	 * The first field is either a protocol version number or a special
 	 * request code.
+	 * 【中文】包内第一个 4 字节是协议版本号，或特殊请求码
+	 * （取消请求 / SSL / GSS 协商）。
 	 */
 	port->proto = proto = pg_ntoh32(*((ProtocolVersion *) buf));
 
+	/* 【中文】取消请求：不认证、不回复，处理完直接结束连接 */
 	if (proto == CANCEL_REQUEST_CODE)
 	{
 		ProcessCancelRequestPacket(port, buf, len);
@@ -579,6 +641,8 @@ retry:
 		goto fail;
 	}
 
+	/* 【中文】SSL 协商请求：回复 'S'（支持）或 'N'（拒绝），
+	 * 之后回到 retry 重新接收启动包。 */
 	if (proto == NEGOTIATE_SSL_CODE && !ssl_done)
 	{
 		char		SSLok;
@@ -747,6 +811,10 @@ retry:
 	/*
 	 * Now fetch parameters out of startup packet and save them into the Port
 	 * structure.
+	 * 【中文】解析启动包里的 "名=值" 参数对，存入 Port 结构：
+	 * database/user/options/replication 是特殊字段；
+	 * 其余一律当作 GUC 选项（如 application_name、search_path 等），
+	 * 认证完成后由 InitPostgres 应用。
 	 */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 
@@ -775,21 +843,25 @@ retry:
 				break;			/* missing value, will complain below */
 			valptr = buf + valoffset;
 
-			if (strcmp(nameptr, "database") == 0)
-				port->database_name = pstrdup(valptr);
-			else if (strcmp(nameptr, "user") == 0)
-				port->user_name = pstrdup(valptr);
-			else if (strcmp(nameptr, "options") == 0)
-				port->cmdline_options = pstrdup(valptr);
-			else if (strcmp(nameptr, "replication") == 0)
-			{
-				/*
-				 * Due to backward compatibility concerns the replication
-				 * parameter is a hybrid beast which allows the value to be
-				 * either boolean or the string 'database'. The latter
-				 * connects to a specific database which is e.g. required for
-				 * logical decoding while.
-				 */
+		if (strcmp(nameptr, "database") == 0)
+			port->database_name = pstrdup(valptr);	/* 目标数据库名 */
+		else if (strcmp(nameptr, "user") == 0)
+			port->user_name = pstrdup(valptr);	/* 连接用户名 */
+		else if (strcmp(nameptr, "options") == 0)
+			port->cmdline_options = pstrdup(valptr);	/* -c 风格命令行选项 */
+		else if (strcmp(nameptr, "replication") == 0)
+		{
+			/*
+			 * Due to backward compatibility concerns the replication
+			 * parameter is a hybrid beast which allows the value to be
+			 * either boolean or the string 'database'. The latter
+			 * connects to a specific database which is e.g. required for
+			 * logical decoding while.
+			 *
+			 * 【中文】replication 参数比较特殊：
+			 * true/1 → 流复制连接（wal sender）；"database" → 逻辑复制
+			 * walsender（需要连具体数据库做逻辑解码）。
+			 */
 				if (strcmp(valptr, "database") == 0)
 				{
 					am_walsender = true;
@@ -858,12 +930,14 @@ retry:
 	}
 
 	/* Check a user name was given. */
+	/* 【中文】启动包必须包含用户名，否则拒绝连接 */
 	if (port->user_name == NULL || port->user_name[0] == '\0')
 		ereport(FATAL,
 				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 				 errmsg("no PostgreSQL user name specified in startup packet")));
 
 	/* The database defaults to the user name. */
+	/* 【中文】未指定数据库时默认连接到与用户名同名的库 */
 	if (port->database_name == NULL || port->database_name[0] == '\0')
 		port->database_name = pstrdup(port->user_name);
 

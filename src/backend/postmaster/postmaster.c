@@ -493,6 +493,24 @@ HANDLE		PostmasterHandle;
 /*
  * Postmaster main entry point
  */
+/*
+ * PostmasterMain -- postmaster 主进程的初始化与运行入口
+ *
+ * 【中文总述】
+ * 这是整个数据库服务的"大脑"启动函数（由 main.c 分发调用）。
+ * 执行阶段概览：
+ *   1. 基础设置：进程全局量、umask、PostmasterContext 内存上下文
+ *   2. 信号处理：安装 SIGHUP/SIGINT/SIGTERM/SIGCHLD 等处理器
+ *      （信号只置标志位 + 唤醒 latch，真正的处理在 ServerLoop 里做）
+ *   3. 解析命令行参数，逐项写入 GUC（PGCS 上下文）
+ *   4. 定位/读取 postgresql.conf 与数据目录，校验 pg_control
+ *   5. 创建数据目录锁文件 postmaster.pid（防多实例冲突）
+ *   6. 注册并创建共享内存与信号量（所有后端子进程共享的"公共大厅"）
+ *   7. 建立监听 socket（TCP + Unix socket），记录选项到 postmaster.opts
+ *   8. 加载 pg_hba.conf/pg_ident.conf，启动 syslogger、checkpointer、
+ *      bgwriter、startup 等辅助子进程
+ *   9. 进入 ServerLoop() 主循环，永不返回（除非出错）
+ */
 void
 PostmasterMain(int argc, char *argv[])
 {
@@ -503,11 +521,11 @@ PostmasterMain(int argc, char *argv[])
 	bool		listen_addr_saved = false;
 	char	   *output_config_variable = NULL;
 
-	InitProcessGlobals();
+	InitProcessGlobals();		/* 初始化进程启动时间、随机数种子等 */
 
-	PostmasterPid = MyProcPid;
+	PostmasterPid = MyProcPid;	/* 记录本进程 PID 为 postmaster PID */
 
-	IsPostmasterEnvironment = true;
+	IsPostmasterEnvironment = true;	/* 标记处于 postmaster 环境（子进程继承该标记） */
 
 	/*
 	 * Start our win32 signal implementation
@@ -548,18 +566,28 @@ PostmasterMain(int argc, char *argv[])
 	 * bootstrap/bootstrap.c, postmaster/bgwriter.c, postmaster/walwriter.c,
 	 * postmaster/autovacuum.c, postmaster/pgarch.c, postmaster/syslogger.c,
 	 * postmaster/bgworker.c and postmaster/checkpointer.c.
+	 *
+	 * 【中文】安装 postmaster 的信号处理器。
+	 * 处理器只做两件事：设置对应标志位 + SetLatch(MyLatch) 唤醒主循环，
+	 * 真正的业务处理（重载配置、关闭子进程、回收僵尸等）都在
+	 * ServerLoop() 中统一进行——这是 PG 单线程事件循环的核心模式。
+	 * CAUTION: 修改此处必须检查对子进程信号处理的影响。
 	 */
 	pqinitmask();
 	sigprocmask(SIG_SETMASK, &BlockSig, NULL);
 
+	/* SIGHUP: pg_ctl reload → 重读配置文件 */
 	pqsignal(SIGHUP, handle_pm_reload_request_signal);
+	/* SIGINT/SIGQUIT/SIGTERM: pg_ctl stop → 优雅/快速/立即关闭 */
 	pqsignal(SIGINT, handle_pm_shutdown_request_signal);
 	pqsignal(SIGQUIT, handle_pm_shutdown_request_signal);
 	pqsignal(SIGTERM, handle_pm_shutdown_request_signal);
 	pqsignal(SIGALRM, PG_SIG_IGN);	/* ignored */
 	pqsignal(SIGPIPE, PG_SIG_IGN);	/* ignored */
+	/* SIGUSR1: 子进程/bgworker 发来的 pmsignal 通知 */
 	pqsignal(SIGUSR1, handle_pm_pmsignal_signal);
 	pqsignal(SIGUSR2, dummy_handler);	/* unused, reserve for children */
+	/* SIGCHLD: 有子进程退出 → 回收僵尸进程 */
 	pqsignal(SIGCHLD, handle_pm_child_exit_signal);
 
 	/* This may configure SIGURG, depending on platform. */
@@ -590,6 +618,9 @@ PostmasterMain(int argc, char *argv[])
 
 	/*
 	 * Options setup
+	 * 【中文】初始化 GUC 框架（读取内置默认值），随后解析命令行参数。
+	 * 注意：命令行参数在这里被转化为 SetConfigOption() 调用，
+	 * 等 SelectConfigFiles 读到 postgresql.conf 时再统一生效。
 	 */
 	InitializeGUCOptions();
 
@@ -597,6 +628,12 @@ PostmasterMain(int argc, char *argv[])
 	 * Parse command-line options.  CAUTION: keep this in sync with
 	 * tcop/postgres.c (the option sets should not conflict) and with the
 	 * common help() function in main/main.c.
+	 *
+	 * 【中文】解析命令行选项（getopt 风格）。
+	 * 大多数字母选项（-B/-D/-h/-p...）被转成对应的 GUC 设置；
+	 * -C NAME 只打印参数值后退出（pg_ctl 常用来探测运行中的服务器）；
+	 * -c NAME=VALUE / --NAME=VALUE 直接设置任意 GUC。
+	 * 若发现 "必须放第一位" 的分发选项（--boot 等）出现在这里，报语法错误。
 	 */
 	pg_getopt_start(&optctx, argc, argv, "B:bC:c:D:d:EeFf:h:ijk:lN:OPp:r:S:sTt:W:-:");
 	optctx.opterr = 1;
@@ -786,6 +823,8 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * Locate the proper configuration files and data directory, and read
 	 * postgresql.conf for the first time.
+	 * 【中文】确定数据目录位置（-D 参数或环境变量），读取
+	 * postgresql.conf 并应用其配置（覆盖命令行的 PGC_POSTMASTER 项）。
 	 */
 	if (!SelectConfigFiles(userDoption, progname))
 		ExitPostmaster(2);
@@ -831,12 +870,15 @@ PostmasterMain(int argc, char *argv[])
 	}
 
 	/* Verify that DataDir looks reasonable */
+	/* 【中文】校验数据目录完整性（权限、PG_VERSION 文件等） */
 	checkDataDir();
 
 	/* Check that pg_control exists */
+	/* 【中文】校验 pg_control 控制文件是否存在且可读 */
 	checkControlFile();
 
 	/* And switch working directory into it */
+	/* 【中文】切换当前工作目录到数据目录（相对路径在服务器中均基于此） */
 	ChangeToDataDir();
 
 	/*
@@ -905,17 +947,18 @@ PostmasterMain(int argc, char *argv[])
 	 * is responsible for removing both data directory and socket lockfiles;
 	 * so it must happen before opening sockets so that at exit, the socket
 	 * lockfiles go away after CloseServerPorts runs.
+	 *
+	 * 【中文】创建数据目录锁文件 postmaster.pid。
+	 * 这是"防止两个 postmaster 同时操作同一数据目录"的互斥机制，
+	 * 比 socket 文件锁更可靠（/tmp 太容易被清理）。
+	 * 同时它还会注册 on_proc_exit 回调，退出时负责删除锁文件。
 	 */
 	CreateDataDirLockFile(true);
 
 	/*
 	 * Read the control file (for error checking and config info).
-	 *
-	 * Since we verify the control file's CRC, this has a useful side effect
-	 * on machines where we need a run-time test for CRC support instructions.
-	 * The postmaster will do the test once at startup, and then its child
-	 * processes will inherit the correct function pointer and not need to
-	 * repeat the test.
+	 * 【中文】读取控制文件 pg_control（数据库状态、WAL 位置、
+	 * 系统标识等关键信息），校验 CRC 时会顺带测试硬件 CRC 指令支持。
 	 */
 	LocalProcessControlFile(false);
 
@@ -1014,6 +1057,11 @@ PostmasterMain(int argc, char *argv[])
 	 * Note: if using SysV shmem and/or semas, each postmaster startup will
 	 * normally choose the same IPC keys.  This helps ensure that we will
 	 * clean up dead IPC objects if the postmaster crashes and is restarted.
+	 *
+	 * 【中文】创建共享内存和信号量——整个数据库实例的"公共大厅"。
+	 * 所有后端子进程在启动时都要 attach 到这里。
+	 * 它按各子系统注册的需求（ShmemCallRequestCallbacks）计算总大小，
+	 * 包含：缓冲池、锁表、PGPROC 数组、WAL 缓冲区、统计信息等。
 	 */
 	CreateSharedMemoryAndSemaphores();
 
@@ -1122,6 +1170,11 @@ PostmasterMain(int argc, char *argv[])
 	 *
 	 * First set up an on_proc_exit function that's charged with closing the
 	 * sockets again at postmaster shutdown.
+	 *
+	 * 【中文】建立监听 socket（TCP + Unix domain）。
+	 * 注册 on_proc_exit 回调 CloseServerPorts 保证退出时关闭它们。
+	 * 之后每次有新连接进来，ServerLoop 的 WL_SOCKET_ACCEPT 事件
+	 * 就会触发 AcceptConnection() + BackendStartup()。
 	 */
 	ListenSockets = palloc(MAXLISTEN * sizeof(pgsocket));
 	on_proc_exit(CloseServerPorts, 0);
@@ -1334,11 +1387,16 @@ PostmasterMain(int argc, char *argv[])
 
 	/*
 	 * Initialize the autovacuum subsystem (again, no process start yet)
+	 * 【中文】初始化 autovacuum 子系统（只是注册，进程稍后由
+	 * ServerLoop 按需启动）。
 	 */
 	autovac_init();
 
 	/*
 	 * Load configuration files for client authentication.
+	 * 【中文】加载认证配置文件 pg_hba.conf（客户端访问控制）与
+	 * pg_ident.conf（用户名映射）。hba 加载失败直接 FATAL——
+	 * 没有它任何客户端都无法连接。
 	 */
 	if (!load_hba())
 	{
@@ -1397,6 +1455,7 @@ PostmasterMain(int argc, char *argv[])
 	maybe_start_io_workers();
 
 	/* Start bgwriter and checkpointer so they can help with recovery */
+	/* 【中文】先启动检查点进程和 bgwriter，它们要参与崩溃恢复 */
 	if (CheckpointerPMChild == NULL)
 		CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
 	if (BgWriterPMChild == NULL)
@@ -1404,18 +1463,22 @@ PostmasterMain(int argc, char *argv[])
 
 	/*
 	 * We're ready to rock and roll...
+	 * 【中文】启动 startup 进程：负责 WAL 重放/崩溃恢复。
+	 * 它完成后会通过 pmsignal 通知 postmaster 进入 PM_RUN 状态。
 	 */
 	StartupPMChild = StartChildProcess(B_STARTUP);
 	Assert(StartupPMChild != NULL);
 	StartupStatus = STARTUP_RUNNING;
 
 	/* Some workers may be scheduled to start now */
+	/* 【中文】启动请求了 POSTMASTER 启动时机的 bgworker */
 	maybe_start_bgworkers();
 
 	status = ServerLoop();
 
 	/*
 	 * ServerLoop probably shouldn't ever return, but if it does, close down.
+	 * 【中文】正常情况下 ServerLoop 不会返回；万一返回则整体关闭。
 	 */
 	ExitPostmaster(status != STATUS_OK);
 
@@ -1673,6 +1736,18 @@ ConfigurePostmasterWaitSet(bool accept_connections)
 
 /*
  * Main idle loop of postmaster
+ *
+ * 【中文总述】postmaster 主事件循环（整个数据库服务的"心脏"）：
+ *   1. 阻塞等待事件（WaitEventSetWait）：监听 socket 新连接
+ *      （WL_SOCKET_ACCEPT）、信号处理器设置的 latch（WL_LATCH_SET）
+ *   2. 处理各类待办标志（pending_*）：
+ *      - 关闭请求（pg_ctl stop）→ 关闭各子进程
+ *      - 重载请求（pg_ctl reload）→ 重读配置并广播 SIGHUP
+ *      - 子进程退出（SIGCHLD）→ 回收僵尸、必要时重启子进程
+ *      - pmsignal（SIGUSR1）→ 子进程的状态通知（恢复完成、热备就绪等）
+ *   3. 新连接到达 → AcceptConnection() + BackendStartup() fork 出后端
+ *   4. 周期任务：补齐缺失的后台进程、超时强杀卡死子进程、
+ *      每分钟检查 postmaster.pid、定期 touch socket 文件
  */
 static int
 ServerLoop(void)
@@ -1682,6 +1757,7 @@ ServerLoop(void)
 	WaitEvent	events[MAXLISTEN];
 	int			nevents;
 
+	/* 注册等待集合：latch + 所有监听 socket */
 	ConfigurePostmasterWaitSet(true);
 	last_lockfile_recheck_time = last_touch_time = time(NULL);
 
@@ -1689,6 +1765,10 @@ ServerLoop(void)
 	{
 		time_t		now;
 
+		/*
+		 * 【中文】阻塞等待事件。DetermineSleepTime() 决定最长睡眠时间，
+		 * 保证周期任务能按时醒来；信号到来会通过 latch 立刻唤醒。
+		 */
 		nevents = WaitEventSetWait(pm_wait_set,
 								   DetermineSleepTime(),
 								   events,
@@ -1710,6 +1790,9 @@ ServerLoop(void)
 			 * and reload requests where the latch happens to appear later in
 			 * events[] or will be reported by a later call to
 			 * WaitEventSetWait().
+			 *
+			 * 【中文】下面这些标志无条件检查（不依赖本次事件），
+			 * 保证关闭/重载请求获得最高优先级处理。
 			 */
 			if (pending_pm_shutdown_request)
 				process_pm_shutdown_request();
@@ -1720,6 +1803,10 @@ ServerLoop(void)
 			if (pending_pm_pmsignal)
 				process_pm_pmsignal();
 
+			/*
+			 * 【中文】监听 socket 可接受连接：accept 后 fork 一个
+			 * 后端进程处理该连接。fork 失败则关闭连接并记录日志。
+			 */
 			if (events[i].events & WL_SOCKET_ACCEPT)
 			{
 				ClientSocket s;
@@ -1739,6 +1826,7 @@ ServerLoop(void)
 		/*
 		 * If we need to launch any background processes after changing state
 		 * or because some exited, do so now.
+		 * 【中文】按需启动缺失的后台进程（如自动清理、bgworker 等）。
 		 */
 		LaunchMissingBackgroundProcesses();
 
@@ -1801,6 +1889,10 @@ ServerLoop(void)
 		 * against a DBA foolishly removing postmaster.pid and manually
 		 * starting a new postmaster.  Data corruption is likely to ensue from
 		 * that anyway, but we can minimize the damage by aborting ASAP.
+		 *
+		 * 【中文】每分钟检查一次 postmaster.pid 是否被删除/覆盖，
+		 * 若异常则立即自杀退出——防止数据目录已被挪走后残留进程
+		 * 造成数据损坏。
 		 */
 		if (now - last_lockfile_recheck_time >= 1 * SECS_PER_MINUTE)
 		{
@@ -1817,6 +1909,8 @@ ServerLoop(void)
 		 * Touch Unix socket and lock files every 58 minutes, to ensure that
 		 * they are not removed by overzealous /tmp-cleaning tasks.  We assume
 		 * no one runs cleaners with cutoff times of less than an hour ...
+		 * 【中文】每 58 分钟刷新一次 socket/lock 文件的时间戳，
+		 * 防止被 /tmp 目录清理任务误删。
 		 */
 		if (now - last_touch_time >= 58 * SECS_PER_MINUTE)
 		{
@@ -3571,6 +3665,16 @@ TerminateChildren(int signal)
  *
  * Note: if you change this code, also consider StartAutovacuumWorker and
  * StartBackgroundWorker.
+ *
+ * 【中文总述】由 ServerLoop 在新连接到达时调用，核心动作就是 fork：
+ *   1. 检查数据库状态是否允许新连接（canAcceptConnections），
+ *      并分配子进程槽位（pmchild）；槽位超限时降级为 dead-end
+ *      子进程（只回一句"too many clients"就退出）
+ *   2. 通过 postmaster_child_launch() fork 出后端子进程
+ *      （非 EXEC_BACKEND 平台直接 fork；Windows 上 fork+exec）
+ *   3. 子进程从 BackendMain() 开始：BackendInitialize() 收启动包、
+ *      InitPostgres() 认证连库、最后进入 PostgresMain() 服务查询
+ *   4. 父进程登记子进程 PID 后返回，继续 ServerLoop 循环
  */
 static int
 BackendStartup(ClientSocket *client_sock)
@@ -3583,6 +3687,7 @@ BackendStartup(ClientSocket *client_sock)
 	/*
 	 * Capture time that Postmaster got a socket from accept (for logging
 	 * connection establishment and setup total duration).
+	 * 【中文】记录 accept 时间，用于日志统计连接建立总耗时。
 	 */
 	startup_data.socket_created = GetCurrentTimestamp();
 
@@ -3590,6 +3695,9 @@ BackendStartup(ClientSocket *client_sock)
 	 * Allocate and assign the child slot.  Note we must do this before
 	 * forking, so that we can handle failures (out of memory or child-process
 	 * slots) cleanly.
+	 *
+	 * 【中文】分配子进程槽位（必须在 fork 之前分配，
+	 * 以便干净地处理内存不足/槽位用尽等失败情况）。
 	 */
 	cac = canAcceptConnections(B_BACKEND);
 	if (cac == CAC_OK)
@@ -3601,6 +3709,8 @@ BackendStartup(ClientSocket *client_sock)
 			/*
 			 * Too many regular child processes; launch a dead-end child
 			 * process instead.
+			 * 【中文】普通子进程槽位用尽：改启动 dead-end 子进程，
+			 * 它只负责给客户端发送拒绝信息（如 "too many clients"）。
 			 */
 			cac = CAC_TOOMANY;
 		}
@@ -3618,12 +3728,18 @@ BackendStartup(ClientSocket *client_sock)
 	}
 
 	/* Pass down canAcceptConnections state */
+	/* 【中文】把"是否允许连接"的状态传给子进程（它据此决定是否报错退出） */
 	startup_data.canAcceptConnections = cac;
 	bn->rw = NULL;
 
 	/* Hasn't asked to be notified about any bgworkers yet */
 	bn->bgworker_notify = false;
 
+	/*
+	 * 【中文】真正的 fork/exec 在这里发生。
+	 * 子进程会沿着 postmaster_child_launch → BackendMain 的路径
+	 * 初始化自己；父进程这边则继续往下登记 PID。
+	 */
 	pid = postmaster_child_launch(bn->bkend_type, bn->child_slot,
 								  &startup_data, sizeof(startup_data),
 								  client_sock);
@@ -3636,6 +3752,7 @@ BackendStartup(ClientSocket *client_sock)
 		errno = save_errno;
 		ereport(LOG,
 				(errmsg("could not fork new process for connection: %m")));
+		/* 【中文】尽力把 fork 失败原因直接发给客户端（V2 协议报文） */
 		report_fork_failure_to_client(client_sock, save_errno);
 		return STATUS_ERROR;
 	}
@@ -3649,6 +3766,7 @@ BackendStartup(ClientSocket *client_sock)
 	/*
 	 * Everything's been successful, it's safe to add this backend to our list
 	 * of backends.
+	 * 【中文】fork 成功：把子进程 PID 记入槽位，纳入 postmaster 管理。
 	 */
 	bn->pid = pid;
 	return STATUS_OK;
