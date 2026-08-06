@@ -1,1 +1,0 @@
-/home/postgres/Learn-PG/src/test/modules/test_custom_stats/Makefile

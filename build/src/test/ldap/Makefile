@@ -1,1 +1,0 @@
-/home/postgres/Learn-PG/src/test/ldap/Makefile

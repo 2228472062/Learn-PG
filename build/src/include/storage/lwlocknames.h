@@ -1,1 +1,0 @@
-/home/postgres/Learn-PG/build/src/backend/storage/lmgr/lwlocknames.h

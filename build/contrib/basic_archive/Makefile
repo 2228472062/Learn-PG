@@ -1,1 +1,0 @@
-/home/postgres/Learn-PG/contrib/basic_archive/Makefile
