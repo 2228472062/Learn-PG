@@ -25,6 +25,26 @@
  * files need to be fsync'd for the next checkpoint, and so a system
  * restart needs to be forced.)
  *
+ * 【中文总述】
+ * 本文件实现检查点进程（checkpointer，Postgres 9.2 引入）：
+ * 负责所有 checkpoint 的执行。checkpoint 的触发方式有两种：
+ *   1. 定时触发：距上次 checkpoint 超过 checkpoint_timeout（默认 300 秒）
+ *   2. 请求触发：普通后端进程在需要时通过共享内存标志 + 信号请求
+ *      （其中"写满 max_wal_size 个 WAL 段就触发"这条规则也是由后端
+ *      进程在填充 WAL 段时发信号实现，checkpointer 自己不监控 WAL 段数）
+ * 一次 checkpoint 大致做三件事（细节见 CreateCheckPoint()）：
+ *   1. 把共享缓冲池里的脏页全部刷到磁盘（BufferSync()）
+ *   2. 写一条 CHECKPOINT WAL 记录（记录 Redo 点，即崩溃后重放的起点）
+ *   3. 更新 pg_control 文件，标记崩溃恢复的起点
+ * 它与 bgwriter 的分工：bgwriter 平时分批刷脏页、维持干净缓冲池；
+ * checkpointer 只在 checkpoint 时做全量刷盘 + fsync 收尾。
+ * 正常关闭流程：postmaster 先停掉所有后端，再给 checkpointer 发 SIGINT
+ * 要求它写"关闭检查点"（shutdown checkpoint），写完再发 SIGUSR2 让它
+ * exit(0)。SIGQUIT 紧急退出。若 checkpointer 意外退出，postmaster
+ * 视同后端崩溃：先 SIGQUIT 杀其余进程再进恢复循环（即使共享内存没坏，
+ * 我们也丢失了"下一个 checkpoint 需要 fsync 哪些文件"的信息，
+ * 因此必须强制重启系统）。
+ *
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
@@ -108,6 +128,24 @@
  *
  * Unlike the checkpoint fields, requests related fields are protected by
  * CheckpointerCommLock.
+ *
+ * 【中文总述】
+ * 这是 checkpointer 与后端进程之间的共享内存通信区，包含两部分：
+ * 1. checkpoint 状态计数器（ckpt_started / ckpt_done / ckpt_failed 和
+ *    ckpt_flags），用自旋锁 ckpt_lck 保护，配合两个条件变量
+ *    （start_cv / done_cv）实现"请求-完成"握手协议（后端等待算法
+ *    见 RequestCheckpoint()，共 6 步）：
+ *    - checkpointer 开始 checkpoint 时读取并清零请求标志、
+ *      ckpt_started + 1；
+ *    - 完成时 ckpt_done = ckpt_started；失败时 ckpt_failed + 1
+ *      并把 ckpt_done 也同步到 ckpt_started，让等待方知道自己失败了。
+ *    后端用"模运算"比较计数器，以容忍计数器回绕。
+ * 2. fsync 请求环形队列（requests[]）：后端进程被迫直接写盘时
+ *    把"哪个文件脏了、需要 fsync"登记到这里，checkpointer 定期
+ *    AbsorbSyncRequests() 收走并转交给本地 fsync 记录（从而在下一次
+ *    checkpoint 的 fsync 阶段统一执行）。这块由 CheckpointerCommLock
+ *    保护。
+ *
  *----------
  */
 typedef struct
@@ -142,11 +180,20 @@ typedef struct
 	/* The ring buffer of pending checkpointer requests */
 	CheckpointerRequest requests[FLEXIBLE_ARRAY_MEMBER];
 } CheckpointerShmemStruct;
+/* 【中文】head/tail 是环形队列的读写游标：head 指向队头（checkpointer
+ * 消费处），tail 指向队尾（后端写入处），用 (x+1) % max_requests 推进；
+ * num_requests 为待处理的请求数；requests[] 是柔性数组，容量 =
+ * min(NBuffers, MAX_CHECKPOINT_REQUESTS)，由 CheckpointerShmemRequest
+ * 申请共享内存时定下（每缓冲区最多一条请求，队列再满时后端会自己
+ * fsync 兜底）。 */
 
 static CheckpointerShmemStruct *CheckpointerShmem;
 
 static void CheckpointerShmemRequest(void *arg);
 static void CheckpointerShmemInit(void *arg);
+/* 【中文】CheckpointerShmemRequest / CheckpointerShmemInit 是共享内存
+ * 子系统回调：前者在申请阶段登记所需内存大小，后者在共享内存创建好
+ * 之后做字段初始化（见下文对应函数注释）。 */
 
 const ShmemCallbacks CheckpointerShmemCallbacks = {
 	.request_fn = CheckpointerShmemRequest,
@@ -155,16 +202,31 @@ const ShmemCallbacks CheckpointerShmemCallbacks = {
 
 /* interval for calling AbsorbSyncRequests in CheckpointWriteDelay */
 #define WRITES_PER_ABSORB		1000
+/* 【中文】CheckpointWriteDelay() 里每隔 WRITES_PER_ABSORB 次写盘调用
+ * 一次 AbsorbSyncRequests()，及时收走后端排队进来的 fsync 请求。 */
 
 /* Maximum number of checkpointer requests to process in one batch */
 #define CKPT_REQ_BATCH_SIZE 10000
+/* 【中文】AbsorbSyncRequests() 一次批量处理的请求上限，防止长时间
+ * 持有 CheckpointerCommLock 阻塞其它后端登记请求。 */
 
 /* Max number of requests the checkpointer request queue can hold */
 #define MAX_CHECKPOINT_REQUESTS 10000000
+/* 【中文】请求环形队列的容量上限（默认 1000 万条），实际容量取
+ * min(NBuffers, MAX_CHECKPOINT_REQUESTS)。 */
 
 /*
  * GUC parameters
  */
+/* 【中文】三个 checkpoint 相关 GUC 参数的底层变量：
+ *  - CheckPointTimeout（checkpoint_timeout，默认 300 秒）：距上次
+ *    checkpoint 超过该时长就自动触发一次定时 checkpoint；
+ *  - CheckPointWarning（checkpoint_warning，默认 30 秒）：若两次
+ *    checkpoint 间隔短于该值且又是因 WAL 写满触发，就发日志警告
+ *    "checkpoints are occurring too frequently"；
+ *  - CheckPointCompletionTarget（checkpoint_completion_target，默认
+ *    0.9）：把刷脏页的工作量尽量摊到"两次 checkpoint 间隔的 90%"
+ *    内完成，避免瞬时大 IO 尖峰（见 IsCheckpointOnSchedule）。 */
 int			CheckPointTimeout = 300;
 int			CheckPointWarning = 30;
 double		CheckPointCompletionTarget = 0.9;
@@ -182,8 +244,25 @@ static double ckpt_cached_elapsed;
 
 static pg_time_t last_checkpoint_time;
 static pg_time_t last_xlog_switch_time;
+/* 【中文】本进程私有的检查点状态：
+ *  - ckpt_active：当前是否正处在一个 checkpoint 执行期间（出错恢复时
+ *    据此判断要不要向等待的后端报告 ckpt_failed）；
+ *  - ShutdownXLOGPending：SIGINT 处理函数置位，要求写关闭检查点；
+ *  - ckpt_start_time / ckpt_start_recptr：本次 checkpoint 开始时刻与
+ *    开始时的 WAL 插入位点（供 IsCheckpointOnSchedule 计算进度基准）；
+ *  - ckpt_cached_elapsed：进度判断的缓存结果，避免每写一页都重算；
+ *  - last_checkpoint_time：上次 checkpoint 开始时间（定时检查点据此
+ *    判断是否到期，注意记录的是"开始"时间以保证间隔可预测）；
+ *  - last_xlog_switch_time：上次 WAL 段切换（或请求切换）时间，
+ *    供 archive_timeout 判定。 */
 
 /* Prototypes for private functions */
+/* 【中文】本文件内部函数原型一览（各函数注释见正文）：
+ * ProcessCheckpointerInterrupts 统一处理信号；CheckArchiveTimeout
+ * 处理 archive_timeout 的 WAL 段切换；IsCheckpointOnSchedule 判断
+ * 刷盘进度是否落后；FastCheckpointRequested 查是否有人请求了快速
+ * 检查点；CompactCheckpointerRequestQueue 压缩 fsync 请求队列去重；
+ * UpdateSharedMemoryConfig 把 GUC 新值同步到共享内存。 */
 
 static void ProcessCheckpointerInterrupts(void);
 static void CheckArchiveTimeout(void);
@@ -201,6 +280,31 @@ static void ReqShutdownXLOG(SIGNAL_ARGS);
  *
  * This is invoked from AuxiliaryProcessMain, which has already created the
  * basic execution environment, but not enabled signals yet.
+ *
+ * 【中文总述】
+ * checkpointer 进程的主入口（由 AuxiliaryProcessMain 分发调用，
+ * 彼时基本执行环境已就绪，但信号尚未启用）。执行阶段概览：
+ *   1. 安装/忽略本进程的信号（注意故意忽略 SIGTERM！）
+ *   2. 初始化：登记"关机前写统计"的退出回调、创建专属内存上下文
+ *   3. 建立错误恢复现场（sigsetjmp），出错时向等待的后端报告失败
+ *   4. 更新共享内存中的配置快照
+ *   5. 主循环（for(;;)），每轮依次判断：
+ *      a. 收走后端排队的 fsync 请求（AbsorbSyncRequests）
+ *      b. 处理信号中断；被要求关闭（SIGINT 写关闭检查点 /
+ *         SIGUSR2 停机）则跳出主循环
+ *      c. 检测"是否有人请求 checkpoint"（共享内存 ckpt_flags 非零）
+ *      d. 检测"是否到定时 checkpoint 时间"（超过 checkpoint_timeout）
+ *      e. 需要时执行 CreateCheckPoint() / CreateRestartPoint()，
+ *         完成后广播 done_cv 唤醒等待的后端，并记录时间/统计
+ *      f. 处理逻辑解码停用、archive_timeout 切换 WAL 段、上报统计
+ *      g. 无事可做时按"距下个事件的时间"计算超时，WaitLatch 睡眠
+ *   6. 退出主循环后：若收到 SIGINT，执行 ShutdownXLOG() 写
+ *      关闭检查点并通知 postmaster；然后等 SIGUSR2 到来，exit(0)
+ *
+ * 核心知识：checkpoint 刷脏页并不是一口气刷完，而是通过
+ * CheckpointWriteDelay() 节流，把刷盘工作摊到
+ * checkpoint_completion_target 规定的时间窗口内完成，避免写放大
+ * 把系统 IO 打满。
  */
 void
 CheckpointerMain(const void *startup_data, size_t startup_data_len)
@@ -208,10 +312,15 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext checkpointer_context;
 
+	/* checkpointer 进程不需要 postmaster 传任何启动数据 */
 	Assert(startup_data_len == 0);
 
+	/* 辅助进程公共初始化（挂接共享内存、登记进程类型、加载 GUC 等，
+	 * 与 bgwriter 的初始化路径一致，见 bgwriter.c 的调用链注释） */
 	AuxiliaryProcessMainCommon();
 
+	/* 向共享内存登记自己的 PID：后端发 fsync 请求时先检查这个字段
+	 * 判断 checkpointer 是否在运行（0 表示未启动） */
 	CheckpointerShmem->checkpointer_pid = MyProcPid;
 
 	/*
@@ -221,23 +330,40 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 	 * system shutdown cycle, init will SIGTERM all processes at once.  We
 	 * want to wait for the backends to exit, whereupon the postmaster will
 	 * tell us it's okay to shut down (via SIGUSR2).
+	 * 【中文】逐个设置信号处理方式（本进程的"信号清单"）：
+	 * SIGHUP → 重载配置文件；SIGINT → ReqShutdownXLOG（请求写关闭
+	 * 检查点）；SIGTERM → 故意忽略：Unix 系统关机时 init 会对所有
+	 * 进程同时发 SIGTERM，我们要等所有后端退出后由 postmaster 发
+	 * SIGUSR2 通知我们"可以退出了"；SIGUSR2 → 停机请求（exit(0)）。
+	 * SIGUSR1 → procsignal；SIGALRM/SIGPIPE → 忽略。
+	 * SIGQUIT 已在 InitPostmasterChild 里设为立即退出。
 	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	/* SIGINT → 置 ShutdownXLOGPending 标志（不是退出，见 ReqShutdownXLOG） */
 	pqsignal(SIGINT, ReqShutdownXLOG);
 	pqsignal(SIGTERM, PG_SIG_IGN);	/* ignore SIGTERM */
 	/* SIGQUIT handler was already set up by InitPostmasterChild */
+	/* 【中文】SIGQUIT 处理函数由 InitPostmasterChild() 在 fork 时已
+	 * 设置好，无需重复安装 */
 	pqsignal(SIGALRM, PG_SIG_IGN);
 	pqsignal(SIGPIPE, PG_SIG_IGN);
+	/* SIGUSR1 → 其它进程投递的 procsignal（屏障、内存日志等请求） */
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+	/* SIGUSR2 → 停机请求（置 ShutdownRequestPending，收尾后 exit(0)） */
 	pqsignal(SIGUSR2, SignalHandlerForShutdownRequest);
 
 	/*
 	 * Reset some signals that are accepted by postmaster but not here
+	 * 【中文】SIGCHLD 恢复默认行为：checkpointer 不 fork 子进程，
+	 * 不需要像 postmaster 那样收割子进程（与 bgwriter 相同）。
 	 */
 	pqsignal(SIGCHLD, PG_SIG_DFL);
 
 	/*
 	 * Initialize so that first time-driven event happens at the correct time.
+	 * 【中文】把"上次检查点时间 / 上次 WAL 段切换时间"都初始化为当前
+	 * 时刻：这样定时 checkpoint 的计时从启动那一刻算起，第一个时间
+	 * 驱动事件恰好落在正确的时间点（不会启动即触发、也不会拖很久）。
 	 */
 	last_checkpoint_time = last_xlog_switch_time = (pg_time_t) time(NULL);
 
@@ -251,6 +377,12 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 	 * after the shutdown checkpoint has been written. postmaster will only
 	 * signal checkpointer to exit after all processes that could emit stats
 	 * have been shut down.
+	 * 【中文】登记"服务器关闭前"回调：把最终统计写盘。这个工作只能由
+	 * 恰好一个进程在正常关闭期间做，而 checkpointer 是退出最晚的进程
+	 * （写完关闭检查点后还赖着不走，等 postmaster 发 SIGUSR2）——
+	 * 写关闭检查点后 walsender 等进程还可能继续产生统计，postmaster
+	 * 会等所有可能产生统计的进程都退出后才发 SIGUSR2，因此由
+	 * checkpointer 在退出前统一落盘最合适。
 	 */
 	before_shmem_exit(pgstat_before_server_shutdown, 0);
 
@@ -259,6 +391,9 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 	 * that we can reset the context during error recovery and thereby avoid
 	 * possible memory leaks.  Formerly this code just ran in
 	 * TopMemoryContext, but resetting that would be a really bad idea.
+	 * 【中文】创建本进程专用的内存上下文 "Checkpointer"：所有工作都在
+	 * 这里面分配内存，出错恢复时整体 Reset 即可清掉泄漏，比直接跑在
+	 * TopMemoryContext 上安全得多（与 bgwriter 的做法一致）。
 	 */
 	checkpointer_context = AllocSetContextCreate(TopMemoryContext,
 												 "Checkpointer",
