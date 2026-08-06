@@ -1255,6 +1255,23 @@ ExecCheckpoint(ParseState *pstate, CheckPointStmt *stmt)
  *		just signal checkpointer to do it, and return).
  *	CHECKPOINT_CAUSE_XLOG: checkpoint is requested due to xlog filling.
  *		(This affects logging, and in particular enables CheckPointWarning.)
+ *
+ * 【中文总述】
+ * 后端进程请求 checkpointer 执行检查点的统一入口。
+ * 核心流程分两步：
+ *   1. 独立后端（standalone backend）直接同步执行 CreateCheckPoint()，
+ *      不经过 checkpointer 进程（因为没有其他后端会被干扰）。
+ *   2. postmaster 环境下的普通后端：
+ *      a. 加 ckpt_lck 锁，原子地 OR 入请求标志 + CHECKPOINT_REQUESTED，
+ *         并记录当前 ckpt_started/ckpt_failed 快照
+ *      b. 通过 SetLatch 唤醒 checkpointer 进程
+ *      c. 若 CHECKPOINT_WAIT 标志位，则通过 start_cv / done_cv
+ *         条件变量等待 checkpointer 完成，使用模运算比较计数器
+ *         以容忍计数器回绕
+ * 【调用链】ExecCheckpoint() / CheckpointerMain() / 自动触发逻辑
+ *   → RequestCheckpoint() → SetLatch(CheckpointerProc) 唤醒 checkpointer
+ *   → checkpointer 的 CheckpointerMain() 主循环检测到 ckpt_flags 非零
+ *   → CreateCheckPoint() 执行实际检查点
  */
 void
 RequestCheckpoint(int flags)
@@ -1404,6 +1421,20 @@ RequestCheckpoint(int flags)
  * is theoretically possible a backend fsync might still be necessary, if
  * the queue is full and contains no duplicate entries.  In that case, we
  * let the backend know by returning false.
+ *
+ * 【中文总述】
+ * 后端被迫直接写盘时，将"此关系脏了、需 fsync"的请求转发给 checkpointer。
+ * 核心逻辑：
+ *   1. 非 postmaster 环境或本进程就是 checkpointer 时直接返回（不可能或非法）
+ *   2. 加 CheckpointerCommLock 排他锁
+ *   3. 若 checkpointer 未运行或队列满，先尝试 CompactCheckpointerRequestQueue()
+ *      去重压缩（队列满时后端自行 fsync 是更昂贵的兜底方案）
+ *   4. 将请求写入环形队列 tail 位置，tail 推进
+ *   5. 队列超过半满时，唤醒 checkpointer 进程来消费
+ * 【调用链】BufferSync() / backend 直接写盘路径
+ *   → ForwardSyncRequest() → 登记到 CheckpointerShmem->requests[] 环形队列
+ *   → checkpointer 的 AbsorbSyncRequests() 批量收走
+ *   → 下一 checkpoint 的 fsync 阶段统一执行
  */
 bool
 ForwardSyncRequest(const FileTag *ftag, SyncRequestType type)
@@ -1475,6 +1506,19 @@ ForwardSyncRequest(const FileTag *ftag, SyncRequestType type)
  * Trying to do this every time the queue is full could lose if there
  * aren't any removable entries.  But that should be vanishingly rare in
  * practice: there's one queue entry per shared buffer.
+ *
+ * 【中文总述】
+ * 对 checkpointer 的 fsync 请求环形队列做原地去重压缩。
+ * 核心算法：
+ *   1. 用哈希表记录每个请求值最后一次出现的环形队列下标
+ *   2. 遍历队列，若某请求值在哈希表中已存在，则标记前一个位置为"可跳过"
+ *   3. 二次遍历：将未被标记的请求按顺序前移（类似删除有序数组中的重复项）
+ *   4. 更新 tail 和 num_requests，返回 true 表示有重复被删除
+ * 为什么不反过来从后往前删？因为 SYNC_FORGET_REQUEST / SYNC_FILTER_REQUEST
+ * 这类特殊请求会改变语义，正向遍历才能正确处理。
+ * 【调用链】ForwardSyncRequest() → 队列满时调用 CompactCheckpointerRequestQueue()
+ *   → 哈希表去重 → 原地紧凑 → 返回是否删除了重复项
+ *   → 若返回 false 且队列仍满，后端只能自行 fsync（兜底）
  */
 static bool
 CompactCheckpointerRequestQueue(void)
@@ -1686,6 +1730,15 @@ AbsorbSyncRequests(void)
 
 /*
  * Update any shared memory configurations based on config parameters
+ *
+ * 【中文总述】
+ * 根据 SIGHUP 重载的配置参数，同步更新共享内存中的相关状态。
+ * 两个核心操作：
+ *   1. SyncRepUpdateSyncStandbysDefined()：更新同步复制的 standby 定义
+ *   2. UpdateFullPageWrites()：若 full_page_writes 被修改，写入 XLOG_FPW_CHANGE 记录
+ * 仅在 checkpointer 进程中被调用，由 ProcessCheckpointerInterrupts() 在每次主循环迭代时触发。
+ * 【调用链】ProcessCheckpointerInterrupts() → UpdateSharedMemoryConfig()
+ *   → SyncRepUpdateSyncStandbysDefined() + UpdateFullPageWrites()
  */
 static void
 UpdateSharedMemoryConfig(void)
@@ -1705,6 +1758,17 @@ UpdateSharedMemoryConfig(void)
 /*
  * FirstCallSinceLastCheckpoint allows a process to take an action once
  * per checkpoint cycle by asynchronously checking for checkpoint completion.
+ *
+ * 【中文总述】
+ * 让其他进程在每个检查点周期中仅执行一次指定动作的辅助函数。
+ * 通过异步检查检查点完成状态来实现：每次调用时比较当前的 ckpt_done
+ * 与上次记录的值，若不同则说明检查点已完成，返回 true。
+ * 典型用法：在后端进程的某个关键路径上调用，若返回 true 则执行一次
+ * 清理或刷新操作（如释放临时快照、刷新 WAL 等）。
+ * 注意：ckpt_done 是共享内存中的原子计数器，由 checkpointer 在每次
+ * 检查点完成后更新；本函数使用自旋锁保护本地静态变量的读取。
+ * 【调用链】checkpointer 完成检查点 → 更新 ckpt_done → 后端调用
+ *   FirstCallSinceLastCheckpoint() → 返回 true → 执行一次动作
  */
 bool
 FirstCallSinceLastCheckpoint(void)
@@ -1727,6 +1791,18 @@ FirstCallSinceLastCheckpoint(void)
 
 /*
  * Wake up the checkpointer process.
+ *
+ * 【中文总述】
+ * 唤醒检查点进程，使其从等待状态中退出并重新进入主循环。
+ * 通过读取共享内存中记录的 checkpointer 进程号，获取其 procLatch，
+ * 然后调用 SetLatch() 触发 latch 信号。
+ * 任何需要触发检查点的进程都可以调用本函数（例如：收到 checkpoint
+ * 请求、检测到 WAL 归档超时、检测到快速检查点请求等）。
+ * 如果当前系统中没有 checkpointer 进程（checkpointerProc == INVALID_PROC_NUMBER），
+ * 则不做任何操作。
+ * 【调用链】RequestCheckpoint() / CheckArchiveTimeout() / FastCheckpointRequested()
+ *   → WakeupCheckpointer() → SetLatch(checkpointerProc->procLatch)
+ *   → checkpointer 主循环被唤醒 → ProcessCheckpointerInterrupts()
  */
 void
 WakeupCheckpointer(void)
