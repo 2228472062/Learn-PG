@@ -37,6 +37,16 @@ static char *str_udeescape(const char *str, char escape,
  *
  * Returns a list of raw (un-analyzed) parse trees.  The contents of the
  * list have the form required by the specified RawParseMode.
+ *
+ * 【中文总述】
+ * SQL 解析的主入口函数。接收 SQL 字符串和解析模式，调用 flex（scanner_init）
+ * 进行词法分析、调用 bison（base_yyparse）进行语法分析，最终返回原始解析树
+ * 列表（未经过 analyze.c 分析）。
+ * 解析模式（RawParseMode）控制是否预读一个 token：
+ *   RAW_PARSE_DEFAULT：普通 SQL 语句，无需预读
+ *   RAW_PARSE_TYPE_NAME：解析类型名（如 CREATE TYPE）
+ *   RAW_PARSE_PLPGSQL_EXPR / ASSIGN1 / ASSIGN2 / ASSIGN3：PL/pgSQL 表达式或赋值
+ * 【调用链】SQL 输入 → raw_parser() → scanner_init() + base_yyparse() → 返回原始解析树列表
  */
 List *
 raw_parser(const char *str, RawParseMode mode)
@@ -106,6 +116,15 @@ raw_parser(const char *str, RawParseMode mode)
  * The filter also provides a convenient place to translate between
  * the core_YYSTYPE and YYSTYPE representations (which are really the
  * same thing anyway, but notationally they're different).
+ *
+ * 【中文总述】
+ * 解析器与核心词法分析器之间的中间过滤器。
+ * 作用：
+ *   1. 将需要前瞻多 token 的 SQL 语法简化为单 token 前瞻，保持文法 LALR(1)
+ *   2. 将 UIDENT/USCONST 序列转换为普通 IDENT/SCONST token
+ *   3. 处理 UESCAPE 语法（Unicode 转义字符串），验证转义字符并执行 Unicode 转换
+ * 【调用链】base_yyparse() → base_yylex() → core_yylex()（核心词法分析器）
+ *   → UESCAPE 处理时调用 check_uescapechar() + str_udeescape()
  */
 int
 base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
@@ -324,6 +343,8 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 }
 
 /* convert hex digit (caller should have verified that) to value */
+/* 【中文】将十六进制字符（0-9, a-f, A-F）转换为对应的数值 0-15。
+ * 【调用链】str_udeescape() → hexval() → 解析 Unicode 转义序列中的十六进制位 */
 static unsigned int
 hexval(unsigned char c)
 {
@@ -338,6 +359,9 @@ hexval(unsigned char c)
 }
 
 /* is Unicode code point acceptable? */
+/* 【中文】检查 Unicode 码点是否合法（是否在有效范围内）。
+ * 如果码点无效，报告语法错误。
+ * 【调用链】str_udeescape() → check_unicode_value() → 验证 Unicode 转义值 */
 static void
 check_unicode_value(char32_t c)
 {
@@ -348,6 +372,9 @@ check_unicode_value(char32_t c)
 }
 
 /* is 'escape' acceptable as Unicode escape character (UESCAPE syntax) ? */
+/* 【中文】检查 UESCAPE 语法中指定的转义字符是否合法。
+ * 合法字符：非十六进制数字、非 +/'"/空白符的任意字符。
+ * 【调用链】base_yylex() → check_uescapechar() → 验证 UESCAPE 字符 */
 static bool
 check_uescapechar(unsigned char escape)
 {
@@ -367,6 +394,17 @@ check_uescapechar(unsigned char escape)
  * escape: the escape character to use
  * position: start position of U&'' or U&"" string token
  * yyscanner: context information needed for error reports
+ *
+ * 【中文总述】
+ * 处理 U&'' / U&"" 字符串中的 Unicode 转义序列（\XXXX 或 \+XXXXXX），
+ * 将其转换为普通字符串。处理逻辑：
+ *   1. 遍历输入字符串，遇到转义字符时解析后续十六进制位
+ *   2. 支持 4 位（\XXXX）和 8 位（\+XXXXXX）两种 Unicode 转义格式
+ *   3. 处理 UTF-16 代理对（surrogate pair）的合并
+ *   4. 调用 pg_unicode_to_server() 将 Unicode 码点转为服务器编码
+ *   5. 错误时通过 scanner_errposition 报告精确位置
+ * 【调用链】base_yylex() → str_udeescape() → hexval() + check_unicode_value()
+ *   → pg_unicode_to_server() → 返回转换后的普通字符串
  */
 static char *
 str_udeescape(const char *str, char escape,

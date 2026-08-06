@@ -59,6 +59,19 @@ static Oid	LookupFuncNameInternal(ObjectType objtype, List *funcname,
 /*
  *	Parse a function call
  *
+ *	【中文总述】
+ *	解析函数调用或列投影表达式。这是解析器处理函数调用的核心入口函数，
+ *	负责将 SQL 中的函数调用语法（如 func(args)）或列投影语法（如 tab.col）
+ *	转换为表达式树节点。函数调用和列投影在语法上可能等价，
+ *	本函数会根据上下文判断具体含义。
+ *
+ *	【调用链】
+ *	被 gram.y 中的 FuncCall 规则调用，
+ *	调用 LookupFuncNameInternal -> FuncnameGetCandidates -> func_get_detail
+ *	进行函数 OID 解析，调用 coerce_type 进行参数类型强制转换，
+ *	调用 transformWindowFuncCall 处理窗口函数，调用 check_srf_call_placement
+ *	检查集合返回函数的位置合法性。
+ *
  *	For historical reasons, Postgres tries to treat the notations tab.col
  *	and col(tab) as equivalent: if a single-argument function call has an
  *	argument of complex type and the (unqualified) function name matches
@@ -929,8 +942,13 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 /*
  * Interpret the fgc_flags and issue a suitable detail or hint message.
  *
- * Helper function to reduce code duplication while throwing a
- * function-not-found error.
+ * 【中文总述】
+ * 辅助函数，用于在函数/过程未找到时根据 fgc_flags 生成详细的错误提示信息。
+ * 通过分析搜索标志位，区分"函数不存在"、"函数不在搜索路径中"、
+ * "参数数量不匹配"、"参数名不匹配"等多种情况，给出精确的错误提示。
+ *
+ * 【调用链】
+ * 被 ParseFuncOrColumn 调用，用于在函数查找失败时生成错误信息。
  */
 static int
 func_lookup_failure_details(int fgc_flags, List *argnames, bool proc_call)
@@ -1027,6 +1045,16 @@ func_lookup_failure_details(int fgc_flags, List *argnames, bool proc_call)
 
 /*
  * func_match_argtypes()
+ *
+ * 【中文总述】
+ * 从候选函数列表中筛选出与输入参数类型兼容的候选函数。
+ * 利用 can_coerce_type 检查每个候选函数的参数类型是否能通过隐式强制转换
+ * 匹配输入类型，返回匹配成功的候选函数数量。
+ * 注意：UNKNOWN 类型的输入可以被强制转换为任何类型，因此不会被排除。
+ *
+ * 【调用链】
+ * 被 func_get_detail 调用，用于在精确匹配失败后筛选候选函数列表。
+ * 内部调用 can_coerce_type 进行类型兼容性检查。
  *
  * Given a list of candidate functions (having the right name and number
  * of arguments) and an array of input datatype OIDs, produce a shortlist of
@@ -1484,6 +1512,17 @@ func_select_candidate(int nargs,
 /*
  * func_get_detail()
  *
+ * 【中文总述】
+ * 在系统目录中查找命名函数，完成函数 OID 解析的核心逻辑。
+ * 首先尝试精确匹配参数类型，如果失败则检查是否为类型转换请求，
+ * 然后通过 func_match_argtypes 和 func_select_candidate 进行候选函数匹配，
+ * 最终返回函数的详细信息（包括返回类型、是否返回集合等）。
+ *
+ * 【调用链】
+ * 被 ParseFuncOrColumn 调用，是函数查找的主流程函数。
+ * 内部调用 FuncnameGetCandidates -> func_match_argtypes -> func_select_candidate
+ * 进行候选函数筛选和选择，最后通过 SearchSysCache1 查询 pg_proc 目录获取函数详情。
+ *
  * Find the named function in the system catalogs.
  *
  * Attempt to find the named function in the system catalogs with
@@ -1858,6 +1897,15 @@ func_get_detail(List *funcname,
 /*
  * unify_hypothetical_args()
  *
+ * 【中文总述】
+ * 确保假设性集合聚合（hypothetical-set aggregate）的每个直接参数
+ * 与对应的聚合参数具有相同的类型。对于声明为 ANY 的参数类型，
+ * 需要通过 select_common_type 统一直接参数和聚合参数的类型。
+ *
+ * 【调用链】
+ * 被 ParseFuncOrColumn 调用（在处理聚合函数时），
+ * 内部调用 select_common_type 和 coerce_type 进行类型统一和强制转换。
+ *
  * Ensure that each hypothetical direct argument of a hypothetical-set
  * aggregate has the same type as the corresponding aggregated argument.
  * Modify the expressions in the fargs list, if necessary, and update
@@ -1943,6 +1991,14 @@ unify_hypothetical_args(ParseState *pstate,
 /*
  * make_fn_arguments()
  *
+ * 【中文总述】
+ * 为函数的实际参数表达式添加必要的类型强制转换，使每个参数的类型
+ * 匹配函数声明所需的类型。直接修改参数列表（in-place）。
+ *
+ * 【调用链】
+ * 被 ParseFuncOrColumn 调用（在确定函数匹配后），
+ * 内部调用 coerce_type 对每个不匹配的参数进行类型转换。
+ *
  * Given the actual argument expressions for a function, and the desired
  * input types for the function, add any necessary typecasting to the
  * expression tree.  Caller should already have verified that casting is
@@ -2004,7 +2060,14 @@ make_fn_arguments(ParseState *pstate,
 
 /*
  * FuncNameAsType -
- *	  convenience routine to see if a function name matches a type name
+ *
+ * 【中文总述】
+ * 便捷函数，检查函数名是否与某个类型名匹配。用于判断
+ * 单参数函数调用是否实际上是类型转换请求（如 text(varchar)）。
+ * 忽略 shell 类型和复杂类型。
+ *
+ * 【调用链】
+ * 被 func_get_detail 调用，用于检测函数名是否为类型名。
  *
  * Returns the OID of the matching type, or InvalidOid if none.  We ignore
  * shell types and complex types.
@@ -2036,7 +2099,17 @@ FuncNameAsType(List *funcname)
 
 /*
  * ParseComplexProjection -
- *	  handles function calls with a single argument that is of complex type.
+ *
+ * 【中文总述】
+ * 处理单参数复杂类型（RECORD 或复合类型）的函数调用。
+ * 如果该调用实际上是列投影（如 tab.col），则返回转换后的 FieldSelect 表达式；
+ * 否则返回 NULL，表示这不是列投影而是普通函数调用。
+ *
+ * 【调用链】
+ * 被 ParseFuncOrColumn 调用（在判断为列投影语法时），
+ * 内部调用 scanNSItemForColumn 或 expandRecordVariable 获取元组描述符。
+ *
+ * 	  handles function calls with a single argument that is of complex type.
  *	  If the function call is actually a column projection, return a suitably
  *	  transformed expression tree.  If not, return NULL.
  */
@@ -2109,7 +2182,16 @@ ParseComplexProjection(ParseState *pstate, const char *funcname, Node *first_arg
 
 /*
  * funcname_signature_string
- *		Build a string representing a function name, including arg types.
+ *
+ * 【中文总述】
+ * 构建表示函数签名的字符串，格式如 "foo(integer)"，用于错误提示信息中
+ * 显示函数名和参数类型。支持命名参数语法。
+ *
+ * 【调用链】
+ * 被 func_get_detail、LookupFuncName、LookupFuncWithArgs 等函数调用，
+ * 用于生成函数未找到或参数不匹配时的错误消息。
+ *
+ * 		Build a string representing a function name, including arg types.
  *		The result is something like "foo(integer)".
  *
  * If argnames isn't NIL, it is a list of C strings representing the actual
@@ -2154,7 +2236,15 @@ funcname_signature_string(const char *funcname, int nargs,
 
 /*
  * func_signature_string
- *		As above, but function name is passed as a qualified name list.
+ *
+ * 【中文总述】
+ * 与 funcname_signature_string 功能相同，但函数名以限定名列表形式传入，
+ * 自动转换为字符串表示。
+ *
+ * 【调用链】
+ * 被 func_get_detail、LookupFuncName、LookupFuncWithArgs 等函数调用。
+ *
+ * 		As above, but function name is passed as a qualified name list.
  */
 const char *
 func_signature_string(List *funcname, int nargs,
@@ -2166,7 +2256,17 @@ func_signature_string(List *funcname, int nargs,
 
 /*
  * LookupFuncNameInternal
- *		Workhorse for LookupFuncName/LookupFuncWithArgs
+ *
+ * 【中文总述】
+ * LookupFuncName 和 LookupFuncWithArgs 的工作主函数。
+ * 通过 FuncnameGetCandidates 获取候选函数列表，然后根据参数类型和对象类型
+ * 进行匹配查找。支持函数、聚合函数、过程和例程等多种对象类型的查找。
+ * 查找失败时返回 InvalidOid 并设置 lookupError 标志。
+ *
+ * 【调用链】
+ * 被 LookupFuncName 和 LookupFuncWithArgs 调用，
+ * 内部调用 FuncnameGetCandidates 获取候选列表，通过 get_func_prokind
+ * 和 SearchSysCache1 查询目录信息。
  *
  * In an error situation, e.g. can't find the function, then we return
  * InvalidOid and set *lookupError to indicate what went wrong.
@@ -2253,6 +2353,15 @@ LookupFuncNameInternal(ObjectType objtype, List *funcname,
 /*
  * LookupFuncName
  *
+ * 【中文总述】
+ * 根据函数名和参数类型查找函数的公共入口。通过 LookupFuncNameInternal
+ * 完成实际查找，只查找普通函数（忽略过程），找不到时根据 missing_ok
+ * 决定返回 InvalidOid 还是抛出错误。
+ *
+ * 【调用链】
+ * 被解析器的各种表达式解析场景调用，
+ * 内部调用 LookupFuncNameInternal -> FuncnameGetCandidates -> SearchSysCache1。
+ *
  * Given a possibly-qualified function name and optionally a set of argument
  * types, look up the function.  Pass nargs == -1 to indicate that the number
  * and types of the arguments are unspecified (this is NOT the same as
@@ -2321,6 +2430,15 @@ LookupFuncName(List *funcname, int nargs, const Oid *argtypes, bool missing_ok)
 
 /*
  * LookupFuncWithArgs
+ *
+ * 【中文总述】
+ * 与 LookupFuncName 类似，但参数类型通过 ObjectWithArgs 节点指定。
+ * 支持按对象类型（函数/过程/聚合/例程）进行查找和验证，
+ * 可同时考虑输入参数和带模式标记的参数列表。
+ *
+ * 【调用链】
+ * 被解析器中处理 ObjectWithArgs 节点的场景调用，
+ * 内部调用 LookupFuncNameInternal 完成实际查找。
  *
  * Like LookupFuncName, but the argument types are specified by an
  * ObjectWithArgs node.  Also, this function can check whether the result is a
@@ -2630,7 +2748,18 @@ LookupFuncWithArgs(ObjectType objtype, ObjectWithArgs *func, bool missing_ok)
 
 /*
  * check_srf_call_placement
- *		Verify that a set-returning function is called in a valid place,
+ *
+ * 【中文总述】
+ * 验证集合返回函数（SRF）是否在合法的上下文中被调用。
+ * 检查当前表达式类型（如 SELECT 目标列、WHERE 子句、FROM 子句等），
+ * 如果 SRF 出现在不允许的位置（如 JOIN 条件、窗口定义中等），则抛出错误。
+ * 同时设置 pstate->p_hasTargetSRFs 标志，标记查询中包含 SRF。
+ *
+ * 【调用链】
+ * 被 ParseFuncOrColumn 调用（在处理完函数参数转换后），
+ * 内部根据 pstate->p_expr_kind 判断上下文合法性。
+ *
+ * 		Verify that a set-returning function is called in a valid place,
  *		and throw a nice error if not.
  *
  * A side-effect is to set pstate->p_hasTargetSRFs true if appropriate.

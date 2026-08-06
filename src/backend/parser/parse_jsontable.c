@@ -79,6 +79,18 @@ static void
  * populate TableFunc.docexpr and TableFunc.colvalexprs, respectively. Also,
  * the PASSING values (jt->passing) are transformed and added into
  * TableFunc.passingvalexprs.
+ *
+ * 【中文总述】
+ * JSON_TABLE 表达式的主转换函数：将原始 JsonTable 节点转换为 TableFunc 节点。
+ * 核心工作：
+ *   1. 转换 context_item（JSON 文档生成表达式）→ TableFunc.docexpr
+ *   2. 转换 columns（列生成表达式）→ TableFunc.colvalexprs
+ *   3. 转换 PASSING 参数 → TableFunc.passingvalexprs
+ * 还会为未命名的路径生成唯一名称，并检查列/路径名是否重复。
+ * 【调用链】SQL 解析器（gram.y）→ transformTableFunction() → 本函数
+ *   transformExpr() → 转换 context_item 为 JsonExpr
+ *   transformJsonTableColumns() → 递归转换所有列
+ *   addRangeTableEntryForTableFunc() → 注册 Range Table Entry
  */
 ParseNamespaceItem *
 transformJsonTable(ParseState *pstate, JsonTable *jt)
@@ -192,6 +204,18 @@ transformJsonTable(ParseState *pstate, JsonTable *jt)
 }
 
 /*
+ * CheckDuplicateColumnOrPathNames -
+ *  检查给定列列表中是否有重复的列名或路径名。
+ *
+ * 【中文总述】
+ * 递归检查 JSON_TABLE 的列定义中是否有重复的列名或路径名。
+ * 对于 NESTED 类型的列，递归检查其子列，并检查路径名是否重复。
+ * 对于普通列，检查列名是否重复。
+ * 【调用链】transformJsonTable() → 本函数（首次调用）
+ *   CheckDuplicateColumnOrPathNames() → 递归检查嵌套列
+ *   LookupPathOrColumnName() → 查询名称是否已存在
+ */
+/*
  * Check if a column / path name is duplicated in the given shared list of
  * names.
  */
@@ -237,6 +261,15 @@ CheckDuplicateColumnOrPathNames(JsonTableParseContext *cxt,
 /*
  * Lookup a column/path name in the given name list, returning true if already
  * there.
+ *
+ * 【中文总述】
+ * 在已收集的路径/列名列表中查找指定名称，返回是否已存在。
+ * 用于检测重复的列名或路径名。
+ * 【调用链】CheckDuplicateColumnOrPathNames() → 本函数
+ */
+/*
+ * Lookup a column/path name in the given name list, returning true if already
+ * there.
  */
 static bool
 LookupPathOrColumnName(JsonTableParseContext *cxt, char *name)
@@ -252,6 +285,15 @@ LookupPathOrColumnName(JsonTableParseContext *cxt, char *name)
 	return false;
 }
 
+/* Generate a new unique JSON_TABLE path name.
+ *
+ * 【中文总述】
+ * 生成唯一的 JSON_TABLE 路径名称，格式为 "json_table_path_N"。
+ * 递增计数器直到找到未被使用的名称（避免与用户指定的列名或路径名冲突）。
+ * 【调用链】transformJsonTable() → 本函数（当 rootPathSpec->name 为 NULL 时）
+ *   transformJsonTableColumns() → 递归调用时也可能触发
+ *   LookupPathOrColumnName() → 检查名称是否已存在
+ */
 /* Generate a new unique JSON_TABLE path name. */
 static char *
 generateJsonTablePathName(JsonTableParseContext *cxt)
@@ -277,6 +319,24 @@ generateJsonTablePathName(JsonTableParseContext *cxt)
 	return name;
 }
 
+/*
+ * Create a JsonTablePlan that will supply the source row for 'columns'
+ * using 'pathspec' and append the columns' transformed JsonExpr nodes and
+ * their type/collation information to cxt->tf.
+ *
+ * 【中文总述】
+ * 将 JSON_TABLE 的列定义列表转换为 JsonTablePlan 计划节点。
+ * 核心工作：
+ *   1. 确定列范围（colMin/colMax）
+ *   2. 处理 PLAN 子句（JSTP_DEFAULT/JSTP_SIMPLE/JSTP_JOINED）
+ *   3. 递归转换嵌套列
+ *   4. 创建 JsonTablePathScan 作为底层扫描节点
+ * 【调用链】transformJsonTable() → 本函数（首次调用）
+ *   transformJsonTableColumns() → 递归处理嵌套列
+ *   transformJsonTableNestedColumns() → 处理 PLAN 子句中的嵌套列
+ *   makeJsonTablePathScan() → 创建路径扫描节点
+ *   appendJsonTableColumns() → 添加列表达式到 TableFunc
+ */
 /*
  * Create a JsonTablePlan that will supply the source row for 'columns'
  * using 'pathspec' and append the columns' transformed JsonExpr nodes and
@@ -373,6 +433,18 @@ transformJsonTableColumns(JsonTableParseContext *cxt,
 	return (JsonTablePlan *) scan;
 }
 
+/* Append transformed non-nested JSON_TABLE columns to the TableFunc node
+ *
+ * 【中文总述】
+ * 将非嵌套列的转换结果追加到 TableFunc 节点中。
+ * 处理 FOR ORDINALITY（生成行号）、普通列（JSON_VALUE）、
+ * 格式化列（JSON_QUERY）和 EXISTS 列（JSON_EXISTS）。
+ * 每列的结果类型、typmod、collation 和表达式都添加到 TableFunc 的对应链表中。
+ * 【调用链】transformJsonTableColumns() → 本函数
+ *   transformJsonTableColumn() → 生成单列的 JsonFuncExpr
+ *   transformExpr() → 转换 JsonFuncExpr 为可执行表达式
+ *   typenameTypeIdAndMod() → 解析用户指定的类型
+ */
 /* Append transformed non-nested JSON_TABLE columns to the TableFunc node */
 static void
 appendJsonTableColumns(JsonTableParseContext *cxt, List *columns, List *passingArgs)
@@ -469,6 +541,20 @@ appendJsonTableColumns(JsonTableParseContext *cxt, List *columns, List *passingA
 /*
  * Check if the type is "composite" for the purpose of checking whether to use
  * JSON_VALUE() or JSON_QUERY() for a given JsonTableColumn.
+ *
+ * 【中文总述】
+ * 判断给定类型是否为"复合类型"，用于决定 JSON_TABLE 列应使用
+ * JSON_VALUE() 还是 JSON_QUERY()。
+ * 复合类型包括：JSON、JSONB、RECORD、任意数组、复合类型，
+ * 以及基于上述类型的域（domain）。
+ * 【调用链】appendJsonTableColumns() → 本函数
+ *   get_typtype() → 获取类型分类
+ *   type_is_array() → 检查是否为数组类型
+ *   getBaseType() → 获取域的基类型
+ */
+/*
+ * Check if the type is "composite" for the purpose of checking whether to use
+ * JSON_VALUE() or JSON_QUERY() for a given JsonTableColumn.
  */
 static bool
 isCompositeType(Oid typid)
@@ -485,6 +571,25 @@ isCompositeType(Oid typid)
 		 isCompositeType(getBaseType(typid)));
 }
 
+/*
+ * Transform JSON_TABLE column definition into a JsonFuncExpr
+ * This turns:
+ *   - regular column into JSON_VALUE()
+ *   - FORMAT JSON column into JSON_QUERY()
+ *   - EXISTS column into JSON_EXISTS()
+ *
+ * 【中文总述】
+ * 将单列 JSON_TABLE 列定义转换为 JsonFuncExpr 节点。
+ * 根据列类型选择操作符：
+ *   JTC_REGULAR → JSON_VALUE_OP
+ *   JTC_EXISTS → JSON_EXISTS_OP
+ *   其他（JTC_FORMATTED）→ JSON_QUERY_OP
+ * 还会为列构造默认路径（"$."列名"）如果未指定路径。
+ * 【调用链】appendJsonTableColumns() → 本函数
+ *   transformExpr() → 转换结果为可执行表达式
+ *   makeJsonValueExpr() → 构造 JSON 值表达式
+ *   makeStringConst() → 构造默认路径字符串常量
+ */
 /*
  * Transform JSON_TABLE column definition into a JsonFuncExpr
  * This turns:
@@ -561,6 +666,27 @@ findNestedJsonTableColumn(List *columns, const char *pathname)
 	return NULL;
 }
 
+/*
+ * Recursively transform nested columns and create child plan(s) that will be
+ * used to evaluate their row patterns.
+ *
+ * Default plan is transformed into a cross/union join of its nested columns.
+ * Simple and outer/inner plans are transformed into a JsonTablePlan by
+ * finding and transforming corresponding nested column.
+ * Sibling plans are recursively transformed into a JsonTableSiblingJoin.
+ *
+ * 【中文总述】
+ * 递归转换嵌套列并创建子计划节点。
+ * 处理四种 PLAN 子句类型：
+ *   JSTP_DEFAULT → 默认计划，对嵌套列做交叉/并集连接
+ *   JSTP_SIMPLE → 简单计划，按路径名查找对应嵌套列
+ *   JSTP_JOINED → 连接计划（INNER/OUTER/CROSS/UNION）
+ *   其他 → 报错
+ * 【调用链】transformJsonTableColumns() → 本函数（处理嵌套列时）
+ *   transformJsonTableColumns() → 递归处理每个嵌套列
+ *   makeJsonTableSiblingJoin() → 合并并行嵌套计划
+ *   findNestedJsonTableColumn() → 按路径名查找嵌套列
+ */
 /*
  * Recursively transform nested columns and create child plan(s) that will be
  * used to evaluate their row patterns.
@@ -668,6 +794,24 @@ transformJsonTableNestedColumns(JsonTableParseContext *cxt,
  * global flat list of column expressions that will be passed to the
  * JSON_TABLE's TableFunc.  Both are -1 when all of columns are nested and
  * thus computed by 'childplan'.
+ *
+ * 【中文总述】
+ * 创建 JsonTablePathScan 计划节点，表示对 JSON 路径的一次扫描。
+ * 将路径字符串转换为 JSONPATHOID 常量，并记录列范围（colMin/colMax）。
+ * 如果有子计划（嵌套列），则标记为 outer join。
+ * 【调用链】transformJsonTableColumns() → 本函数
+ *   makeJsonTablePath() → 构造 JSON 路径对象
+ *   jsonpath_in() → 将路径字符串转为内部表示
+ */
+/*
+ * Create transformed JSON_TABLE parent plan node by appending all non-nested
+ * columns to the TableFunc node and remembering their indices in the
+ * colvalexprs list.
+ *
+ * colMin and colMax give the range of columns computed by this scan in the
+ * global flat list of column expressions that will be passed to the
+ * JSON_TABLE's TableFunc.  Both are -1 when all of columns are nested and
+ * thus computed by 'childplan'.
  */
 static JsonTablePlan *
 makeJsonTablePathScan(JsonTableParseContext *cxt, JsonTablePathSpec *pathspec,
@@ -710,6 +854,19 @@ makeJsonTablePathScan(JsonTableParseContext *cxt, JsonTablePathSpec *pathspec,
  *
  * The default way of "joining" the rows is to perform a UNION between the
  * sets of rows from 'lplan' and 'rplan'.
+ *
+ * 【中文总述】
+ * 创建 JsonTableSiblingJoin 计划节点，将两个子计划的行集合并。
+ * cross=true 表示 CROSS JOIN（笛卡尔积），cross=false 表示 UNION。
+ * 【调用链】transformJsonTableNestedColumns() → 本函数
+ *   transformJsonTableColumns() → 递归转换每个子计划
+ */
+/*
+ * Create a JsonTablePlan that will perform a join of the rows coming from
+ * 'lplan' and 'rplan'.
+ *
+ * The default way of "joining" the rows is to perform a UNION between the
+ * sets of rows from 'lplan' and 'rplan'.
  */
 static JsonTablePlan *
 makeJsonTableSiblingJoin(bool cross, JsonTablePlan *lplan, JsonTablePlan *rplan)
@@ -724,6 +881,13 @@ makeJsonTableSiblingJoin(bool cross, JsonTablePlan *lplan, JsonTablePlan *rplan)
 	return (JsonTablePlan *) join;
 }
 
+/* Collect sibling path names from plan to the specified list.
+ *
+ * 【中文总述】
+ * 收集 JsonTablePlanSpec 中所有 sibling 路径名称到列表中。
+ * 递归处理 JSTP_JOINED 类型的计划节点。
+ * 【调用链】validateJsonTableChildPlan() → 本函数
+ */
 /* Collect sibling path names from plan to the specified list. */
 static void
 collectSiblingPathsInJsonTablePlan(JsonTablePlanSpec *plan, List **paths)
@@ -750,6 +914,22 @@ collectSiblingPathsInJsonTablePlan(JsonTablePlanSpec *plan, List **paths)
 	}
 }
 
+/*
+ * Validate child JSON_TABLE plan by checking that:
+ *  - all nested columns have path names specified
+ *  - all nested columns have corresponding node in the sibling plan
+ *  - plan does not contain duplicate or extra nodes
+ *
+ * 【中文总述】
+ * 校验 JSON_TABLE 的子计划（PLAN 子句）是否合法。
+ * 检查：
+ *   1. 所有 NESTED 列都有路径名
+ *   2. 所有 NESTED 列在 sibling 计划中都有对应节点
+ *   3. sibling 计划中没有多余的或重复的节点
+ * 【调用链】transformJsonTableColumns() → 本函数（处理 PLAN 子句时）
+ *   collectSiblingPathsInJsonTablePlan() → 收集所有 sibling 路径名
+ *   generateJsonTablePathName() → 为未命名的嵌套路径生成名称
+ */
 /*
  * Validate child JSON_TABLE plan by checking that:
  *  - all nested columns have path names specified

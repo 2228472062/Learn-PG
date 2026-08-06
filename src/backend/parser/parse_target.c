@@ -282,6 +282,13 @@ transformExpressionList(ParseState *pstate, List *exprlist,
  *
  * We do this after we've exhausted all other ways of identifying the output
  * column types of a query.
+ *
+ * 【中文总述】
+ * 将目标列表中所有未知类型（UNKNOWN）的列表达式强制转换为 TEXT 类型。
+ * 在 SELECT 中，未指定类型的字面量（如字符串字面量）会被解析为 UNKNOWN，
+ * 最终需要确定为具体类型才能生成执行计划。
+ * 【调用链】transformTargetList() → 本函数（在类型推断完成后调用）
+ *   coerce_type() → 执行实际的类型转换
  */
 void
 resolveTargetListUnknowns(ParseState *pstate, List *targetlist)
@@ -312,6 +319,13 @@ resolveTargetListUnknowns(ParseState *pstate, List *targetlist)
  *
  * Currently, this is done only for SELECT targetlists and RETURNING lists,
  * since we only need the info if we are going to send it to the frontend.
+ *
+ * 【中文总述】
+ * 遍历目标列表，为每个 TargetEntry 标记来源表信息。
+ * 仅对 SELECT 和 RETURNING 列表调用，因为只有这些场景需要
+ * 将列来源信息发送给前端（用于 ORC/JSON 等输出格式）。
+ * 【调用链】parse_select() / parse_returning() → 本函数
+ *   markTargetListOrigin() → 处理单个 TargetEntry
  */
 void
 markTargetListOrigins(ParseState *pstate, List *targetlist)
@@ -326,6 +340,27 @@ markTargetListOrigins(ParseState *pstate, List *targetlist)
 	}
 }
 
+/*
+ * markTargetListOrigin()
+ *		If 'var' is a Var of a plain relation, mark 'tle' with its origin
+ *
+ * levelsup is an extra offset to interpret the Var's varlevelsup correctly.
+ *
+ * Note that we do not drill down into views, but report the view as the
+ * column owner.  There's also no need to drill down into joins: if we see
+ * a join alias Var, it must be a merged JOIN USING column (or possibly a
+ * whole-row Var); that is not a direct reference to any plain table column,
+ * so we don't report it.
+ *
+ * 【中文总述】
+ * 标记单个 TargetEntry 的来源表和列号。
+ * 根据 RTE 类型分别处理：
+ *   RTE_RELATION → 直接记录表 OID 和列号
+ *   RTE_SUBQUERY → 递归复制子查询的来源信息
+ *   RTE_CTE → 递归复制 CTE 的来源信息
+ *   其他类型（JOIN/FUNCTION/VALUES 等）不标记
+ * 【调用链】markTargetListOrigins() → 本函数
+ */
 /*
  * markTargetListOrigin()
  *		If 'var' is a Var of a plain relation, mark 'tle' with its origin
@@ -454,6 +489,18 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
  * column name list entry), and must therefore be -1 in an INSERT that
  * omits the column name list.  So we should usually prefer to use
  * exprLocation(expr) for errors that can happen in a default INSERT.
+ *
+ * 【中文总述】
+ * 处理 INSERT/UPDATE 语句中列赋值表达式的类型转换和子字段/下标操作。
+ * 核心工作：
+ *   1. 处理 DEFAULT 占位符（填充目标列的类型信息）
+ *   2. 处理下标赋值（如 arr[1] = val）
+ *   3. 处理子字段赋值（如 col.field = val）
+ *   4. 对普通列执行类型强制转换
+ * 【调用链】transformUpdateStmt() / transformInsertStmt() → 本函数
+ *   transformAssignmentIndirection() → 处理下标/子字段
+ *   coerce_to_target_type() → 类型强制转换
+ *   transformExpr() → 已在调用前完成表达式转换
  */
 Expr *
 transformAssignedExpr(ParseState *pstate,
@@ -622,6 +669,12 @@ transformAssignedExpr(ParseState *pstate,
  * attrno		target attribute number
  * indirection	subscripts/field names for target column, if any
  * location		error cursor position (should point at column name), or -1
+ *
+ * 【中文总述】
+ * UPDATE 语句中更新目标列表条目的入口函数。
+ * 调用 transformAssignedExpr() 处理表达式，然后设置 resno 和 resname。
+ * 【调用链】transformUpdateStmt() → 本函数
+ *   transformAssignedExpr() → 处理类型转换和下标/子字段
  */
 void
 updateTargetListEntry(ParseState *pstate,
@@ -660,7 +713,7 @@ updateTargetListEntry(ParseState *pstate,
  *
  * In the initial call, basenode is a Var for the target column in UPDATE,
  * or a null Const of the target's type in INSERT, or a Param for the target
- * variable in PL/pgSQL assignment.  In recursive calls, basenode is NULL,
+ * variable in PL/pgSQL assignment. In recursive calls, basenode is NULL,
  * indicating that a substitute node should be consed up if needed.
  *
  * targetName is the name of the field or subfield we're assigning to, and
@@ -686,6 +739,18 @@ updateTargetListEntry(ParseState *pstate,
  * to the head of the target clause, eg "foo" in "foo.bar[baz]".  Later we
  * might want to decorate indirection cells with their own location info,
  * in which case the location argument could probably be dropped.)
+ *
+ * 【中文总述】
+ * 处理 INSERT/UPDATE/赋值语句中目标列的下标和子字段访问。
+ * 递归处理多层 indirection：
+ *   - A_Indices（下标）→ 累积到 subscripts 列表
+ *   - String（字段名）→ 创建 FieldStore 节点
+ *   - A_Star（*）→ 报错（不支持行扩展）
+ * 最终将 RHS 强制转换为目标类型并返回。
+ * 【调用链】transformAssignedExpr() → 本函数
+ *   transformAssignmentSubscripts() → 处理下标赋值
+ *   coerce_to_target_type() → 最终类型强制转换
+ *   coerce_to_domain() → 处理域类型约束
  */
 Node *
 transformAssignmentIndirection(ParseState *pstate,
@@ -906,6 +971,15 @@ transformAssignmentIndirection(ParseState *pstate,
 
 /*
  * helper for transformAssignmentIndirection: process container assignment
+ *
+ * 【中文总述】
+ * 处理容器类型的下标赋值（如数组、jsonb 等）。
+ * 调用 transformContainerSubscripts() 处理下标，
+ * 然后递归调用 transformAssignmentIndirection 处理 RHS，
+ * 最后将结果包装为 SubscriptingRef 节点。
+ * 【调用链】transformAssignmentIndirection() → 本函数（遇到下标时）
+ *   transformContainerSubscripts() → 解析下标表达式
+ *   transformAssignmentIndirection() → 递归处理 RHS
  */
 static Node *
 transformAssignmentSubscripts(ParseState *pstate,
@@ -1018,6 +1092,15 @@ transformAssignmentSubscripts(ParseState *pstate,
  *	  generate a list of INSERT column targets if not supplied, or
  *	  test supplied column names to make sure they are in target table.
  *	  Also return an integer list of the columns' attribute numbers.
+ *
+ * 【中文总述】
+ * 处理 INSERT 语句的列目标列表。
+ * 如果未指定列列表（INSERT INTO t VALUES (...)），则生成默认列列表；
+ * 如果指定了列列表，则验证每个列名是否存在于目标表中，
+ * 并检查是否有重复列（包括整列和子列的冲突）。
+ * 【调用链】transformInsertStmt() → 本函数
+ *   attnameAttNum() → 查找列号
+ *   expandNSItemAttrs() / expandNSItemVars() → 生成列表达式
  */
 List *
 checkInsertTargets(ParseState *pstate, List *cols, List **attrnos)
@@ -1123,6 +1206,17 @@ checkInsertTargets(ParseState *pstate, List *cols, List **attrnos)
  * expressions).
  *
  * The referenced columns are marked as requiring SELECT access.
+ *
+ * 【中文总述】
+ * 将 ColumnRef 中的 "*" 展开为多个列表达式或目标列表条目。
+ * 处理两种情况：
+ *   1. 裸 "*"（SELECT *）→ 展开所有可见表的列
+ *   2. "foo.*" → 展开指定表的列
+ * 通过 PreParseColumnRefHook / PostParseColumnRefHook 支持扩展钩子。
+ * 【调用链】transformTargetList() / transformExpressionList() → 本函数
+ *   ExpandAllTables() → 处理裸 "*"
+ *   ExpandSingleTable() → 处理 "foo.*"
+ *   ExpandRowReference() → 处理钩子返回的表达式
  */
 static List *
 ExpandColumnRefStar(ParseState *pstate, ColumnRef *cref,
@@ -1296,6 +1390,14 @@ ExpandColumnRefStar(ParseState *pstate, ColumnRef *cref,
  * etc.
  *
  * The referenced relations/columns are marked as requiring SELECT access.
+ *
+ * 【中文总述】
+ * 将 SELECT * 中的 "*" 展开为所有可见表的列列表。
+ * 遍历 p_namespace 中所有 p_cols_visible 的表项，
+ * 为每个表的每个列生成 TargetEntry。
+ * 如果没有找到任何表（如 SELECT * 没有 FROM 子句），则报错。
+ * 【调用链】ExpandColumnRefStar() → 本函数（numnames == 1 时）
+ *   expandNSItemAttrs() → 展开单个表的所有列
  */
 static List *
 ExpandAllTables(ParseState *pstate, int location)

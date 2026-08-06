@@ -63,6 +63,11 @@ static bool query_contains_extern_params_walker(Node *node, void *context);
 
 /*
  * Set up to process a query containing references to fixed parameters.
+ *
+ * 【中文总述】设置固定参数解析状态：参数类型在编译时已知（Oid 数组），
+ * 解析 $n 时直接查表映射到 Param 节点，无需类型推断。
+ * 【调用链】由 raw_parser() → analyze.c 中的 parse_analyze() 调用，
+ * 用于预处理含固定参数的查询。
  */
 void
 setup_parse_fixed_parameters(ParseState *pstate,
@@ -79,6 +84,11 @@ setup_parse_fixed_parameters(ParseState *pstate,
 
 /*
  * Set up to process a query containing references to variable parameters.
+ *
+ * 【中文总述】设置可变参数解析状态：参数类型初始为 UNKNOWN，
+ * 解析时根据上下文推断具体类型，参数数组可动态扩容。
+ * 【调用链】由 raw_parser() → analyze.c 中的 parse_analyze() 调用，
+ * 用于预处理含可变参数（$1, $2...）的查询。
  */
 void
 setup_parse_variable_parameters(ParseState *pstate,
@@ -95,6 +105,11 @@ setup_parse_variable_parameters(ParseState *pstate,
 
 /*
  * Transform a ParamRef using fixed parameter types.
+ *
+ * 【中文总述】处理固定参数 $n 的引用：检查参数编号有效性，
+ * 从预定义类型数组中查找类型，创建 Param 节点。
+ * 【调用链】被 p_paramref_hook 回调调用（由 parse_expr.c 中的
+ * transformParamRef 触发），解析 SQL 中的 $n 参数引用。
  */
 static Node *
 fixed_paramref_hook(ParseState *pstate, ParamRef *pref)
@@ -127,6 +142,12 @@ fixed_paramref_hook(ParseState *pstate, ParamRef *pref)
  *
  * The only difference here is we must enlarge the parameter type array
  * as needed.
+ *
+ * 【中文总述】处理可变参数 $n 的引用：若参数编号超出当前数组则扩容，
+ * 初始化未见过的参数为 UNKNOWN 类型，对 void 类型参数做特殊处理
+ *（允许 JDBC 驱动不区分函数与过程调用）。
+ * 【调用链】被 p_paramref_hook 回调调用，在解析含可变参数的 SQL 时触发；
+ * 参数类型后续由 variable_coerce_param_hook 在类型推断阶段确定。
  */
 static Node *
 variable_paramref_hook(ParseState *pstate, ParamRef *pref)
@@ -182,6 +203,13 @@ variable_paramref_hook(ParseState *pstate, ParamRef *pref)
 
 /*
  * Coerce a Param to a query-requested datatype, in the varparams case.
+ *
+ * 【中文总述】在可变参数场景下，将 Param 从 UNKNOWN 类型强制转换
+ * 为查询请求的目标类型，并记录类型信息。若类型已确定且匹配则跳过，
+ * 若前后推断不一致则报错。
+ * 【调用链】被 p_coerce_param_hook 回调调用（由 transformExpr /
+ * coerce_to_target_type 触发），在表达式类型推断阶段对 UNKNOWN
+ * 类型参数进行类型解析。
  */
 static Node *
 variable_coerce_param_hook(ParseState *pstate, Param *param,
@@ -264,6 +292,11 @@ variable_coerce_param_hook(ParseState *pstate, Param *param,
  * Note: this code intentionally does not check that all parameter positions
  * were used, nor that all got non-UNKNOWN types assigned.  Caller of parser
  * should enforce that if it's important.
+ *
+ * 【中文总述】在可变参数解析完成后，遍历查询树检查参数类型
+ * 是否一致解析（防止同一 $n 在不同位置被推断为不同类型）。
+ * 【调用链】由 parse_analyze() 在 parse_variable_parameters()
+ * 之后调用，确保参数类型推断的完整性。
  */
 void
 check_variable_parameters(ParseState *pstate, Query *query)
@@ -279,9 +312,14 @@ check_variable_parameters(ParseState *pstate, Query *query)
 
 /*
  * Traverse a fully-analyzed tree to verify that parameter symbols
- * match their types.  We need this because some Params might still
+ * match their types. We need this because some Params might still
  * be UNKNOWN, if there wasn't anything to force their coercion,
  * and yet other instances seen later might have gotten coerced.
+ *
+ * 【中文总述】递归遍历已分析的查询树，验证所有 PARAM_EXTERN
+ * 参数是否都获得了确定的类型（不能仍为 UNKNOWN）。
+ * 【调用链】被 check_variable_parameters() 通过 query_tree_walker 调用；
+ * 内部递归调用自身处理子查询和表达式树。
  */
 static bool
 check_parameter_resolution_walker(Node *node, ParseState *pstate)
@@ -326,6 +364,11 @@ check_parameter_resolution_walker(Node *node, ParseState *pstate)
 
 /*
  * Check to see if a fully-parsed query tree contains any PARAM_EXTERN Params.
+ *
+ * 【中文总述】检查一个已解析的查询树中是否包含任何
+ * PARAM_EXTERN 类型的参数引用。
+ * 【调用链】被 analyze.c 或其他分析阶段调用，
+ * 用于判断查询是否依赖外部参数。
  */
 bool
 query_contains_extern_params(Query *query)
@@ -335,10 +378,16 @@ query_contains_extern_params(Query *query)
 							 NULL, 0);
 }
 
+/*
+ * 【中文总述】递归遍历查询树，查找 PARAM_EXTERN 类型的
+ * Param 节点，找到即返回 true。
+ * 【调用链】被 query_contains_extern_params() 通过
+ * query_tree_walker 调用；内部递归调用自身处理子查询
+ * 和表达式树。
+ */
 static bool
 query_contains_extern_params_walker(Node *node, void *context)
 {
-	if (node == NULL)
 		return false;
 	if (IsA(node, Param))
 	{

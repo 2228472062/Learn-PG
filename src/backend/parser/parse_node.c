@@ -34,6 +34,18 @@ static void pcb_error_callback(void *arg);
  *		Allocate and initialize a new ParseState.
  *
  * Caller should eventually release the ParseState via free_parsestate().
+ *
+ * 【中文总述】
+ * 创建并初始化一个新的 ParseState 结构体。
+ * ParseState 是解析分析阶段的核心上下文，记录：
+ *   - parentParseState：父解析状态（用于嵌套查询/子查询）
+ *   - p_next_resno：下一个结果列编号
+ *   - p_resolve_unknowns：是否自动解析 UNKNOWN 类型
+ *   - p_sourcetext：源 SQL 文本（从父状态继承）
+ *   - 各种钩子函数（pre/post columnref hook, paramref hook 等）
+ *   - p_queryEnv：查询环境（ENR 查找等）
+ * 【调用链】analyze.c → make_parsestate() → 创建解析上下文
+ *   → 后续 parse_*() 函数使用 pstate 进行表达式分析
  */
 ParseState *
 make_parsestate(ParseState *parentParseState)
@@ -67,6 +79,14 @@ make_parsestate(ParseState *parentParseState)
 /*
  * free_parsestate
  *		Release a ParseState and any subsidiary resources.
+ *
+ * 【中文总述】
+ * 释放 ParseState 及其关联资源。
+ * 关键检查：
+ *   1. 检查结果列编号是否超过 AttrNumber 上限（MaxTupleAttributeNumber）
+ *   2. 关闭目标关系表（如果打开了的话）
+ *   3. 释放 ParseState 内存
+ * 【调用链】analyze.c → free_parsestate() → table_close() + pfree()
  */
 void
 free_parsestate(ParseState *pstate)
@@ -101,6 +121,14 @@ free_parsestate(ParseState *pstate)
  * to clients.  (We do things this way to avoid unnecessary overhead in the
  * normal non-error case: computing character indexes would be much more
  * expensive than storing token offsets.)
+ *
+ * 【中文总述】
+ * 将原始解析树中的字节偏移位置转换为客户端可读的字符位置，
+ * 并通过 ereport 机制报告错误位置。
+ * 转换逻辑：pg_mbstrlen_with_len() 将字节偏移转为字符偏移（1-based），
+ * 再调用 errposition() 存入错误上下文。
+ * 仅在错误路径调用，正常情况不产生额外开销。
+ * 【调用链】各 parse_*() 函数 → parser_errposition() → errposition()
  */
 int
 parser_errposition(ParseState *pstate, int location)
@@ -135,6 +163,15 @@ parser_errposition(ParseState *pstate, int location)
  *		setup_parser_errposition_callback(&pcbstate, pstate, location);
  *		call function that might throw error;
  *		cancel_parser_errposition_callback(&pcbstate);
+ *
+ * 【中文总述】
+ * 为非解析器内部的错误设置错误位置回调。
+ * 当解析器调用的函数不属于解析子系统但可能抛出错误时，
+ * 通过此函数将错误位置绑定到 ParseState 和指定字节偏移，
+ * 使错误报告能指向源码中的正确位置。
+ * 使用模式：setup → 可能出错的函数调用 → cancel
+ * 【调用链】各 parse_*() 函数 → setup_parser_errposition_callback()
+ *   → pcb_error_callback()（错误时触发）→ cancel_parser_errposition_callback()
  */
 void
 setup_parser_errposition_callback(ParseCallbackState *pcbstate,
@@ -151,7 +188,12 @@ setup_parser_errposition_callback(ParseCallbackState *pcbstate,
 
 /*
  * Cancel a previously-set-up errposition callback.
- */
+ *
+ * 【中文总述】
+ * 取消之前通过 setup_parser_errposition_callback() 设置的错误位置回调。
+ * 从错误上下文栈中弹出当前回调，恢复为上一个回调。
+ * 【调用链】各 parse_*() 函数 → cancel_parser_errposition_callback()
+ *   → error_context_stack 恢复为 previous */
 void
 cancel_parser_errposition_callback(ParseCallbackState *pcbstate)
 {
@@ -165,7 +207,15 @@ cancel_parser_errposition_callback(ParseCallbackState *pcbstate)
  * Note that this will be called for *any* error occurring while the
  * callback is installed.  We avoid inserting an irrelevant error location
  * if the error is a query cancel --- are there any other important cases?
- */
+ *
+ * 【中文总述】
+ * 错误上下文回调函数，在 ereport 报告错误时自动调用。
+ * 将解析器错误位置（字节偏移 → 字符偏移）插入到错误上下文中，
+ * 使客户端能定位到源码中的出错位置。
+ * 跳过查询取消（ERRCODE_QUERY_CANCELED）的情况，
+ * 避免在查询被取消时报告无关的解析位置。
+ * 【调用链】setup_parser_errposition_callback() → pcb_error_callback()
+ *   → parser_errposition() → errposition() */
 static void
 pcb_error_callback(void *arg)
 {
@@ -184,7 +234,15 @@ pcb_error_callback(void *arg)
  * the actual container type and typmod.  This mainly involves smashing
  * any domain to its base type, but there are some special considerations.
  * Note that caller still needs to check if the result type is a container.
- */
+ *
+ * 【中文总述】
+ * 确定下标操作中容器的实际类型。
+ * 主要处理：
+ *   1. 将域（domain）类型"压平"为其基类型
+ *   2. 特殊处理 int2vector/oidvector：视为 int2[]/oid[] 的域，
+ *      使数组切片结果类型更通用
+ * 【调用链】transformContainerSubscripts() → transformContainerType()
+ *   → getBaseTypeAndTypmod() + 类型替换 */
 void
 transformContainerType(Oid *containerType, int32 *containerTypmod)
 {

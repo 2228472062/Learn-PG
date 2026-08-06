@@ -31,6 +31,16 @@ static int32 typenameTypeMod(ParseState *pstate, const TypeName *typeName,
 
 
 /*
+ * 【中文总述】
+ * LookupTypeName() — 类型名称查找的封装入口
+ *
+ * 对 LookupTypeNameExtended() 的简单包装，设置 temp_ok=true
+ * 表示调用者确定该名称一定是一个类型。
+ *
+ * 【调用链】
+ * analyze.c → LookupTypeName() → LookupTypeNameExtended()
+ */
+/*
  * LookupTypeName
  *		Wrapper for typical case.
  */
@@ -42,6 +52,24 @@ LookupTypeName(ParseState *pstate, const TypeName *typeName,
 								  typeName, typmod_p, true, missing_ok);
 }
 
+/*
+ * 【中文总述】
+ * LookupTypeNameExtended() — 根据 TypeName 对象查找 pg_type 系统缓存条目
+ *
+ * 这是类型名称查找的核心函数。它处理三种情况：
+ *   1. 内部生成的 TypeName（已有 OID）
+ *   2. %TYPE 引用（引用现有字段的类型）
+ *   3. 普通类型名称引用（可能带模式限定）
+ * 返回类型元组（需调用方 ReleaseSysCache），并计算 typmod 值。
+ *
+ * 【调用链】
+ * LookupTypeName() → LookupTypeNameExtended()
+ *            LookupTypeNameExtended() → RangeVarGetRelid() / get_attnum()
+ *            LookupTypeNameExtended() → LookupExplicitNamespace()
+ *            LookupTypeNameExtended() → TypenameGetTypidExtended()
+ *            LookupTypeNameExtended() → SearchSysCache1()
+ *            LookupTypeNameExtended() → typenameTypeMod()
+ */
 /*
  * LookupTypeNameExtended
  *		Given a TypeName object, lookup the pg_type syscache entry of the type.
@@ -217,6 +245,18 @@ LookupTypeNameExtended(ParseState *pstate,
 }
 
 /*
+ * 【中文总述】
+ * LookupTypeNameOid() — 根据 TypeName 查找类型 OID
+ *
+ * LookupTypeName() 的简化版本，只返回类型 OID，
+ * 不返回 syscache 条目（调用方无需 ReleaseSysCache）。
+ * 如果类型未找到且 missing_ok 为 false，则报错。
+ *
+ * 【调用链】
+ * LookupOperWithArgs() → LookupTypeNameOid()
+ *            LookupTypeNameOid() → LookupTypeName()
+ */
+/*
  * LookupTypeNameOid
  *		Given a TypeName object, lookup the pg_type syscache entry of the type.
  *		Returns InvalidOid if no such type can be found.  If the type is found,
@@ -254,6 +294,18 @@ LookupTypeNameOid(ParseState *pstate, const TypeName *typeName, bool missing_ok)
 }
 
 /*
+ * 【中文总述】
+ * typenameType() — 根据 TypeName 返回 Type 结构体及 typmod
+ *
+ * 等价于 LookupTypeName，但当类型未找到或未定义时
+ * 会报出合适的错误信息。调用方可以假定结果是完全有效的类型。
+ *
+ * 【调用链】
+ * typenameTypeId() → typenameType()
+ *            typenameTypeIdAndMod() → typenameType()
+ *            parseTypeString() → typenameType()
+ */
+/*
  * typenameType - given a TypeName, return a Type structure and typmod
  *
  * This is equivalent to LookupTypeName, except that this will report
@@ -282,6 +334,17 @@ typenameType(ParseState *pstate, const TypeName *typeName, int32 *typmod_p)
 }
 
 /*
+ * 【中文总述】
+ * typenameTypeId() — 根据 TypeName 返回类型 OID
+ *
+ * 类似 typenameType，但只返回类型 OID，
+ * 不返回 syscache 条目。
+ *
+ * 【调用链】
+ * parseTypeString() → typenameTypeId()
+ *            typenameTypeId() → typenameType()
+ */
+/*
  * typenameTypeId - given a TypeName, return the type's OID
  *
  * This is similar to typenameType, but we only hand back the type OID
@@ -301,6 +364,17 @@ typenameTypeId(ParseState *pstate, const TypeName *typeName)
 }
 
 /*
+ * 【中文总述】
+ * typenameTypeIdAndMod() — 根据 TypeName 返回类型 OID 和 typmod
+ *
+ * 等价于 typenameType，但只返回类型 OID 和 typmod，
+ * 不返回 syscache 条目。
+ *
+ * 【调用链】
+ * parseTypeString() → typenameTypeIdAndMod()
+ *            typenameTypeIdAndMod() → typenameType()
+ */
+/*
  * typenameTypeIdAndMod - given a TypeName, return the type's OID and typmod
  *
  * This is equivalent to typenameType, but we only hand back the type OID
@@ -317,6 +391,18 @@ typenameTypeIdAndMod(ParseState *pstate, const TypeName *typeName,
 	ReleaseSysCache(tup);
 }
 
+/*
+ * 【中文总述】
+ * typenameTypeMod() — 根据 TypeName 计算内部 typmod 值
+ *
+ * 处理类型修饰符表达式（简单常量或标识符），
+ * 调用类型的 typmodin 函数将修饰符列表转换为内部整数值。
+ * 如果类型是 shell 类型或不允许修饰符，会报错。
+ *
+ * 【调用链】
+ * LookupTypeNameExtended() → typenameTypeMod()
+ *            typenameTypeMod() → OidFunctionCall1() (typmodin)
+ */
 /*
  * typenameTypeMod - given a TypeName, return the internal typmod value
  *
@@ -428,6 +514,18 @@ typenameTypeMod(ParseState *pstate, const TypeName *typeName, Type typ)
 }
 
 /*
+ * 【中文总述】
+ * appendTypeNameToBuffer() — 将 TypeName 的名称字符串追加到 StringInfo
+ *
+ * TypeNameToString 和 TypeNameListToString 的共享核心实现。
+ * 处理三种情况：限定名（逐段输出）、内部 OID 名（用 format_type_be）、
+ * 以及 %TYPE 和数组修饰符。
+ *
+ * 【调用链】
+ * TypeNameToString() → appendTypeNameToBuffer()
+ *            TypeNameListToString() → appendTypeNameToBuffer()
+ */
+/*
  * appendTypeNameToBuffer
  *		Append a string representing the name of a TypeName to a StringInfo.
  *		This is the shared guts of TypeNameToString and TypeNameListToString.
@@ -468,6 +566,13 @@ appendTypeNameToBuffer(const TypeName *typeName, StringInfo string)
 }
 
 /*
+ * 【中文总述】
+ * TypeNameToString() — 将 TypeName 转换为字符串表示
+ *
+ * 【调用链】
+ * parseTypeString() → typeStringToTypeName() → TypeNameToString()
+ */
+/*
  * TypeNameToString
  *		Produce a string representing the name of a TypeName.
  *
@@ -484,6 +589,13 @@ TypeNameToString(const TypeName *typeName)
 	return string.data;
 }
 
+/*
+ * 【中文总述】
+ * TypeNameListToString() — 将 TypeName 列表转换为逗号分隔的字符串
+ *
+ * 【调用链】
+ * error context → TypeNameListToString()
+ */
 /*
  * TypeNameListToString
  *		Produce a string representing the name(s) of a List of TypeNames
@@ -507,6 +619,15 @@ TypeNameListToString(List *typenames)
 }
 
 /*
+ * 【中文总述】
+ * LookupCollation() — 按名称查找排序规则（collation），返回 OID
+ *
+ * 带错误位置信息的 collation 查找封装。
+ *
+ * 【调用链】
+ * GetColumnDefCollation() → LookupCollation()
+ */
+/*
  * LookupCollation
  *
  * Look up collation by name, return OID, with support for error location.
@@ -528,6 +649,20 @@ LookupCollation(ParseState *pstate, List *collnames, int location)
 	return colloid;
 }
 
+/*
+ * 【中文总述】
+ * GetColumnDefCollation() — 确定列定义使用的排序规则
+ *
+ * 根据 ColumnDef 节点和已确定的列类型 OID，
+ * 获取应使用的排序规则 OID。优先级：
+ *   1. 显式 COLLATE 子句
+ *   2. 预计算的排序规则 OID（collOid）
+ *   3. 类型的默认排序规则
+ * 如果 COLLATE 应用到不可排序的类型，报错。
+ *
+ * 【调用链】
+ * analyze.c → GetColumnDefCollation() → LookupCollation()
+ */
 /*
  * GetColumnDefCollation
  *
@@ -572,6 +707,13 @@ GetColumnDefCollation(ParseState *pstate, const ColumnDef *coldef, Oid typeOid)
 	return result;
 }
 
+/*
+ * 【中文总述】
+ * typeidType() — 根据类型 OID 返回 Type 结构体
+ *
+ * 【调用链】
+ * parseTypeString() → typeidType()
+ */
 /* return a Type structure, given a type id */
 /* NB: caller must ReleaseSysCache the type tuple when done with it */
 Type
@@ -585,6 +727,13 @@ typeidType(Oid id)
 	return (Type) tup;
 }
 
+/*
+ * 【中文总述】
+ * typeTypeId() — 根据 Type 结构体返回类型 OID
+ *
+ * 【调用链】
+ * parseTypeString() → typeTypeId()
+ */
 /* given type (as type struct), return the type OID */
 Oid
 typeTypeId(Type tp)

@@ -98,6 +98,23 @@ static void checkWellFormedSelectStmt(SelectStmt *stmt, CteState *cstate);
 
 
 /*
+ * 【中文总述】
+ * transformWithClause() — 将 WITH 子句（公共表表达式）转换为 Query 节点列表
+ *
+ * 这是 CTE 解析的入口函数，由 analyze.c 在转换 SELECT/INSERT/UPDATE/DELETE/MERGE
+ * 语句时调用。它负责：
+ *   1. 检查 CTE 名称是否有重复
+ *   2. 对 WITH RECURSIVE 做拓扑排序，消除前向引用
+ *   3. 逐个分析每个 CTE 的主查询
+ *   4. 将分析后的 CTE 加入 pstate->p_ctenamespace
+ *
+ * 【调用链】
+ * analyze.c → transformWithClause() → analyzeCTE() → parse_sub_analyze()
+ *            transformWithClause() → makeDependencyGraph() → TopologicalSort()
+ *            transformWithClause() → checkWellFormedRecursion()
+ *            analyzeCTE() → analyzeCTETargetList()
+ */
+/*
  * transformWithClause -
  *	  Transform the list of WITH clause "common table expressions" into
  *	  Query nodes.
@@ -234,6 +251,26 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
 }
 
 
+/*
+ * 【中文总述】
+ * analyzeCTE() — 对单个 CTE 执行实际的解析分析转换
+ *
+ * 所有该 CTE 依赖的其他 CTE 已经加载到 pstate->p_ctenamespace 中，
+ * 并且已经标记了正确的输出列名/类型。此函数：
+ *   1. 处理 CYCLE 子句（标记列类型推导、强制类型转换）
+ *   2. 调用 parse_sub_analyze() 分析 CTE 的主查询
+ *   3. 验证查询类型（必须是 SELECT，不能是 utility 语句）
+ *   4. 检查数据修改型 WITH 子句是否位于顶层
+ *   5. 对非递归 CTE 计算输出列信息
+ *   6. 对递归 CTE 验证列类型和排序规则一致性
+ *   7. 验证 SEARCH 和 CYCLE 子句的合法性
+ *
+ * 【调用链】
+ * transformWithClause() → analyzeCTE() → parse_sub_analyze()
+ *            analyzeCTE() → analyzeCTETargetList()
+ *            analyzeCTE() → transformExpr() (for cycle mark values)
+ *            analyzeCTE() → select_common_type() / coerce_to_common_type()
+ */
 /*
  * Perform the actual parse analysis transformation of one CTE.  All
  * CTEs it depends on have already been loaded into pstate->p_ctenamespace,
@@ -556,6 +593,18 @@ analyzeCTE(ParseState *pstate, CommonTableExpr *cte)
 }
 
 /*
+ * 【中文总述】
+ * analyzeCTETargetList() — 根据转换后的输出目标列表计算 CTE 的派生字段
+ *
+ * 为 CTE 确定输出列名、类型和排序规则。别名列优先于查询本身的列名。
+ * 对于递归 CTE，在分析非递归项之后调用此函数，此时需要将未知类型
+ * （UNKNOWNOID）强制转换为 text 类型。
+ *
+ * 【调用链】
+ * analyzeCTE() → analyzeCTETargetList()
+ *            analyzeCTETargetList() → exprType() / exprTypmod() / exprCollation()
+ */
+/*
  * Compute derived fields of a CTE, given the transformed output targetlist
  *
  * For a nonrecursive CTE, this is called after transforming the CTE's query.
@@ -641,6 +690,18 @@ analyzeCTETargetList(ParseState *pstate, CommonTableExpr *cte, List *tlist)
 
 
 /*
+ * 【中文总述】
+ * makeDependencyGraph() — 识别 WITH RECURSIVE 项之间的交叉引用，并按依赖关系拓扑排序
+ *
+ * 遍历每个 CTE 的主查询，使用 makeDependencyGraphWalker 树形遍历器
+ * 检测哪些 CTE 被引用了（依赖关系），以及哪些 CTE 是自引用的（递归）。
+ * 然后调用 TopologicalSort() 按依赖顺序排序，确保没有前向引用。
+ *
+ * 【调用链】
+ * transformWithClause() → makeDependencyGraph() → makeDependencyGraphWalker()
+ *            makeDependencyGraph() → TopologicalSort()
+ */
+/*
  * Identify the cross-references of a list of WITH RECURSIVE items,
  * and sort into an order that has no forward references.
  */
@@ -662,6 +723,19 @@ makeDependencyGraph(CteState *cstate)
 	TopologicalSort(cstate->pstate, cstate->items, cstate->numitems);
 }
 
+/*
+ * 【中文总述】
+ * makeDependencyGraphWalker() — 树形遍历器，检测 CTE 之间的交叉引用和自引用
+ *
+ * 遍历 CTE 的主查询表达式树，识别对其它 CTE 的引用（交叉依赖）
+ * 和对自身的引用（自引用/递归）。对于 WITH 子句中的语句，
+ * 会递归处理内部的 WITH 子句。
+ *
+ * 【调用链】
+ * makeDependencyGraph() → makeDependencyGraphWalker()
+ *            makeDependencyGraphWalker() → WalkInnerWith()
+ *            makeDependencyGraphWalker() → raw_expression_tree_walker()
+ */
 /*
  * Tree walker function to detect cross-references and self-references of the
  * CTEs in a WITH RECURSIVE list.
@@ -803,6 +877,21 @@ makeDependencyGraphWalker(Node *node, CteState *cstate)
 }
 
 /*
+ * 【中文总述】
+ * WalkInnerWith() — 处理 WITH 子句的递归遍历，更新 innerwiths 列表
+ *
+ * makeDependencyGraphWalker 的子程序，负责正确更新 innerwiths 列表
+ * 以反映 CTE 名称的可见性规则。
+ *   - 递归 WITH 情况：所有 WITH 名称对所有 WITH 项和主查询可见，
+ *     全部压入后处理再弹出
+ *   - 非递归 WITH 情况：查询名称对之后的 WITH 项和主查询可见
+ *
+ * 【调用链】
+ * makeDependencyGraphWalker() → WalkInnerWith()
+ *            WalkInnerWith() → makeDependencyGraphWalker() (递归)
+ *            WalkInnerWith() → raw_expression_tree_walker()
+ */
+/*
  * makeDependencyGraphWalker's recursion into a statement having a WITH clause.
  *
  * This subroutine is concerned with updating the innerwiths list correctly
@@ -857,6 +946,17 @@ WalkInnerWith(Node *stmt, WithClause *withClause, CteState *cstate)
 }
 
 /*
+ * 【中文总述】
+ * TopologicalSort() — 按依赖关系对 CTE 项进行拓扑排序
+ *
+ * 使用选择排序算法，每次从未处理的项中找到一个没有依赖的项，
+ * 将其移到已处理序列的前端，并将其从所有其他项的依赖集中移除。
+ * 如果找不到无依赖的项，说明依赖图中存在环（相互递归），报错。
+ *
+ * 【调用链】
+ * makeDependencyGraph() → TopologicalSort()
+ */
+/*
  * Sort by dependencies, using a standard topological sort operation
  */
 static void
@@ -908,6 +1008,21 @@ TopologicalSort(ParseState *pstate, CteItem *items, int numitems)
 }
 
 
+/*
+ * 【中文总述】
+ * checkWellFormedRecursion() — 验证递归查询的结构是否合法
+ *
+ * 对每个被标记为递归的 CTE 项执行以下检查：
+ *   1. 必须是 SELECT 语句（不能包含数据修改语句）
+ *   2. 顶层必须是 UNION（不能用 INTERSECT/EXCEPT 连接递归和非递归部分）
+ *   3. 递归项中不能有 ORDER BY、OFFSET、LIMIT、FOR UPDATE/SHARE
+ *   4. 左操作数不能包含自引用
+ *   5. 右操作数必须恰好包含一次自引用
+ *
+ * 【调用链】
+ * transformWithClause() → checkWellFormedRecursion()
+ *            checkWellFormedRecursion() → checkWellFormedRecursionWalker()
+ */
 /*
  * Check that recursive queries are well-formed.
  */
@@ -1020,6 +1135,20 @@ checkWellFormedRecursion(CteState *cstate)
 	}
 }
 
+/*
+ * 【中文总述】
+ * checkWellFormedRecursionWalker() — 树形遍历器，检测递归查询中的非法自引用
+ *
+ * 递归检查 WITH RECURSIVE 查询的表达式树，跟踪当前的自引用上下文
+ * （RECURSION_OK / RECURSION_NONRECURSIVETERM / RECURSION_SUBLINK /
+ * RECURSION_OUTERJOIN / RECURSION_INTERSECT / RECURSION_EXCEPT），
+ * 确保自引用只出现在合法位置。
+ *
+ * 【调用链】
+ * checkWellFormedRecursion() → checkWellFormedRecursionWalker()
+ *            checkWellFormedRecursionWalker() → checkWellFormedSelectStmt()
+ *            checkWellFormedRecursionWalker() → raw_expression_tree_walker()
+ */
 /*
  * Tree walker function to detect invalid self-references in a recursive query.
  */
@@ -1199,6 +1328,19 @@ checkWellFormedRecursionWalker(Node *node, CteState *cstate)
 									  cstate);
 }
 
+/*
+ * 【中文总述】
+ * checkWellFormedSelectStmt() — 处理 SELECT 语句的递归合法性检查
+ *
+ * checkWellFormedRecursionWalker 的子程序，专门处理 SelectStmt 节点，
+ * 不处理其 WITH 子句（由调用者处理）。根据集合操作类型
+ * （UNION/INTERSECT/EXCEPT）设置不同的递归上下文，
+ * 并递归检查各操作数。
+ *
+ * 【调用链】
+ * checkWellFormedRecursionWalker() → checkWellFormedSelectStmt()
+ *            checkWellFormedSelectStmt() → checkWellFormedRecursionWalker() (递归)
+ */
 /*
  * subroutine for checkWellFormedRecursionWalker: process a SelectStmt
  * without worrying about its WITH clause

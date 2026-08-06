@@ -33,6 +33,12 @@
  * transformations that increase the string length, but we don't yet
  * support that.  If you want to implement it, you'll need to fix
  * SplitIdentifierString() in utils/adt/varlena.c.
+ *
+ * 【中文总述】
+ * 对未加引号的标识符进行小写转换和截断处理。
+ * 这是 downcase_identifier() 的简单封装，始终启用截断。
+ * 【调用链】scanner/gram.y → downcase_truncate_identifier()
+ *   → downcase_identifier() → pg_downcase_ident() + truncate_identifier()
  */
 char *
 downcase_truncate_identifier(const char *ident, int len, bool warn)
@@ -42,6 +48,14 @@ downcase_truncate_identifier(const char *ident, int len, bool warn)
 
 /*
  * a workhorse for downcase_truncate_identifier
+ *
+ * 【中文总述】
+ * downcase_truncate_identifier() 的核心工作函数。
+ * 执行实际的小写转换（pg_downcase_ident），然后根据需要截断到 NAMEDATALEN-1。
+ * 注意：如果未来需要支持 Unicode 感知的标识符大小写转换，
+ * 需要同时修改 pg_downcase_ident 和 SplitIdentifierString。
+ * 【调用链】downcase_truncate_identifier() → downcase_identifier()
+ *   → pg_downcase_ident() + truncate_identifier()
  */
 char *
 downcase_identifier(const char *ident, int len, bool warn, bool truncate)
@@ -76,6 +90,12 @@ downcase_identifier(const char *ident, int len, bool warn, bool truncate)
  *
  * We require the caller to pass in the string length since this saves a
  * strlen() call in some common usages.
+ *
+ * 【中文总述】
+ * 将标识符截断到 NAMEDATALEN-1 字节。
+ * 如果标识符长度超过限制，先用 pg_mbcliplen 按字符边界截断，
+ * 然后发出 NOTICE 警告（如果 warn 为 true），最后补 '\0'。
+ * 【调用链】downcase_identifier() → truncate_identifier()
  */
 void
 truncate_identifier(char *ident, int len, bool warn)
@@ -100,7 +120,12 @@ truncate_identifier(char *ident, int len, bool warn)
  *
  * In principle we might need similar functions for isalnum etc, but for the
  * moment only isspace seems needed.
- */
+ *
+ * 【中文总述】
+ * 检查字符是否被 flex 词法分析器视为空白符。
+ * 必须与 scan.l 中的 {space} 字符列表保持一致，避免因本地化
+ * 设置不同而与词法分析器行为不一致。
+ * 【调用链】scan.l / base_yylex() → scanner_isspace() → 判断空白符 */
 bool
 scanner_isspace(char ch)
 {

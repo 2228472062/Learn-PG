@@ -11,6 +11,13 @@
  *	  src/backend/parser/parse_clause.c
  *
  *-------------------------------------------------------------------------
+ *
+ * 【中文总述】
+ * 在排序/分组列表中查找与给定 sortgroupref 匹配的位置。
+ * 辅助函数，用于将 ORDER BY 或 GROUP BY 引用映射到目标列表中的位置。
+ *
+ * 【调用链】
+ * transformSortClause() / transformGroupClause() → get_matching_location()
  */
 
 #include "postgres.h"
@@ -150,6 +157,14 @@ transformFromClause(ParseState *pstate, List *frmList)
 	 * unconditionally visible.  Note that this will also reset lateral_only
 	 * for any namespace items that were already present when we were called;
 	 * but those should have been that way already.
+ *
+ * 【中文总述】
+ * 设置 UPDATE/DELETE/SELECT FOR UPDATE 语句的目标表。
+ * 将目标 RangeVar 添加到 ParseState 的范围表和命名空间中，
+ * 并标记该表为可更新（如果需要的话）。
+ *
+ * 【调用链】
+ * transformStmt() → transformUpdateStmt()/transformDeleteStmt() → setTargetTable()
 	 */
 	setNamespaceLateralState(pstate->p_namespace, false, true);
 }
@@ -232,6 +247,13 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 
 	/*
 	 * If UPDATE/DELETE, add table to joinlist and namespace.
+ *
+ * 【中文总述】
+ * 从 USING 子句中提取剩余的列名（未在 USING 列表中明确指定的列）。
+ * 用于 JOIN ... USING 语法中，将左右表中不在 USING 列表中的列合并到结果中。
+ *
+ * 【调用链】
+ * transformJoinUsingClause() → extractRemainingColumns()
 	 */
 	if (alsoSource)
 		addNSItemToQuery(pstate, nsitem, true, true, true);
@@ -271,6 +293,13 @@ extractRemainingColumns(ParseState *pstate,
 	 * detect already-merged columns in the loop below, that would be O(N^2)
 	 * for a wide input table.  Instead build a bitmapset of just the merged
 	 * USING columns, which we won't add to within the main loop.
+ *
+ * 【中文总述】
+ * 处理 JOIN ... USING 子句：将 USING 列表中的列转换为等值连接条件，
+ * 并处理 USING 列的合并（去除重复列，保留非空约束等）。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → transformJoinUsingClause() → extractRemainingColumns()
 	 */
 	prevcols = NULL;
 	foreach(lc, *src_colnos)
@@ -354,6 +383,13 @@ transformJoinUsingClause(ParseState *pstate,
 	 * relations, we don't have to go through the same pushups that
 	 * transformJoinOnClause() does.  Just invoke transformExpr() to fix up
 	 * the operators, and we're done.
+ *
+ * 【中文总述】
+ * 处理 JOIN ... ON 子句：将 ON 表达式转换并添加到命名空间中，
+ * 确保 ON 条件中引用的列在当前命名空间中可见。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → transformJoinOnClause()
 	 */
 	result = transformExpr(pstate, result, EXPR_KIND_JOIN_USING);
 
@@ -380,6 +416,13 @@ transformJoinOnClause(ParseState *pstate, JoinExpr *j, List *namespace)
 	 * not check for refname conflicts, because transformFromClauseItem()
 	 * already did.)  All namespace items are marked visible regardless of
 	 * LATERAL state.
+ *
+ * 【中文总述】
+ * 处理 FROM 子句中的普通表引用（RangeVar）。
+ * 将 RangeVar 转换为 ParseNamespaceItem，并添加到当前命名空间中。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → transformTableEntry() → parserOpenTable()
 	 */
 	setNamespaceLateralState(namespace, false, true);
 
@@ -396,6 +439,13 @@ transformJoinOnClause(ParseState *pstate, JoinExpr *j, List *namespace)
 
 /*
  * transformTableEntry --- transform a RangeVar (simple relation reference)
+ *
+ * 【中文总述】
+ * 处理 FROM 子句中的子查询（RangeSubselect）。
+ * 递归地分析和转换子查询，将其作为命名空间中的一个项添加。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → transformRangeSubselect() → parse_sub_analyze()
  */
 static ParseNamespaceItem *
 transformTableEntry(ParseState *pstate, RangeVar *r)
@@ -453,6 +503,13 @@ transformRangeSubselect(ParseState *pstate, RangeSubselect *r)
 
 	/*
 	 * OK, build an RTE and nsitem for the subquery.
+ *
+ * 【中文总述】
+ * 处理 FROM 子句中的函数调用（RangeFunction）。
+ * 将函数表达式转换为命名空间项，并处理函数返回的列定义。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → transformRangeFunction()
 	 */
 	return addRangeTableEntryForSubquery(pstate,
 										 query,
@@ -674,6 +731,13 @@ transformRangeFunction(ParseState *pstate, RangeFunction *r)
 
 	/*
 	 * OK, build an RTE and nsitem for the function.
+ *
+ * 【中文总述】
+ * 处理 FROM 子句中的 XMLTABLE/VALUES 函数（RangeTableFunc）。
+ * 解析 COLUMNS 和 XMLNAMESPACES 子句，将函数结果转换为命名空间项。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → transformRangeTableFunc()
 	 */
 	return addRangeTableEntryForFunction(pstate,
 										 funcnames, funcexprs, coldeflists,
@@ -897,6 +961,13 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
 	/*
 	 * Mark the RTE as LATERAL if the user said LATERAL explicitly, or if
 	 * there are any lateral cross-references in it.
+ *
+ * 【中文总述】
+ * 打开属性图（Property Graph）表以供解析使用。
+ * 这是处理 Cypher-style 图查询时的辅助函数，用于打开图关系。
+ *
+ * 【调用链】
+ * transformRangeGraphTable() → parserOpenPropGraph()
 	 */
 	is_lateral = rtf->lateral || contain_vars_of_level((Node *) tf, 0);
 
@@ -920,6 +991,13 @@ parserOpenPropGraph(ParseState *pstate, const RangeVar *relation, LOCKMODE lockm
 	/*
 	 * In parserOpenTable(), the relkind check is done inside table_openrv*.
 	 * We do it here since we don't have anything like propgraph_open.
+ *
+ * 【中文总述】
+ * 处理 FROM 子句中的属性图表引用（RangeGraphTable）。
+ * 解析图表名、别名和属性图模式，将图关系添加到命名空间中。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → transformRangeGraphTable() → parserOpenPropGraph()
 	 */
 	if (rel->rd_rel->relkind != RELKIND_PROPGRAPH)
 		ereport(ERROR,
@@ -1044,6 +1122,13 @@ transformRangeGraphTable(ParseState *pstate, RangeGraphTable *rgt)
 	/*
 	 * GRAPH_TABLE cannot yet evaluate aggregate, window, or set-returning
 	 * functions in its COLUMNS list, so prohibit them for now.
+ *
+ * 【中文总述】
+ * 处理 FROM 子句中的 TABLESAMPLE 子句。
+ * 解析采样方法和参数，将其附加到 RangeTblEntry 上。
+ *
+ * 【调用链】
+ * transformRangeTableSample() 被 transformFromClauseItem() 调用
 	 */
 	if (pstate->p_hasAggs)
 		ereport(ERROR,
@@ -1130,6 +1215,13 @@ transformRangeTableSample(ParseState *pstate, RangeTableSample *rts)
 	 * Transform the arguments, typecasting them as needed.  Note we must also
 	 * assign collations now, because assign_query_collations() doesn't
 	 * examine any substructure of RTEs.
+ *
+ * 【中文总述】
+ * 为特殊关系类型（如 generate_series、unnest 等集合返回函数）
+ * 创建 ParseNamespaceItem。处理这些特殊关系时，需要特殊列处理逻辑。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → getNSItemForSpecialRelationTypes()
 	 */
 	fargs = NIL;
 	forboth(larg, rts->args, ltyp, tsm->parameterTypes)
@@ -1182,6 +1274,14 @@ getNSItemForSpecialRelationTypes(ParseState *pstate, RangeVar *rv)
 
 	/*
 	 * if it is a qualified name, it can't be a CTE or tuplestore reference
+ *
+ * 【中文总述】
+ * 处理 FROM 子句中的单个项（核心分发函数）。
+ * 根据节点类型（RangeVar, RangeSubselect, RangeFunction, JoinExpr 等）
+ * 分发到对应的处理函数，并维护命名空间和范围表。
+ *
+ * 【调用链】
+ * transformFromClause() → transformFromClauseItem() → 各 transformRange*() 函数
 	 */
 	if (rv->schemaname)
 		return NULL;
@@ -1788,6 +1888,13 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		/*
 		 * The join RTE itself is always made visible for unqualified column
 		 * names.  It's visible as a relation name only if it has an alias.
+ *
+ * 【中文总述】
+ * 从命名空间列（ParseNamespaceColumn）构建 Var 节点。
+ * 用于将命名空间中的列引用转换为可执行的 Var 表达式。
+ *
+ * 【调用链】
+ * transformJoinUsingClause() / buildMergedJoinVar() → buildVarFromNSColumn()
 		 */
 		nsitem->p_rel_visible = (j->alias != NULL);
 		nsitem->p_cols_visible = true;
@@ -1812,6 +1919,13 @@ transformFromClauseItem(ParseState *pstate, Node *n,
  * We can assume varlevelsup should be 0, and no location is specified.
  * Note also that no column SELECT privilege is requested here; that would
  * happen only if the column is actually referenced in the query.
+ *
+ * 【中文总述】
+ * 构建合并的 JOIN 变量（用于 USING 连接中列的合并）。
+ * 当 JOIN ... USING 合并左右表的同名列时，构建正确的 Var 引用。
+ *
+ * 【调用链】
+ * transformJoinUsingClause() → buildMergedJoinVar() → buildVarFromNSColumn()
  */
 static Var *
 buildVarFromNSColumn(ParseState *pstate, ParseNamespaceColumn *nscol)
@@ -1938,6 +2052,13 @@ buildMergedJoinVar(ParseState *pstate, JoinType jointype,
 	 * Apply assign_expr_collations to fix up the collation info in the
 	 * coercion and CoalesceExpr nodes, if we made any.  This must be done now
 	 * so that the join node's alias vars show correct collation info.
+ *
+ * 【中文总述】
+ * 标记被 outer join 取消的关系（nulled-by 集合）。
+ * 对于 LEFT JOIN / FULL JOIN，标记右表中因 outer join 条件不满足而为 NULL 的列。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → markRelsAsNulledBy()
 	 */
 	assign_expr_collations(pstate, res_node);
 
@@ -1978,6 +2099,13 @@ markRelsAsNulledBy(ParseState *pstate, Node *n, int jindex)
 	 * Now add jindex to the p_nullingrels set for relation varno.  Since we
 	 * maintain the p_nullingrels list lazily, we might need to extend it to
 	 * make the varno'th entry exist.
+ *
+ * 【中文总述】
+ * 设置命名空间中列的可见性。
+ * 控制哪些列在当前作用域中可见（处理 USING 连接中重复列的隐藏等）。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → setNamespaceColumnVisibility()
 	 */
 	while (list_length(pstate->p_nullingrels) < varno)
 		pstate->p_nullingrels = lappend(pstate->p_nullingrels, NULL);
@@ -1988,6 +2116,13 @@ markRelsAsNulledBy(ParseState *pstate, Node *n, int jindex)
 /*
  * setNamespaceColumnVisibility -
  *	  Convenience subroutine to update cols_visible flags in a namespace list.
+ *
+ * 【中文总述】
+ * 设置命名空间中 lateral 引用状态。
+ * 标记哪些命名空间项允许 lateral 子查询引用（lateral_ok）和仅允许 lateral 引用（lateral_only）。
+ *
+ * 【调用链】
+ * transformFromClauseItem() → setNamespaceLateralState()
  */
 static void
 setNamespaceColumnVisibility(List *namespace, bool cols_visible)
@@ -2005,6 +2140,13 @@ setNamespaceColumnVisibility(List *namespace, bool cols_visible)
 /*
  * setNamespaceLateralState -
  *	  Convenience subroutine to update LATERAL flags in a namespace list.
+ *
+ * 【中文总述】
+ * 处理 WHERE 子句：将 WHERE 表达式转换并添加到查询的过滤条件中。
+ * 检查表达式中不能包含变量引用（确保是合法的 WHERE 条件）。
+ *
+ * 【调用链】
+ * transformStmt() → transformWhereClause() → checkExprIsVarFree()
  */
 static void
 setNamespaceLateralState(List *namespace, bool lateral_only, bool lateral_ok)
@@ -2027,6 +2169,13 @@ setNamespaceLateralState(List *namespace, bool lateral_only, bool lateral_ok)
  *	  Used for WHERE and allied clauses.
  *
  * constructName does not affect the semantics, but is used in error messages
+ *
+ * 【中文总述】
+ * 处理 LIMIT / OFFSET 子句：将限制表达式转换并绑定到查询节点。
+ * LIMIT 和 OFFSET 表达式被转换为 Expr 节点，存储在 Query 结构中。
+ *
+ * 【调用链】
+ * transformStmt() → transformLimitClause()
  */
 Node *
 transformWhereClause(ParseState *pstate, Node *clause,
@@ -2077,6 +2226,13 @@ transformLimitClause(ParseState *pstate, Node *clause,
 	 * extremely simplistic, in that you can pass a NULL anyway by hiding it
 	 * inside an expression -- but this protects ruleutils against emitting an
 	 * unadorned NULL that's not accepted back by the grammar.
+ *
+ * 【中文总述】
+ * 检查表达式中是否不包含变量引用。
+ * 用于验证 LIMIT/OFFSET 等子句中的表达式必须是常量或参数，不能引用列变量。
+ *
+ * 【调用链】
+ * transformWhereClause() / transformLimitClause() → checkExprIsVarFree()
 	 */
 	if (exprKind == EXPR_KIND_LIMIT && limitOption == LIMIT_OPTION_WITH_TIES &&
 		IsA(clause, A_Const) && castNode(A_Const, clause)->isnull)
@@ -2098,6 +2254,13 @@ transformLimitClause(ParseState *pstate, Node *clause,
  * function gives on first execution is what you get.
  *
  * constructName does not affect the semantics, but is used in error messages
+ *
+ * 【中文总述】
+ * 检查目标列表项是否符合 SQL92 标准的列引用规则。
+ * 验证目标列表中的表达式是合法的列引用或表达式。
+ *
+ * 【调用链】
+ * findTargetlistEntrySQL92() → checkTargetlistEntrySQL92()
  */
 static void
 checkExprIsVarFree(ParseState *pstate, Node *n, const char *constructName)
@@ -2123,6 +2286,13 @@ checkExprIsVarFree(ParseState *pstate, Node *n, const char *constructName)
  * as "GROUP BY 1", we have to make sure it is acceptable for use in the
  * indicated clause type; transformExpr() will have treated it as a regular
  * targetlist item.
+ *
+ * 【中文总述】
+ * 在目标列表中查找匹配的 SQL92 列引用。
+ * 用于解析 SELECT 列表中列引用的目标列表位置，支持模糊匹配。
+ *
+ * 【调用链】
+ * transformStmt() → findTargetlistEntrySQL92() → checkTargetlistEntrySQL92()
  */
 static void
 checkTargetlistEntrySQL92(ParseState *pstate, TargetEntry *tle,
@@ -2329,6 +2499,13 @@ findTargetlistEntrySQL92(ParseState *pstate, Node *node, List **tlist,
 
 	/*
 	 * Otherwise, we have an expression, so process it per SQL99 rules.
+ *
+ * 【中文总述】
+ * 在目标列表中查找匹配的 SQL99 列引用。
+ * 支持 SQL99 标准的列引用解析，包括表别名限定等。
+ *
+ * 【调用链】
+ * transformStmt() → findTargetlistEntrySQL99()
 	 */
 	return findTargetlistEntrySQL99(pstate, node, tlist, exprKind);
 }
@@ -2387,6 +2564,13 @@ findTargetlistEntrySQL99(ParseState *pstate, Node *node, List **tlist,
 	 * If no matches, construct a new target entry which is appended to the
 	 * end of the target list.  This target is given resjunk = true so that it
 	 * will not be projected into the final tuple.
+ *
+ * 【中文总述】
+ * 将 GROUPING SETS 表达式展平为普通的 GROUP BY 列列表。
+ * 递归处理嵌套的 GROUPING SETS、CUBE 和 ROLLUP 语法。
+ *
+ * 【调用链】
+ * transformGroupClause() → flatten_grouping_sets()
 	 */
 	target_result = transformTargetEntry(pstate, node, expr, exprKind,
 										 NULL, true);
@@ -2486,6 +2670,13 @@ flatten_grouping_sets(Node *expr, bool toplevel, bool *hasGroupingSets)
 				 * At top level, keep the grouping set node; but if we're in a
 				 * nested grouping set, then we need to concat the flattened
 				 * result into the outer list if it's simply nested.
+ *
+ * 【中文总述】
+ * 转换 GROUP BY 子句中的单个表达式。
+ * 处理 GROUP BY 列表中的每个表达式，将其转换为目标列表项。
+ *
+ * 【调用链】
+ * transformGroupClause() → transformGroupClauseExpr()
 				 */
 
 				if (toplevel || (gset->kind != GROUPING_SET_SETS))
@@ -2627,6 +2818,13 @@ transformGroupClauseExpr(List **flatresult, Bitmapset *seen_local,
 
 	/*
 	 * _something_ must have assigned us a sortgroupref by now...
+ *
+ * 【中文总述】
+ * 转换 GROUP BY 子句列表。
+ * 处理 GROUP BY 中的所有表达式，构建展平的结果列表。
+ *
+ * 【调用链】
+ * transformGroupClause() → transformGroupClauseList() → transformGroupClauseExpr()
 	 */
 
 	return tle->ressortgroupref;
@@ -2648,6 +2846,13 @@ transformGroupClauseExpr(List **flatresult, Bitmapset *seen_local,
  * exprKind		expression kind
  * useSQL99		SQL99 rather than SQL92 syntax
  * toplevel		false if within any grouping set
+ *
+ * 【中文总述】
+ * 处理 GROUPING SETS 子句中的单个分组集。
+ * 将每个分组集转换为目标列表项，并处理 CUBE/ROLLUP 的展开。
+ *
+ * 【调用链】
+ * transformGroupClause() → transformGroupingSet() → flatten_grouping_sets()
  */
 static List *
 transformGroupClauseList(List **flatresult,
@@ -2701,6 +2906,13 @@ transformGroupClauseList(List **flatresult,
  * exprKind		expression kind
  * useSQL99		SQL99 rather than SQL92 syntax
  * toplevel		false if within any grouping set
+ *
+ * 【中文总述】
+ * 处理 GROUP BY 子句：转换所有分组表达式并构建分组目标列表。
+ * 处理 GROUP BY、CUBE、ROLLUP 和 GROUPING SETS 等所有分组语法。
+ *
+ * 【调用链】
+ * transformStmt() → transformGroupClause() → transformGroupClauseList()
  */
 static Node *
 transformGroupingSet(List **flatresult,
@@ -2831,6 +3043,13 @@ transformGroupClause(ParseState *pstate, List *grouplist, List **groupingSets,
 	 * If the list is now empty, but hasGroupingSets is true, it's because we
 	 * elided redundant empty grouping sets. Restore a single empty grouping
 	 * set to leave a canonical form: GROUP BY ()
+ *
+ * 【中文总述】
+ * 处理 ORDER BY 子句：将排序表达式转换并添加到目标列表中。
+ * 处理 ASC/DESC、NULLS FIRST/LAST 等排序选项。
+ *
+ * 【调用链】
+ * transformStmt() → transformSortClause() → addTargetToSortList()
 	 */
 
 	if (flat_grouplist == NIL && hasGroupingSets)
@@ -2905,6 +3124,13 @@ transformGroupClause(ParseState *pstate, List *grouplist, List **groupingSets,
  *
  * This is also used for window and aggregate ORDER BY clauses (which act
  * almost the same, but are always interpreted per SQL99 rules).
+ *
+ * 【中文总述】
+ * 处理窗口定义（WINDOW 子句）。
+ * 解析命名窗口规范，并将其与 OVER 子句中的窗口引用关联。
+ *
+ * 【调用链】
+ * transformStmt() → transformWindowDefinitions() → findWindowClause()
  */
 List *
 transformSortClause(ParseState *pstate,
@@ -3086,6 +3312,13 @@ transformWindowDefinitions(ParseState *pstate,
 		/*
 		 * RANGE offset PRECEDING/FOLLOWING requires exactly one ORDER BY
 		 * column; check that and get its sort opfamily info.
+ *
+ * 【中文总述】
+ * 处理 DISTINCT 子句：将 DISTINCT 表达式转换为目标列表项。
+ * 确保 DISTINCT 列表中的表达式在目标列表中有对应的条目。
+ *
+ * 【调用链】
+ * transformStmt() → transformDistinctClause()
 		 */
 		if ((wc->frameOptions & FRAMEOPTION_RANGE) &&
 			(wc->frameOptions & (FRAMEOPTION_START_OFFSET |
@@ -3219,6 +3452,13 @@ transformDistinctClause(ParseState *pstate,
 	 * results that would probably surprise the user.  Note: this case is
 	 * presently impossible for aggregates because of grammar restrictions,
 	 * but we check anyway.
+ *
+ * 【中文总述】
+ * 处理 DISTINCT ON 子句：解析 DISTINCT ON 列表并确保目标列表匹配。
+ * DISTINCT ON 要求列表中的第一个表达式与目标列表中的某一项匹配。
+ *
+ * 【调用链】
+ * transformStmt() → transformDistinctOnClause() → transformDistinctClause()
 	 */
 	if (result == NIL)
 		ereport(ERROR,
@@ -3333,6 +3573,13 @@ transformDistinctOnClause(ParseState *pstate, List *distinctlist,
 	/*
 	 * An empty result list is impossible here because of grammar
 	 * restrictions.
+ *
+ * 【中文总述】
+ * 在排序/分组列表中查找与给定 sortgroupref 匹配的位置。
+ * 辅助函数，用于将 ORDER BY 或 GROUP BY 引用映射到目标列表中的位置。
+ *
+ * 【调用链】
+ * transformSortClause() / transformGroupClause() → get_matching_location()
 	 */
 	Assert(result != NIL);
 
@@ -3349,6 +3596,13 @@ transformDistinctOnClause(ParseState *pstate, List *distinctlist,
  * item, as whatever TLE it corresponds to will very possibly have a
  * parse location pointing to some matching entry in the SELECT list
  * or ORDER BY list.)
+ *
+ * 【中文总述】
+ * 解析唯一索引表达式，用于 ON CONFLICT DO UPDATE 语句。
+ * 将唯一索引的表达式转换为可比较的形式，用于冲突检测。
+ *
+ * 【调用链】
+ * transformOnConflictArbiter() → resolve_unique_index_expr()
  */
 static int
 get_matching_location(int sortgroupref, List *sortgrouprefs, List *exprs)
@@ -3446,6 +3700,14 @@ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
 		 * EXPR_KIND_INDEX_EXPRESSION.  So we needn't worry about those
 		 * further ... not that they would match any available index
 		 * expression anyway.
+ *
+ * 【中文总述】
+ * 处理 ON CONFLICT 子句中的仲裁者（arbiter）规范。
+ * 解析 ON CONFLICT ON CONSTRAINT 或 ON CONFLICT (index_expr) 语法，
+ * 确定冲突检测的索引或约束条件。
+ *
+ * 【调用链】
+ * transformInsertStmt() → transformOnConflictClause() → transformOnConflictArbiter()
 		 */
 		pInfer->expr = transformExpr(pstate, parse, EXPR_KIND_INDEX_EXPRESSION);
 
@@ -3563,6 +3825,13 @@ transformOnConflictArbiter(ParseState *pstate,
 	 * primnode representation is used for inference elements, and so
 	 * assign_query_collations() can be trusted to do the right thing with the
 	 * post parse analysis query tree inference clause representation.
+ *
+ * 【中文总述】
+ * 将目标列表项添加到排序列表中。
+ * 处理 ORDER BY 子句中每个表达式，确保其在目标列表中有对应条目。
+ *
+ * 【调用链】
+ * transformSortClause() → addTargetToSortList()
 	 */
 }
 
@@ -3650,6 +3919,13 @@ addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 
 			/*
 			 * Also see if the equality operator is hashable.
+ *
+ * 【中文总述】
+ * 将目标列表项添加到分组列表中。
+ * 处理 GROUP BY 子句中每个表达式，确保其在目标列表中有对应条目。
+ *
+ * 【调用链】
+ * transformGroupClause() → addTargetToGroupList()
 			 */
 			hashable = op_hashjoinable(eqop, restype);
 			break;
@@ -3717,6 +3993,13 @@ addTargetToSortList(ParseState *pstate, TargetEntry *tle,
  * to report such a location.
  *
  * Returns the updated SortGroupClause list.
+ *
+ * 【中文总述】
+ * 为排序/分组目标列表项分配 sortgroupref 编号。
+ * sortgroupref 用于在 ORDER BY 和 GROUP BY 中引用目标列表中的项。
+ *
+ * 【调用链】
+ * transformSortClause() / transformGroupClause() → assignSortGroupRef()
  */
 static List *
 addTargetToGroupList(ParseState *pstate, TargetEntry *tle,
@@ -3774,6 +4057,13 @@ addTargetToGroupList(ParseState *pstate, TargetEntry *tle,
  *	  already have one.  Return the assigned or pre-existing refnumber.
  *
  * 'tlist' is the targetlist containing (or to contain) the given targetentry.
+ *
+ * 【中文总述】
+ * 检查目标列表项是否在排序列表中。
+ * 用于验证目标列表中的项是否已被 ORDER BY 子句引用。
+ *
+ * 【调用链】
+ * transformDistinctClause() / transformSortClause() → targetIsInSortList()
  */
 Index
 assignSortGroupRef(TargetEntry *tle, List *tlist)
@@ -3815,6 +4105,13 @@ assignSortGroupRef(TargetEntry *tle, List *tlist)
  * InvalidOid when considering grouping).  Note that the main reason we need
  * this routine (and not just a quick test for nonzeroness of ressortgroupref)
  * is that a TLE might be in only one of the lists.
+ *
+ * 【中文总述】
+ * 在窗口定义列表中查找指定名称的窗口规范。
+ * 用于解析 WINDOW 子句中命名的窗口定义。
+ *
+ * 【调用链】
+ * transformWindowDefinitions() → findWindowClause()
  */
 bool
 targetIsInSortList(TargetEntry *tle, Oid sortop, List *sortList)
@@ -3842,6 +4139,13 @@ targetIsInSortList(TargetEntry *tle, Oid sortop, List *sortList)
 /*
  * findWindowClause
  *		Find the named WindowClause in the list, or return NULL if not there
+ *
+ * 【中文总述】
+ * 转换窗口框架偏移量表达式（RANGE/ROWS BETWEEN ... PRECEDING/FOLLOWING）。
+ * 处理窗口框架边界中的偏移表达式，确保其类型正确。
+ *
+ * 【调用链】
+ * transformWindowDefinitions() → transformFrameOffset()
  */
 static WindowClause *
 findWindowClause(List *wclist, const char *name)
