@@ -102,18 +102,35 @@ main(int argc, char *argv[])
 	 * the backend/postmaster crashes with a fatal signal or exception.
 	 * 【中文】在 Windows 平台上安装崩溃转储（crash dump）处理回调，
 	 * 以便进程因致命信号/异常崩溃时生成 dump 文件便于排查。
+	 *
+	 * 【调用链】pgwin32_install_crashdump_handler()
+	 *   → SetUnhandledExceptionFilter() 安装顶层异常过滤器
+	 *   → 进程崩溃时进入过滤器：收集现场信息并写出 *.dmp 崩溃转储文件
+	 *   （仅 Windows 平台编译，其它平台无此分支）
 	 */
 #if defined(WIN32)
 	pgwin32_install_crashdump_handler();
 #endif
 
 	/* 从 argv[0] 中提取不带路径的程序名（如 "postgres"），存到全局变量 */
+	/* 【调用链】get_progname(argv[0])
+	 *   → last_dir_separator() 截掉目录部分；无目录则 skip_drive() 去盘符
+	 *   → strdup() 拷贝一份（防止之后 argv 被 ps_status 改写）
+	 *   → Cygwin/Windows 下再剥离 ".exe" 后缀 */
 	progname = get_progname(argv[0]);
 
 	/*
 	 * Platform-specific startup hacks
 	 * 【中文】平台相关的启动设置（Windows 专用：Winsock 初始化、
 	 * 标准输出不缓冲、错误输出方式等）。
+	 *
+	 * 【调用链】startup_hacks()
+	 *   → setvbuf() 把 stdout/stderr 改为不缓冲
+	 *   → WSAStartup() 初始化 Winsock 网络库（失败则报错退出）
+	 *   → _set_abort_behavior()/SetErrorMode()/_set_error_mode() 让系统错误
+	 *     以"返回给调用者 + 输出到 stderr"的方式报告，而不是弹窗
+	 *   → _CrtSetReportMode() 把 C 运行时错误/断言/警告也重定向到 stderr
+	 *   （该函数仅在 WIN32 下做实际工作，其它平台是空操作）
 	 */
 	startup_hacks(progname);
 
@@ -132,6 +149,13 @@ main(int argc, char *argv[])
 	 * 进程标题，此时该函数会拷贝一份新的 argv 返回（原数组被改）。
 	 * 另外它还可能挪动环境变量字符串，所以必须尽早调用，
 	 * 避免与保存了 getenv() 返回指针的代码冲突。
+	 *
+	 * 【调用链】save_ps_display_args()
+	 *   → 检查 argv 字符串与 environ 在内存中是否连续（只对需要改写 argv
+	 *     的 PS_USE_CLOBBER_ARGV 平台），算出可覆盖区域作为 ps_buffer
+	 *   → 空间不够时拷贝 argv / 挪动环境变量腾出空间，并返回新 argv
+	 *   → 之后的 set_ps_display() 把进程标题写入 ps_buffer，
+	 *     ps 工具即可看到带含义的进程名（如 "postgres: writer"）
 	 */
 	argv = save_ps_display_args(argc, argv);
 
@@ -147,6 +171,11 @@ main(int argc, char *argv[])
 	 * 不过在 GUC 配置加载之前，消息只能输出到 stderr，且还没有本地化。
 	 */
 	MyProcPid = getpid();		/* 记录本进程 PID（供错误信息等使用） */
+	/* 【调用链】MemoryContextInit()
+	 *   → AllocSetContextCreate(NULL) 创建 TopMemoryContext（一切上下文的根）
+	 *   → CurrentMemoryContext 先指向 TopMemoryContext
+	 *   → 再创建 ErrorContext（错误恢复专用，临界区内也允许分配）
+	 *   → 至此 palloc()/pfree()/MemoryContextAlloc() 等内存 API 才可用 */
 	MemoryContextInit();		/* 初始化内存上下文体系（TopMemoryContext 等） */
 
 	/*
@@ -155,6 +184,13 @@ main(int argc, char *argv[])
 	 * 【中文】记录当前栈顶位置作为"栈深度检查"的基准点，
 	 * 之后递归过深（如无限递归的 SQL）时能检测到栈溢出。
 	 * （错误报告可用之前设置它没有意义，所以要放在上面两步之后。）
+	 *
+	 * 【调用链】set_stack_base()
+	 *   → __builtin_frame_address(0)（gcc 内建函数）取当前栈帧地址
+	 *     存入全局 stack_base_ptr
+	 *   → 之后每个可能深递归的函数都调 stack_is_too_deep()：
+	 *     当前栈指针与基准点之差超过上限即抛
+	 *     "stack depth limit exceeded" 错误，避免 SIGSEGV
 	 */
 	(void) set_stack_base();
 
@@ -162,6 +198,13 @@ main(int argc, char *argv[])
 	 * Set up locale information
 	 * 【中文】设置程序名对应的 locale 消息目录（gettext 本地化所需），
 	 * 并确定服务目录位置。
+	 *
+	 * 【调用链】set_pglocale_pgservice()
+	 *   → find_my_exec() 解析可执行文件的真实路径
+	 *   → get_locale_path() 计算消息目录 → bindtextdomain()/textdomain()
+	 *     注册 gettext 消息域，此后 _() 宏才有翻译可查
+	 *   → 若 PGSYSCONFDIR 未设置：get_etc_path() 得到配置文件目录并
+	 *     setenv() 写入（供 libpq 等查找系统配置）
 	 */
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("postgres"));
 
@@ -170,6 +213,11 @@ main(int argc, char *argv[])
 	 * the provider. strcoll(), etc., should not be called directly.
 	 * 【中文】字符串排序规则（排序/比较行为）由 pg_locale.c 统一管理，
 	 * 不要直接调用 strcoll() 等 libc 函数。这里先把 LC_COLLATE 置为 "C"。
+	 *
+	 * 【调用链】init_locale() → pg_perm_setlocale()
+	 *   → setlocale() 真正修改进程的 locale 类别；返回 NULL 表示失败
+	 *   → 失败则再试 "C"；连 "C" 都失败说明内存等严重问题，
+	 *     elog(FATAL) 直接终止启动
 	 */
 	init_locale("LC_COLLATE", LC_COLLATE, "C");
 
@@ -183,6 +231,8 @@ main(int argc, char *argv[])
 	 * 影响大小写转换等）。单个后端进程之后会改成所连数据库的
 	 * pg_database.datctype，但 postmaster 做不到，所以在这里先取环境值。
 	 * 若一直保持 "C"，postmaster 内的消息本地化可能不正常。
+	 *
+	 * 【调用链】同 LC_COLLATE：init_locale() → pg_perm_setlocale() → setlocale()
 	 */
 	init_locale("LC_CTYPE", LC_CTYPE, "");
 
@@ -191,6 +241,7 @@ main(int argc, char *argv[])
 	 * it here to allow startup error messages to be localized.
 	 * 【中文】LC_MESSAGES（消息语言）之后在 GUC 处理时会再设置，
 	 * 这里先设置是为了让启动阶段的错误信息也能本地化。
+	 * 【调用链】同 LC_CTYPE：init_locale() → pg_perm_setlocale() → setlocale()
 	 */
 #ifdef LC_MESSAGES
 	init_locale("LC_MESSAGES", LC_MESSAGES, "");
@@ -210,6 +261,7 @@ main(int argc, char *argv[])
 	 * 否则 LC_ALL 会覆盖 pg_perm_setlocale 设置的所有类别，
 	 * 导致上面的显式设置失效。
 	 */
+	/* 【调用链】unsetenv("LC_ALL")：libc 直接删除该环境变量，无后续调用 */
 	unsetenv("LC_ALL");
 
 	/*
@@ -223,11 +275,13 @@ main(int argc, char *argv[])
 	{
 		if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0)
 		{
+			/* 【调用链】help() → printf() 逐行打印各选项说明，无深层调用 */
 			help(progname);
-			exit(0);
+			exit(0);			/* 打印完毕直接正常退出 */
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
+			/* 【调用链】fputs() → stdout 输出 PG_BACKEND_VERSIONSTR 版本串 */
 			fputs(PG_BACKEND_VERSIONSTR, stdout);
 			exit(0);
 		}
@@ -258,6 +312,11 @@ main(int argc, char *argv[])
 	 * option.
 	 * 【中文】默认情况下拒绝以 root（Windows 上是管理员）运行 postgres，
 	 * 防止权限过高带来安全隐患；上面标记为安全的选项除外。
+	 *
+	 * 【调用链】check_root()
+	 *   → Unix：geteuid()==0（root）→ write_stderr() 报错 + exit(1)；
+	 *     getuid()!=geteuid()（setuid 方式运行）同样报错退出
+	 *   → Windows：pgwin32_is_admin() 为真 → write_stderr() + exit(1)
 	 */
 	if (do_check_root)
 		check_root(progname);
@@ -267,6 +326,11 @@ main(int argc, char *argv[])
 	 * 【中文】根据第一个参数分发给不同的子程序（详见各分支）。
 	 * 只有以 "--" 开头（如 "--boot"）才被解析为分发选项；
 	 * 普通 postgres 启动命令没有这类参数，走最后的 DISPATCH_POSTMASTER。
+	 *
+	 * 【调用链】parse_dispatch_option("boot"/"single"/...)
+	 *   → 遍历本文件中的 DispatchOptionNames[] 数组
+	 *   → "forkchild" 用 strncmp 做前缀匹配，其余选项 strcmp 全匹配
+	 *   → 返回对应的 DispatchOption 枚举值；无匹配则 DISPATCH_POSTMASTER
 	 */
 	if (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-')
 		dispatch_option = parse_dispatch_option(&argv[1][2]);
@@ -275,10 +339,24 @@ main(int argc, char *argv[])
 	{
 		case DISPATCH_CHECK:
 			/* --check：检查模式，initdb 早期用来验证系统表能否被读回 */
+			/* 【调用链】BootstrapModeMain(check_only=true)
+			 *   → InitializeGUCOptions() 载入 GUC 默认值 → 解析启动参数
+			 *   → SelectConfigFiles() 读 postgresql.conf → checkDataDir() 验证数据目录
+			 *   → CreateDataDirLockFile() 写锁文件
+			 *   → CreateSharedMemoryAndSemaphores() 建共享内存
+			 *   → 进入 CheckerModeMain()：只读回系统表验证一致性，
+			 *     不创建任何数据，成功即结束（initdb 靠它做早期体检） */
 			BootstrapModeMain(argc, argv, true);
 			break;
 		case DISPATCH_BOOT:
 			/* --boot：引导模式，initdb 用它创建系统表并写入基础数据 */
+			/* 【调用链】BootstrapModeMain(check_only=false)
+			 *   → 与 --check 相同的前置初始化（GUC/数据目录/共享内存）
+			 *   → 区别：InitProcess() → BaseInit() → bootstrap_signals()
+			 *   → BootStrapXLOG() 初始化 WAL 与 pg_control
+			 *   → InitPostgres() 进入初始数据库 template1
+			 *   → process_bootstrap_input() 执行 bootstrap 脚本：
+			 *     逐条创建系统表（pg_class、pg_attribute...）并插入初始数据 */
 			BootstrapModeMain(argc, argv, false);
 			break;
 		case DISPATCH_FORKCHILD:
@@ -286,6 +364,18 @@ main(int argc, char *argv[])
 			 * 由 postmaster exec 出来的子进程从这里进入
 			 * SubPostmasterMain()（例如做 WAL 归档、校验等工作）。
 			 * 普通 fork 平台理论上不会出现，所以 Assert 防御。 */
+			/* 【调用链】SubPostmasterMain()
+			 *   → InitializeGUCOptions()；解析 --forkchild= 得到子进程类型
+			 *   → read_backend_variables() 从管道读回 postmaster 传来的
+			 *     共享内存位置、GUC 等启动参数
+			 *   → ClosePostmasterPorts() 关闭继承的监听 socket
+			 *   → PGSharedMemoryReAttach() 重新挂接共享内存段
+			 *   → read_nondefault_variables() 读回非默认 GUC → checkDataDir()
+			 *   → 按类型分发到 main_fn：B_STARTUP→StartupProcessMain()
+			 *     B_CHECKPOINTER→CheckpointerMain() / B_BG_WRITER→BackgroundWriterMain()
+			 *     B_WALWRITER / B_AUTOVAC_LAUNCHER→AutoVacLauncherMain()
+			 *     B_AUTOVAC_WORKER→AutoVacWorkerMain() / B_ARCHIVER→PgArchiverMain()
+			 *     B_LOGGER→SysLoggerMain() / B_BACKEND→BackendMain() */
 #ifdef EXEC_BACKEND
 			SubPostmasterMain(argc, argv);
 #else
@@ -294,17 +384,48 @@ main(int argc, char *argv[])
 			break;
 		case DISPATCH_DESCRIBE_CONFIG:
 			/* --describe-config：打印所有 GUC 参数，供 pg_config 等工具使用 */
+			/* 【调用链】GucInfoMain()
+			 *   → build_guc_variables() 构建 GUC 哈希表（注册全部内置参数）
+			 *   → get_guc_variables() 取数组 → displayStruct() 过滤掉
+			 *     不允许展示的参数（GUC_NO_SHOW_ALL 等）
+			 *   → printMixedStruct() 按"名称/context/分组/类型/默认值"
+			 *     制表符分隔打印 → exit(0) */
 			GucInfoMain();
 			break;
 		case DISPATCH_SINGLE:
 			/* --single：单用户模式（如 initdb 后期、紧急修复时使用），
 			 * 用户名取自操作系统用户 */
+			/* 【调用链】PostgresSingleUserMain()
+			 *   → InitStandaloneProcess()（独立进程初始化，非 postmaster 子进程）
+			 *   → InitializeGUCOptions() → process_postgres_switches() 解析
+			 *     -D/-d/-E 等参数
+			 *   → SelectConfigFiles() 读 postgresql.conf
+			 *   → checkDataDir()/ChangeToDataDir() → CreateDataDirLockFile()
+			 *   → LocalProcessControlFile() 读取控制文件
+			 *   → InitPostgres() 连接目标数据库并设定用户身份
+			 *   → PostgresMain() 进入单用户查询循环：读一行 SQL → 执行 →
+			 *     返回结果，直到 EOF（这就是 initdb 后期灌入
+			 *     postgres.* 系统数据的方式） */
 			PostgresSingleUserMain(argc, argv,
 								   strdup(get_user_name_or_exit(progname)));
 			break;
 		case DISPATCH_POSTMASTER:
 			/* 默认身份：postmaster 主进程，整个数据库服务从这里开始。
 			 * 它会负责监听端口、fork 后端进程、管理共享内存等。 */
+			/* 【调用链】PostmasterMain()
+			 *   → InitProcessGlobals()；创建 PostmasterContext
+			 *   → getInstallationPaths() 定位安装目录 → 解析启动参数
+			 *   → load_config() 读取 postgresql.conf → checkDataDir()
+			 *   → CreateDataDirLockFile() 写锁文件
+			 *   → CreateSharedMemoryAndSemaphores() 创建共享内存/信号量
+			 *   → 依次 fork 辅助进程：startup(StartupProcessMain) →
+			 *     checkpointer → bgwriter → walwriter → autovacuum launcher
+			 *     → stats collector → archiver（由 PostmasterStateMachine 驱动）
+			 *   → ServerLoop() 主循环：select() 等待监听 socket 事件
+			 *   → 新连接 → AcceptConnection() → BackendStartup() fork 后端
+			 *     → BackendInitialize() → BackendRun() → PostgresMain()
+			 *     进入每个连接的查询执行循环
+			 *   （ServerLoop 正常不返回；返回则整体关闭退出） */
 			PostmasterMain(argc, argv);
 			break;
 	}
@@ -322,6 +443,7 @@ main(int argc, char *argv[])
 DispatchOption
 parse_dispatch_option(const char *name)
 {
+	/* 【中文】遍历所有可选的分发选项名，逐个与命令行参数比较 */
 	for (size_t i = 0; i < lengthof(DispatchOptionNames); i++)
 	{
 		/*
@@ -482,6 +604,9 @@ startup_hacks(const char *progname)
 static void
 init_locale(const char *categoryname, int category, const char *locale)
 {
+	/* 【调用链】pg_perm_setlocale() → setlocale() 真正修改进程 locale；
+	 * 返回 NULL 说明指定 locale 无效 → 再试回退值 "C"；
+	 * 连 "C" 都失败（如内存不足）→ elog(FATAL) 终止启动 */
 	if (pg_perm_setlocale(category, locale) == NULL &&
 		pg_perm_setlocale(category, "C") == NULL)
 		elog(FATAL, "could not adopt \"%s\" locale nor C locale for %s",
@@ -505,8 +630,12 @@ init_locale(const char *categoryname, int category, const char *locale)
 static void
 help(const char *progname)
 {
+	/* 【中文】程序简介：打印进程名与说明，标明这是 PostgreSQL 服务器程序 */
 	printf(_("%s is the PostgreSQL server.\n\n"), progname);
+	/* 【中文】用法说明：基本调用形式  postgres [OPTION]... */
 	printf(_("Usage:\n  %s [OPTION]...\n\n"), progname);
+
+	/* 【中文】普通运行选项：缓冲区数量、参数设置、监听地址、端口等 */
 	printf(_("Options:\n"));
 	printf(_("  -B NBUFFERS        number of shared buffers\n"));
 	printf(_("  -c NAME=VALUE      set run-time parameter\n"));
@@ -531,6 +660,7 @@ help(const char *progname)
 	printf(_("  -?, --help         show this help, then exit\n"));
 
 	printf(_("\nDeveloper options:\n"));
+	/* 【中文】开发者选项：禁用某些计划类型、允许修改系统表等（调试/开发用） */
 	printf(_("  -f s|i|o|b|t|n|m|h forbid use of some plan types\n"));
 	printf(_("  -O                 allow system table structure changes\n"));
 	printf(_("  -P                 disable system indexes\n"));
@@ -539,6 +669,7 @@ help(const char *progname)
 	printf(_("  -W NUM             wait NUM seconds to allow attach from a debugger\n"));
 
 	printf(_("\nOptions for single-user mode:\n"));
+	/* 【中文】单用户模式选项：--single 必须放第一个参数，可直接指定数据库名 */
 	printf(_("  --single           selects single-user mode (must be first argument)\n"));
 	printf(_("  DBNAME             database name (defaults to user name)\n"));
 	printf(_("  -d 0-5             override debugging level\n"));
@@ -547,11 +678,13 @@ help(const char *progname)
 	printf(_("  -r FILENAME        send stdout and stderr to given file\n"));
 
 	printf(_("\nOptions for bootstrapping mode:\n"));
+	/* 【中文】引导/检查模式选项：initdb 建库时用，--boot/--check 必须放第一个参数 */
 	printf(_("  --boot             selects bootstrapping mode (must be first argument)\n"));
 	printf(_("  --check            selects check mode (must be first argument)\n"));
 	printf(_("  DBNAME             database name (mandatory argument in bootstrapping mode)\n"));
 	printf(_("  -r FILENAME        send stdout and stderr to given file\n"));
 
+	/* 【中文】结尾提示：完整配置项请查阅文档，并给出 bug 反馈与主页地址 */
 	printf(_("\nPlease read the documentation for the complete list of run-time\n"
 			 "configuration settings and how to set them on the command line or in\n"
 			 "the configuration file.\n\n"

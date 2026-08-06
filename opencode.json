@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "lsp": {
+    "clangd": {
+      "command": ["clangd"],
+      "extensions": [".c", ".h"],
+      "initialization": {
+        "compilationDatabasePath": "build"
+      }
+    }
+  }
+}
