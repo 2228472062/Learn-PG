@@ -10,6 +10,45 @@
  * IDENTIFICATION
  *	  src/backend/storage/lmgr/proc.c
  *
+ * 【模块总览(中文)】
+ * 本文件负责管理 PostgreSQL 的"进程表"——共享内存中每个后端/辅助进程/
+ * prepared 事务对应的 PGPROC 结构(以及配套的 PROC_HDR 表头)。PGPROC 是
+ * 整个锁系统与并发控制的中枢:它记录进程的虚拟事务号(VXID)、正在等待的
+ * 重锁(waitLock/waitLockMode/waitStatus)、LWLock 等待状态(lwWaiting/
+ * lwWaitMode)、每进程的 latch(procLatch,用于被其他进程唤醒)与信号量
+ * (sem,用于 LWLock 睡眠)、fast-path 锁槽(fpLockBits/fpRelId)、锁组
+ * 关系(lockGroupLeader)、同步复制与日志回收等状态,并被 ProcArray
+ * (procarray.c)、procsignal、wait_event 统计等模块广泛引用。
+ *
+ * 【核心数据结构】
+ * - PROC_HDR(ProcGlobal):进程表头。包含全部 PGPROC 的指针 allProcs、
+ *   按角色划分的空闲链表(freeProcs/autovacFreeProcs/bgworkerFreeProcs/
+ *   walsenderFreeProcs)、与 PGPROC 字段紧凑镜像的数组 xids/
+ *   subxidStates/statusFlags,以及各辅助进程的 ProcNumber 广告位
+ *   (avLauncherProc/walwriterProc/checkpointerProc);
+ * - PGPROC:共享内存数组中的单进程条目。辅助进程使用固定预留的
+ *   AuxiliaryProcs 区段,prepared 事务使用 PreparedXactProcs 区段,
+ *   普通后端/自动清理/后台工作者/walsender 分别从各自的空闲链表摘取。
+ *
+ * 【设计思想】
+ * 1. 预先分配:PGPROC 数组与每进程信号量在 postmaster 启动时按
+ *    max_connections 等 GUC 上限一次性创建(ProcGlobalShmemInit),既满足
+ *    "信号量须在 postmaster 中创建"的实现约束,也让"配置超出内核限制"
+ *    尽早暴露,而不是负载高企时才开始失败;
+ * 2. 按角色隔离的空闲链表:不同角色的进程从不同链表取 PGPROC,使
+ *    "连接数超限"与"walsender 超限"等错误互不干扰;
+ * 3. 等锁睡眠:重锁获取失败后,lock.c 调用本文件的 JoinWaitQueue/
+ *    ProcSleep 把进程挂入锁的等待队列并睡眠(latch 唤醒),配合
+ *    deadlock_timeout 定时器触发 CheckDeadLock 死锁检测;
+ * 4. 退出清理:进程退出时 ProcKill 归还 PGPROC、清理 latch 所有权与
+ *    锁组关系,持有的 LWLock 由 LWLockReleaseAll 兜底释放;
+ * 5. 中断安全:等锁期间通过 WaitLatch + CHECK_FOR_INTERRUPTS 及时响应
+ *    取消/死锁超时;LockErrorCleanup 保证出错时把进程从等待队列摘除。
+ *
+ * 与 lwlock.c 的关系:LWLock 的睡眠/唤醒使用 PGPROC 的 sem 信号量与
+ * lwWaiting 状态;与 lock.c/deadlock.c 的协作见 ProcSleep/CheckDeadLock
+ * 的注释。
+ *
  *-------------------------------------------------------------------------
  */
 /*
@@ -59,6 +98,14 @@
 #include "utils/wait_event.h"
 
 /* GUC variables */
+/* (中文)本文件相关的 GUC 配置项(用户可在 postgresql.conf 中设置):
+ * - DeadlockTimeout:等锁超过该毫秒数后触发死锁检测(见 ProcSleep/
+ *   CheckDeadLock);
+ * - StatementTimeout / LockTimeout / IdleInTransactionSessionTimeout /
+ *   TransactionTimeout / IdleSessionTimeout:各类超时,LockTimeout 用于
+ *   等锁超时(与 DeadlockTimeout 在同一定时器框架中启用);
+ * - log_lock_waits:为 true 时,等待超过 DeadlockTimeout 的锁等待会写入
+ *   服务器日志(见 ProcSleep 中的日志逻辑)。 */
 int			DeadlockTimeout = 1000;
 int			StatementTimeout = 0;
 int			LockTimeout = 0;
@@ -67,9 +114,22 @@ int			TransactionTimeout = 0;
 int			IdleSessionTimeout = 0;
 bool		log_lock_waits = true;
 
+/* (中文)本进程自己的 PGPROC 指针:InitProcess/InitAuxiliaryProcess 成功
+ * 后非 NULL;为 NULL 时表示尚无 PGPROC(如共享内存初始化早期),此时
+ * 不能睡眠等待 LWLock。进程退出清理(ProcKill/AuxiliaryProcKill)会把它
+ * 置回 NULL。 */
 /* Pointer to this process's PGPROC struct, if any */
 PGPROC	   *MyProc = NULL;
 
+/* (中文)指向共享内存结构的指针:
+ * - ProcGlobal(PROC_HDR):进程表头,postmaster 启动时建立,各进程继承;
+ * - AllProcsShmemPtr / FastPathLockArrayShmemPtr:分别指向"PGPROC 大块
+ *   内存(PGPROC 数组 + xids 等镜像数组)"与"fast-path 锁数组"共享内存
+ *   的基址,仅用于 ProcGlobalShmemInit 中的切片初始化;
+ * - AuxiliaryProcs:固定预留给辅助进程(bgwriter、checkpointer 等)的
+ *   PGPROC 区段(共 NUM_AUXILIARY_PROCS 个);
+ * - PreparedXactProcs:预留给 prepared(两阶段)事务"虚拟进程"的 PGPROC
+ *   区段。 */
 /* Pointers to shared-memory structures */
 PROC_HDR   *ProcGlobal = NULL;
 static void *AllProcsShmemPtr;
@@ -80,18 +140,35 @@ PGPROC	   *PreparedXactProcs = NULL;
 static void ProcGlobalShmemRequest(void *arg);
 static void ProcGlobalShmemInit(void *arg);
 
+/* (中文)向共享内存子系统注册的 request/init 回调对:request 阶段
+ * (ProcGlobalShmemRequest)声明进程表所需字节数并让信号量实现登记其
+ * 共享需求;init 阶段(ProcGlobalShmemInit)完成表头初始化、PGPROC
+ * 区段切片与全部信号量创建。 */
 const ShmemCallbacks ProcGlobalShmemCallbacks = {
 	.request_fn = ProcGlobalShmemRequest,
 	.init_fn = ProcGlobalShmemInit,
 };
 
+/* (中文)静态辅助量(见各使用处):
+ * - TotalProcs:PGPROC 总数(MaxBackends + 辅助进程数 + prepared 事务数);
+ * - ProcGlobalAllProcsShmemSize:PGPROC 及其镜像数组所需总字节数;
+ * - FastPathLockArrayShmemSize:fast-path 锁数组所需总字节数。 */
 static uint32 TotalProcs;
 static size_t ProcGlobalAllProcsShmemSize;
 static size_t FastPathLockArrayShmemSize;
 
+/* (中文)死锁检测超时(deadlock_timeout)触发标志:由信号处理函数
+ * CheckDeadLockAlert 置位,ProcSleep 的等待循环里轮询该标志后调用
+ * CheckDeadLock() 做真正的检测(检测不能在信号处理器里做)。
+ * sig_atomic_t 保证信号处理器中的写入在主执行流中原子可见。 */
 /* Is a deadlock check pending? */
 static volatile sig_atomic_t got_deadlock_timeout;
 
+/* (中文)静态函数前置声明(实现见后文):
+ * - RemoveProcFromArray:进程退出时把本进程从共享 ProcArray 中移除;
+ * - ProcKill / AuxiliaryProcKill:普通/辅助进程的退出清理回调;
+ * - CheckDeadLock:实际的死锁检测(锁表全分区加排他锁后调用
+ *   DeadLockCheck)。 */
 static void RemoveProcFromArray(int code, Datum arg);
 static void ProcKill(int code, Datum arg);
 static void AuxiliaryProcKill(int code, Datum arg);
@@ -101,6 +178,20 @@ static DeadLockState CheckDeadLock(void);
 /*
  * Calculate shared-memory space needed by Fast-Path locks.
  */
+/* (中文)计算 fast-path 锁数组所需的共享内存字节数。
+ *
+ * 【作用】仅被 ProcGlobalShmemRequest 调用(postmaster 阶段):每个
+ * PGPROC 需要"锁模式位图数组"(FastPathLockGroupsPerBackend 个 uint64,
+ * 记录各 fast-path 槽位请求的锁模式)与"关系 OID 数组"
+ * (FastPathLockSlotsPerBackend() 个 Oid,记录各槽位锁定的关系),两者
+ * 均按 MAXALIGN 对齐,再乘以进程总数 TotalProcs。
+ *
+ * 【设计思想】fast-path 锁数组是变长的,无法直接内嵌进 PGPROC,故单独
+ * 划一块共享内存、按进程顺序连续切分(fast-path 机制见 lock.c);每个
+ * 后端的两段数组交错布置(见 ProcGlobalShmemInit),尽量利用局部性。
+ *
+ * 【参数】无
+ * 【返回值】所需字节数(恒大于 0)。 */
 static Size
 CalculateFastPathLockShmemSize(void)
 {
@@ -126,6 +217,18 @@ CalculateFastPathLockShmemSize(void)
 /*
  * Report number of semaphores needed by ProcGlobalShmemInit.
  */
+/* (中文)报告进程表子系统需要的信号量总数。
+ *
+ * 【作用】被 ProcGlobalShmemRequest(转发给 PGSemaphoreShmemRequest)与
+ * ProcGlobalShmemInit(PGSemaphoreInit)调用,保证分配的信号量与 PGPROC
+ * 一一对应。
+ *
+ * 【设计思想】信号量数量 = 普通后端(含自动清理、后台工作者、walsender,
+ * 统一计入 MaxBackends) + 辅助进程数;prepared 事务的"虚拟 PGPROC"不
+ * 与真实进程关联,不需要信号量(见 ProcGlobalShmemInit 中的分支)。
+ *
+ * 【参数】无
+ * 【返回值】信号量总数。 */
 int
 ProcGlobalSemas(void)
 {
@@ -143,6 +246,26 @@ ProcGlobalSemas(void)
  * This is called during postmaster or standalone backend startup, and also
  * during backend startup in EXEC_BACKEND mode.
  */
+/* (中文)共享内存 request 阶段回调:登记进程表子系统所需的共享内存。
+ *
+ * 【作用】postmaster(或独立后端、EXEC_BACKEND 下的后端)启动早期由共享
+ * 内存子系统调用,声明三块内存:
+ * 1. "PGPROC 大块":TotalProcs 个 PGPROC + 每进程一个的 xids/
+ *    subxidStates/statusFlags 镜像数组(总大小记录进
+ *    ProcGlobalAllProcsShmemSize);
+ * 2. "Fast-Path Lock Array":postmaster 阶段按 CalculateFastPathLockShmemSize
+ *    计算精确大小;子进程阶段以 SHMEM_ATTACH_UNKNOWN_SIZE 表示附加既有
+ *    内存(避免重复计算,EXEC_BACKEND 下按同样布局重新附加);
+ * 3. "Proc Header"(PROC_HDR)。
+ * 最后委托信号量实现(PGSemaphoreShmemRequest)登记其共享需求。
+ *
+ * 【设计思想】"先请求后初始化"两阶段约定:request 阶段只统计并声明
+ * 字节数,init 阶段(ProcGlobalShmemInit)才填充内容。EXEC_BACKEND 下
+ * ProcGlobal 需要被后端在调用 ShmemAttachRequested() 之前就访问到,
+ * 故其 .ptr 注册方式与普通结构相同、但传播路径特殊(见英文注释)。
+ *
+ * 【参数】arg —— 回调参数(未使用)。
+ * 【返回值】无 */
 static void
 ProcGlobalShmemRequest(void *arg)
 {
@@ -217,6 +340,32 @@ ProcGlobalShmemRequest(void *arg)
  *	  implementation typically requires us to create semaphores in the
  *	  postmaster, not in backends.
  */
+/* (中文)共享内存 init 阶段回调:初始化全局进程表并创建全部信号量。
+ *
+ * 【作用】共享内存分配完成后执行:
+ * 1. 初始化 PROC_HDR:spinlock、四条空闲链表、各辅助进程广告位
+ *    (avLauncherProc 等,先置 INVALID_PROC_NUMBER)、spins_per_delay;
+ * 2. 把"PGPROC 大块"清零并切片:allProcs 数组(PGPROC 本体,共
+ *    TotalProcs 个)+ 三个密集镜像数组 xids/subxidStates/statusFlags;
+ * 3. 切分 fast-path 锁数组:按进程逐个分配 fpLockBits/fpRelId,两段
+ *    交错布置以利用缓存局部性;前 FIRST_PREPARED_XACT_PROC_NUMBER 个
+ *    PGPROC 创建各自信号量、共享 latch 与 fpInfoLock(prepared 事务
+ *    的虚拟 PGPROC 不需要——它们不与真实进程关联);
+ * 4. 按角色把 PGPROC 挂进对应空闲链表:普通后端(< MaxConnections)
+ *    -> freeProcs;自动清理/特殊 worker -> autovacFreeProcs;后台
+ *    worker -> bgworkerFreeProcs;walsender -> walsenderFreeProcs。
+ *    辅助进程不用空闲链表(数量少且固定,由 InitAuxiliaryProcess 线性
+ *    查找),prepared 事务 PGPROC 由 TwoPhaseShmemInit 管理;
+ * 5. 初始化各 PGPROC 的 myProcLocks、lockGroupMembers 与原子字段,
+ *    最后记录 AuxiliaryProcs/PreparedXactProcs 区段起始指针。
+ *
+ * 【设计思想】按角色分链表(见英文注释):不同类型的进程各有配额语义,
+ * 单独链表让"连接满"与"walsender 满"等错误信息互不干扰;信号量在
+ * postmaster 启动时一次性创建,宁可配置失败早暴露,也不在负载高峰
+ * 时才因内核限额失败(见函数上方英文注释)。
+ *
+ * 【参数】arg —— 回调参数(未使用)。
+ * 【返回值】无 */
 static void
 ProcGlobalShmemInit(void *arg)
 {
@@ -389,6 +538,31 @@ ProcGlobalShmemInit(void *arg)
 /*
  * InitProcess -- initialize a per-process PGPROC entry for this backend
  */
+/* (中文)为当前后端进程初始化一个 PGPROC 条目(后端启动的关键一步)。
+ *
+ * 【作用】普通后端、自动清理 worker、后台工作者、walsender 进程在启动
+ * 早期调用(由 postmaster 启动协议中的 BackendStartup/autovac 等路径
+ * 触发):从对应角色空闲链表摘取一个空闲 PGPROC 作为 MyProc,初始化其
+ * 全部字段,接管共享 latch、登记 wait_event 存储,注册退出清理回调
+ * ProcKill,并初始化 LWLock 与死锁检测的本地状态。
+ *
+ * 【设计思想】
+ * - 角色选择必须与 ProcGlobalShmemInit 建链表的划分完全一致(见函数内
+ *   注释),否则会挂错链表、破坏角色配额;
+ * - 摘取在 freeProcsLock 自旋锁内完成,顺带把共享的 spins_per_delay
+ *   估计值拷进本地(自旋策略的全局自适应,见 s_lock.c);链表为空表示
+ *   配额用尽,给出"too many clients"等标准错误;
+ * - 大段字段初始化与 ProcGlobalShmemInit 的分工:后者负责"进程无关、
+ *   一次到位"的公共部分(信号量、锁队列头、原子变量),本函数负责
+ *   "每次占用都要重置"的进程相关部分;PGPROC 会被复用,故所有字段都
+ *   必须恢复初值,断言确保前一个进程没留下锁;
+ * - latch 所有权:本进程的 latch 原指向进程本地,OwnLatch + SwitchToSharedLatch
+ *   后指向共享的 MyProc->procLatch,使其他进程能通过 SetLatch 唤醒我们;
+ * - 信号量可能来自已崩溃进程,重新 PGSemaphoreReset 保证计数干净。
+ *
+ * 【参数】无
+ * 【返回值】无(PGPROC 配额耗尽时 ereport(FATAL);重复调用会
+ *         elog(ERROR))。 */
 void
 InitProcess(void)
 {
@@ -584,6 +758,19 @@ InitProcess(void)
  * we've created a PGPROC, but in the EXEC_BACKEND case ProcArrayAdd won't
  * work until after we've done AttachSharedMemoryStructs.
  */
+/* (中文)初始化第二阶段:把本进程加入共享 ProcArray。
+ *
+ * 【作用】在 InitProcess 之后、事务真正开始之前调用:调用 ProcArrayAdd
+ * 使本进程对 ProcArray(procarray.c,用于快照/活跃事务判定)可见,并注册
+ * 退出回调 RemoveProcFromArray。
+ *
+ * 【设计思想】与 InitProcess 分开的原因:ProcArrayAdd 需要持有 LWLock,
+ * 而拿到 PGPROC 是使用 LWLock 的前提;EXEC_BACKEND 模式下 ProcArrayAdd
+ * 还要等 AttachSharedMemoryStructs 之后才能工作,故把"建 PGPROC"与
+ * "进 ProcArray"拆成两步,让启动流程在两者之间插入必要的附加步骤。
+ *
+ * 【参数】无
+ * 【返回值】无(前置条件:MyProc 已就绪)。 */
 void
 InitProcessPhase2(void)
 {
@@ -619,6 +806,25 @@ InitProcessPhase2(void)
  * as a sendOnly process, so never reads messages from sinval queue. So
  * Startup process does have a VXID and does show up in pg_locks.
  */
+/* (中文)为辅助进程(bgwriter、checkpointer、walwriter、启动进程等)创建
+ * PGPROC 条目。
+ *
+ * 【作用】辅助进程不经过 InitProcess,而是调用本函数:在 freeProcsLock
+ * 保护下从固定区段 AuxiliaryProcs 里线性找一个空闲(pid == 0)槽位,
+ * 标记占用后作为 MyProc,初始化所需字段,接管共享 latch、登记
+ * wait_event 存储,注册退出回调 AuxiliaryProcKill,并初始化 LWLock
+ * 本地状态。walwriter/checkpointer 还会把自己的 ProcNumber 广告到
+ * ProcGlobal(见注释:部分辅助进程在 ProcGlobal 中"打广告")。
+ *
+ * 【设计思想】辅助进程是固定数量、固定角色的小集合,故不用空闲链表而
+ * 用线性查找;它们不参与重锁等待、不进 ProcArray、不做 sinval 消息
+ * 接收,因此相应机制(死锁检测器、VXID、ProcArrayAdd)一概跳过。例外:
+ * 启动进程(startup)会持有重锁且以 sendOnly 身份参与 sinval,所以它有
+ * VXID、会出现在 pg_locks 中(见英文注释)。这些进程只等 LWLock,故仅
+ * 初始化 LWLock 所需状态。
+ *
+ * 【参数】无
+ * 【返回值】无(槽位耗尽时 elog(FATAL);重复调用会 elog(ERROR))。 */
 void
 InitAuxiliaryProcess(void)
 {
@@ -765,6 +971,19 @@ InitAuxiliaryProcess(void)
  * at this value, so locking not required, especially since the set is
  * an atomic integer set operation.
  */
+/* (中文)设置/清除"启动进程等待的 buffer pin 缓冲号"。
+ *
+ * 【作用】热备恢复期间,启动进程(Startup)等待某个缓冲区被解除 pin 时
+ * 把该缓冲区编号(或 -1 表示不等待)写入 ProcGlobal,供各后端读取
+ * (见 GetStartupBufferPinWaitBufId),从而实现 buffer pin 恢复冲突的
+ * 检测与协调。
+ *
+ * 【设计思想】写入先于后端的读取发生(先设置后使用),且是单字原子
+ * 赋值,故不需要锁;用 volatile 指针防止编译器重排读序。
+ *
+ * 【参数】bufid —— 启动进程等待的缓冲区编号;传 -1 表示复位为
+ *         "不等待"。
+ * 【返回值】无 */
 void
 SetStartupBufferPinWaitBufId(int bufid)
 {
@@ -777,6 +996,16 @@ SetStartupBufferPinWaitBufId(int bufid)
 /*
  * Used by backends when they receive a request to check for buffer pin waits.
  */
+/* (中文)读取"启动进程当前等待的 buffer pin 缓冲号"。
+ *
+ * 【作用】后端收到 procsignal 的恢复冲突请求时调用:若返回值为合法缓冲
+ * 号且本进程正 pin 着该缓冲区,就主动解除 pin,配合 Startup 推进恢复。
+ *
+ * 【设计思想】与 SetStartupBufferPinWaitBufId 对应,读侧同样用 volatile
+ * 指针;因写入先于读取(见 setter 注释),无需加锁。
+ *
+ * 【参数】无
+ * 【返回值】启动进程等待的缓冲号;-1 表示没有等待。 */
 int
 GetStartupBufferPinWaitBufId(void)
 {
@@ -793,6 +1022,19 @@ GetStartupBufferPinWaitBufId(void)
  *
  * Note: this is designed on the assumption that N will generally be small.
  */
+/* (中文)检查普通后端空闲链表上是否还有至少 N 个空闲 PGPROC。
+ *
+ * 【作用】供需要"预先判断能否再接纳 N 个连接"的调用方(如 postmaster
+ * 判断连接池/两阶段事务注册是否可行)使用:在 freeProcsLock 保护下清点
+ * freeProcs 链表前 N 项(不到 N 项则数完为止)。
+ *
+ * 【设计思想】只查"普通后端"链表,不含 autovac/bgworker/walsender;
+ * N 通常很小,线性数节点成本可忽略。返回 false 时把实际空闲数带出,
+ * 方便调用方报出准确数字。
+ *
+ * 【参数】n —— 需要检查的空闲数;nfree —— 输出参数:空闲数 >= n 时
+ *         写入 n,否则写入实际空闲数。
+ * 【返回值】空闲数 >= n 返回 true,否则 false。 */
 bool
 HaveNFreeProcs(int n, int *nfree)
 {
@@ -824,6 +1066,24 @@ HaveNFreeProcs(int n, int *nfree)
  * interrupt while waiting; but an ereport(ERROR) before or during the lock
  * wait is within the realm of possibility, too.)
  */
+/* (中文)事务中止时取消正在进行的锁等待,并回退强锁计数。
+ *
+ * 【作用】在事务中止/错误清理路径上调用(ProcReleaseLocks 与
+ * ProcEndTransaction 等处):先 AbortStrongLockAcquire 撤销
+ * "strong lock 计数已 +1"的获取登记;若本进程确实在等锁(GetAwaitedLock
+ * 非空),关闭死锁与锁超时定时器,持对应分区锁把本进程从锁等待队列摘除
+ * (若已被摘除且等待被授予,则把锁登记进本地锁表 GrantAwaitedLock),
+ * 最后复位等待锁记录。
+ *
+ * 【设计思想】等锁期间随时可能被取消/出错,必须保证"进程要么在等待
+ * 队列里、要么不在",共享锁表才一致;摘除操作以分区锁串行化,避免与
+ * 释放者/死锁检测者竞争。定时器关闭时保留 LOCK_TIMEOUT 的 indicator
+ * 标志:当 SIGINT 恰好来自锁超时而非用户取消时,错误要上报为"锁超时"
+ * 而不是"查询取消"(见函数内注释)。本函数全程 HOLD_INTERRUPTS,保证
+ * 清理过程不被再次中断。
+ *
+ * 【参数】无
+ * 【返回值】无 */
 void
 LockErrorCleanup(void)
 {
@@ -902,6 +1162,22 @@ LockErrorCleanup(void)
  * this is implemented by retail releasing of the locks under control of
  * the ResourceOwner mechanism.
  */
+/* (中文)在事务提交/中止时释放与当前事务相关的锁。
+ *
+ * 【作用】由事务提交/回滚路径(commit/abort)调用:
+ * - 若本进程没有 PGPROC(如独立后端早期),直接返回;
+ * - 若正停留在等锁队列上(通常是错误后的残留),先 LockErrorCleanup;
+ * - 主事务提交:释放标准锁(除 session 级);主事务中止:释放包括
+ *   session 级在内的全部标准锁;
+ * - 用户锁(advisory):只释放事务级的,session 级持有的无论提交与否
+ *   都保留。
+ *
+ * 【设计思想】子事务提交不释放任何锁(延迟到父事务处理,因此本函数
+ * 根本不被调用);子事务中止时锁由 ResourceOwner 机制逐把零售释放。
+ *
+ * 【参数】isCommit —— true 表示提交(保留 session 级标准锁),false
+ *         表示中止(全部标准锁都释放)。
+ * 【返回值】无 */
 void
 ProcReleaseLocks(bool isCommit)
 {
@@ -919,6 +1195,13 @@ ProcReleaseLocks(bool isCommit)
 /*
  * RemoveProcFromArray() -- Remove this process from the shared ProcArray.
  */
+/* (中文)进程退出回调:把本进程从共享 ProcArray 中移除。
+ *
+ * 【作用】由 InitProcessPhase2 注册的 on_shmem_exit 回调,进程退出时
+ * 调用 ProcArrayRemove 使本进程在快照/活跃事务判定中不可见。
+ *
+ * 【参数】code —— 退出码;arg —— 附加参数(均未使用)。
+ * 【返回值】无 */
 static void
 RemoveProcFromArray(int code, Datum arg)
 {
@@ -930,6 +1213,29 @@ RemoveProcFromArray(int code, Datum arg)
  * ProcKill() -- Destroy the per-proc data structure for
  *		this process. Release any of its held LW locks.
  */
+/* (中文)普通后端的退出清理回调:销毁本进程的 PGPROC 条目并归还空闲链表。
+ *
+ * 【作用】由 InitProcess 注册的 on_shmem_exit 回调,进程(正常或异常)
+ * 退出时执行,按序完成:同步复制链清理 -> 释放遗留 LWLock -> 清理
+ * LSN 等待与条件变量睡眠 -> 把 latch 切回进程本地并放弃共享 latch
+ * 所有权 -> 退出锁组(必要时连带归还 leader 的 PGPROC)-> 重置字段 ->
+ * 把 PGPROC 挂回所属空闲链表,并更新全局 spins_per_delay 估计。
+ *
+ * 【设计思想】若干并发安全细节:
+ * - DisownLatch 必须先于 PGPROC 回链:新 fork 的后端可能立刻弹出这个
+ *   槽并 OwnLatch,若 latch 仍属旧进程会 PANIC;
+ * - 锁组退出逻辑在 leader 的分区锁(leader_lwlock)保护下决定
+ *   push_self/push_leader:组长在还有跟随者时提前退出,其 PGPROC 由
+ *   最后一个跟随者归还,避免"组长 PGPROC 已回链却被跟随者引用";
+ * - 实际回链在单次 freeProcsLock 临界区中完成(避免与 InitProcess 的
+ *   摘取竞争),并顺带把本进程观察到的自旋延迟反馈进共享估计;
+ * - LWLockReleaseAll 兜底:正常路径不该有遗留 LWLock,但保险起见
+ *   在放弃 PGPROC 前再清一次(放弃后我们就无法再睡眠了);
+ * - pgstat_reset_wait_event_storage 故意推迟到锁组处理之后,使我们在
+ *   槽位上被他人观察期间 wait_event_info 仍有效。
+ *
+ * 【参数】code —— 退出码;arg —— 附加参数(均未使用)。
+ * 【返回值】无 */
 static void
 ProcKill(int code, Datum arg)
 {
@@ -1091,6 +1397,22 @@ ProcKill(int code, Datum arg)
  *		processes (bgwriter, etc).  The PGPROC and sema are not released, only
  *		marked as not-in-use.
  */
+/* (中文)辅助进程的退出清理回调(ProcKill 的精简版)。
+ *
+ * 【作用】由 InitAuxiliaryProcess 注册的 on_shmem_exit 回调,辅助进程
+ * 退出时执行:释放遗留 LWLock、取消条件变量睡眠、把 latch 切回本地、
+ * 清除 ProcGlobal 中本进程的广告位(walwriter/checkpointer)、放弃
+ * latch 所有权、把槽位标记为空闲(pid = 0,供后继辅助进程复用),并
+ * 更新 spins_per_delay。
+ *
+ * 【设计思想】辅助进程的 PGPROC 来自固定区段 AuxiliaryProcs,不挂任何
+ * 空闲链表,退出只做"标记空闲"而非归还;标记动作在 freeProcsLock
+ * 保护下完成,与 InitAuxiliaryProcess 的线性查找互斥。其余细节见
+ * ProcKill 的注释(两者共享同样的 latch/信号量卫生约定)。
+ *
+ * 【参数】code —— 退出码;arg —— 注册时传入的辅助进程类型号
+ *         (AuxiliaryProcs 下标)。
+ * 【返回值】无 */
 static void
 AuxiliaryProcKill(int code, Datum arg)
 {
@@ -1156,6 +1478,18 @@ AuxiliaryProcKill(int code, Datum arg)
  *
  * Returns NULL if not found.
  */
+/* (中文)按 PID 查找辅助进程的 PGPROC。
+ *
+ * 【作用】供 postmaster 等在需要定位某辅助进程(如按 PID 判断角色)时
+ * 使用:线性扫描固定区段 AuxiliaryProcs,比对 pid 字段。
+ *
+ * 【设计思想】辅助进程数量少且固定(NUM_AUXILIARY_PROCS),线性扫描
+ * 足够;pid == 0 的槽位是空闲槽(任何真实进程 pid 都不可能为 0),
+ * 直接排除。查找不加锁:pid 字段的读在辅助进程退出清理里会被写回 0,
+ * 最坏情况是查到"刚退出的进程"或"查不到",调用方自行容忍。
+ *
+ * 【参数】pid —— 要查找的进程 PID。
+ * 【返回值】匹配的 PGPROC 指针;未找到返回 NULL。 */
 PGPROC *
 AuxiliaryPidGetProc(int pid)
 {
@@ -1205,6 +1539,33 @@ AuxiliaryPidGetProc(int pid)
  *
  * NOTES: The process queue is now a priority queue for locking.
  */
+/* (中文)把本进程加入指定重锁的等待队列(可能"一进去就被直接授予")。
+ *
+ * 【作用】LockAcquireExtended 在判定需要等待后、调用 ProcSleep 之前
+ * 调用(由 lock.c 的 WaitOnLock 进入):在持分区锁(LW_EXCLUSIVE)的前提下,
+ * 遍历锁的等待队列确定插入位置,必要时立即授予(不真正睡眠)。
+ *
+ * 【设计思想】
+ * - 队列是优先级队列:若本进程已持有的锁与某个前方等待者的请求冲突,
+ *   应插到该等待者之前(否则死锁检测迟早也会把我们挪到它前面,不如
+ *   现在就地解决)。扫描中若发现"他必须等我、我也必须等他",即两人
+ *   互等,构成即时死锁(early_deadlock),直接返回 ERROR 状态;
+ * - 特殊情形:若本进程要插到某等待者之前,且与更前方的请求及所有已
+ *   持有锁都不冲突,则干脆跳过等待、立即 GrantLock(相当于在队列"前
+ *   半段"做一次立即授予判定);
+ * - 锁组成员合并计数:组内成员持有的锁并入 myHeldLocks(组间协同
+ *   获取,见 lock.c 的组锁机制),但互等的判定仍各自独立;
+ * - 插入位置确定后:把 MyProc 链入 waitProcs、更新 waitMask,并在
+ *   MyProc 上登记 waitLock/waitProcLock/waitLockMode,置
+ *   PROC_WAIT_STATUS_WAITING。
+ * 调用约定:进入与返回时调用者都持有分区锁;dontWait 为 true(条件
+ * 加锁)且必须等待时,返回 ERROR 但不入队。
+ *
+ * 【参数】locallock —— 本进程对该锁的本地记账(含 LOCK/PROCLOCK/
+ *         hashcode);lockMethodTable —— 锁方法表(冲突矩阵);
+ *         dontWait —— true 表示不许等待。
+ * 【返回值】PROC_WAIT_STATUS_OK(立即授予)/ WAITING(已入队,应调
+ *         ProcSleep)/ ERROR(即时死锁或 dontWait)。 */
 ProcWaitStatus
 JoinWaitQueue(LOCALLOCK *locallock, LockMethod lockMethodTable, bool dontWait)
 {
@@ -1374,6 +1735,43 @@ JoinWaitQueue(LOCALLOCK *locallock, LockMethod lockMethodTable, bool dontWait)
  *  PROC_WAIT_STATUS_OK      - lock was granted
  *  PROC_WAIT_STATUS_ERROR   - a deadlock was detected
  */
+/* (中文)让本进程在锁的等待队列上睡眠,直到拿到锁或检测到死锁。
+ *
+ * 【作用】JoinWaitQueue 返回 PROC_WAIT_STATUS_WAITING 后由 lock.c 调用:
+ * 开启死锁/锁超时定时器,然后在循环里 WaitLatch(或热备下的恢复冲突
+ * 处理)等待;被唤醒(可能是授予、伪唤醒、超时或取消)后检查死锁标志,
+ * 必要时运行 CheckDeadLock;若被 autovacuum 阻塞且条件允许,向该
+ * autovacuum worker 发 SIGINT 取消它;日志记录长等待;直到
+ * waitStatus 离开 WAITING 才返回。结束后关闭定时器。
+ *
+ * 【设计思想】要点:
+ * - 死锁检测延迟到等待超过 deadlock_timeout 才做(Cheap:大多数锁很快
+ *   就拿到,无需为每次获取运行昂贵的检测);超时处理器只置标志
+ *   (got_deadlock_timeout + 置 latch),真正的 DeadLockCheck 在循环里
+ *   执行,信号处理器里只做信号安全的事;
+ * - waitStart(pg_locks 的 waitstart 列)复用定时器框架取到的时间戳,
+ *   不额外获取分区锁,允许短暂为 NULL(见函数内注释);
+ * - 等待用 latch 而非信号量:SetLatch 是异步信号安全的,释放者无需
+ *   持有分区锁即可唤醒;但"latch 被置"≠"锁已授予"(可能有其他唤醒
+ *   来源),所以醒来后必须重查 waitStatus;
+ * - 中断处理:CHECK_FOR_INTERRUPTS 及时响应取消;若在等待中被取消,
+ *   依赖 LockErrorCleanup 摘除队列(共享表状态变更都已完成,睡眠循环
+ *   本身没有必须清理的共享状态);
+ * - 热备:等待者还要处理"与 Startup 进程的恢复冲突"——启动进程要
+ *   拿锁而我们挡路时,可能被要求主动放弃(ResolveRecoveryConflictWithLock),
+ *   并按要求记录/上报冲突日志;
+ * - 统计与日志:deadlock 检查后累计 pgstat 锁等待时长;log_lock_waits
+ *   打开时,长等待、软/硬死锁、获取成功等都会写日志,"still waiting"
+ *   消息每轮最多打一次;
+ * - 与 CheckDeadLock 的配合:硬死锁时 RemoveFromWaitQueue 会把
+ *   waitStatus 置为 ERROR,循环据此退出并返回错误。
+ *
+ * 【参数】locallock —— 本进程对该锁的本地记账;调用前必须已通过
+ *         SetStartTimeOfWaitOnLock 之类的机制把 awaitedLock 设好(前置
+ *         断言 GetAwaitedLock() == locallock),并已释放分区锁。
+ * 【返回值】PROC_WAIT_STATUS_OK = 已授予(唤醒者已更新共享表,调用者
+ *         负责更新本地锁表);PROC_WAIT_STATUS_ERROR = 死锁(取消或超时
+ *         时 ereport(ERROR))。 */
 ProcWaitStatus
 ProcSleep(LOCALLOCK *locallock)
 {
@@ -1808,6 +2206,20 @@ ProcSleep(LOCALLOCK *locallock)
  * to twiddle the lock's request counts too --- see RemoveFromWaitQueue.
  * Hence, in practice the waitStatus parameter must be PROC_WAIT_STATUS_OK.
  */
+/* (中文)唤醒等待队列上的一个进程(设置其 latch)。
+ *
+ * 【作用】由锁释放路径(ProcLockWakeup、RemoveFromWaitQueue)调用:把
+ * 目标进程从锁的等待队列中摘除、清理其 wait 状态,再 SetLatch 唤醒。
+ *
+ * 【设计思想】调用者必须已持有相应分区锁(队列操作因此安全);当前实现
+ * 只用于"成功授予"场景:摘除时不做请求计数回滚(失败场景的清理见
+ * RemoveFromWaitQueue 的注释,故 waitStatus 参数实际恒为 OK)。
+ * 唤醒用 SetLatch 而非信号量:latch 设置是异步信号安全的,且唤醒者
+ * 不依赖目标进程执行任何动作。
+ *
+ * 【参数】proc —— 要唤醒的进程;waitStatus —— 传给目标进程的结果码
+ *         (实践中为 PROC_WAIT_STATUS_OK)。
+ * 【返回值】无 */
 void
 ProcWakeup(PGPROC *proc, ProcWaitStatus waitStatus)
 {
@@ -1836,6 +2248,22 @@ ProcWakeup(PGPROC *proc, ProcWaitStatus waitStatus)
  *
  * The appropriate lock partition lock must be held by caller.
  */
+/* (中文)扫描锁的等待队列,唤醒所有"不再被阻塞"的等待者。
+ *
+ * 【作用】锁被释放(或前方等待者退出)后由 lock.c 调用:按队列顺序遍历
+ * 每个等待者,只要其请求模式与"更前方等待者的请求"及"已授予锁"都不
+ * 冲突,就 GrantLock + ProcWakeup;否则保留在队列中,并把它请求的模式
+ * 并入 aheadRequests,供后续等待者判定。
+ *
+ * 【设计思想】队列是"请求优先级"队列(见 JoinWaitQueue):越靠前越优先,
+ * 因此只需单向扫描、累计前方请求掩码即可判定能否唤醒。唤醒一个进程
+ * 会"消耗"可并发兼容的剩余容量,故共享模式的多个等待者可依次通过,
+ * 排他模式只允许在队列最合适的位置被授予(冲突矩阵自动保证)。调用者
+ * 必须持有分区锁;被唤醒进程的 waitStatus 由 ProcWakeup 置 OK。
+ *
+ * 【参数】lockMethodTable —— 锁方法表(冲突矩阵);lock —— 目标锁
+ *         (其等待队列非空才会继续处理)。
+ * 【返回值】无 */
 void
 ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock)
 {
@@ -1883,6 +2311,28 @@ ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock)
  * not, just return.  If we have a real deadlock, remove ourselves from the
  * lock's wait queue.
  */
+/* (中文)执行一次完整的死锁检测(deadlock_timeout 到期后触发)。
+ *
+ * 【作用】由 ProcSleep 的等待循环在 got_deadlock_timeout 置位后调用:
+ * 依次以 LW_EXCLUSIVE 获取全部 NUM_LOCK_PARTITIONS 个分区锁,锁定整个
+ * 共享锁表;若本进程已被摘出等待队列,直接判定无死锁;否则调用
+ * deadlock.c 的 DeadLockCheck(MyProc) 分析等待图。硬死锁
+ * (DS_HARD_DEADLOCK)时把本进程从等待队列摘除(RemoveFromWaitQueue 会
+ * 把 waitStatus 置 PROC_WAIT_STATUS_ERROR,ProcSleep 据此报错);软死锁
+ * (DS_SOFT_DEADLOCK)时检测器已调整队列顺序,本进程继续等待即可。
+ *
+ * 【设计思想】按分区号递增顺序加锁、逆序释放,防止多个进程各自乱序
+ * 取分区锁造成 LWLock 级死锁;加锁过程处于临界区(LWLockAcquire 内部
+ * HOLD_INTERRUPTS),整个检测不可被取消打断,并且本进程此刻绝不能
+ * 持有任何分区锁,否则会自等死锁(见英文注释)。全部锁加齐后,检测器
+ * 读到的是锁表的一致快照;若加锁期间已被授予(从队列摘除),说明死锁
+ * 已消失,跳过昂贵的检测。释放按逆序进行,既避免与"递增顺序取多把锁"
+ * 的其他进程相互阻塞,也避免 LWLockRelease 内部的 O(N^2) 开销。
+ *
+ * 【参数】无
+ * 【返回值】DeadLockState:DS_NO_DEADLOCK(无死锁)/ DS_SOFT_DEADLOCK
+ *         (软死锁,已调整)/ DS_HARD_DEADLOCK(硬死锁,本进程为牺牲者)。
+ *         语义定义见 deadlock.c。 */
 static DeadLockState
 CheckDeadLock(void)
 {
@@ -1974,6 +2424,22 @@ check_done:
  *
  * NB: Runs inside a signal handler, be careful.
  */
+/* (中文)deadlock_timeout 到期处理(在信号处理器内运行!)。
+ *
+ * 【作用】定时器框架在 DEADLOCK_TIMEOUT 到期时调用本函数:置位
+ * got_deadlock_timeout 标志,并再次 SetLatch(MyLatch) 唤醒正在
+ * WaitLatch 的 ProcSleep 循环。
+ *
+ * 【设计思想】信号处理器只能做异步信号安全的事:真正的死锁检测代价高、
+ * 还可能加锁,必须推迟到主执行流(ProcSleep 循环)去做,这里只"置标志
+ * + 置 latch"。重复 SetLatch 是安全的(设置一个已设置的 latch 只是
+ * 一次廉价写),也覆盖了 handle_sig_alarm 先于标志置位设置 latch 的
+ * 时序(见英文注释);保存/恢复 errno 是信号处理器的标准卫生要求。
+ * 注意:经 procsignal_sigusr1_handler 路径进入时,该 handler 之后还会
+ * 再置一次 latch,无碍。
+ *
+ * 【参数】无
+ * 【返回值】无 */
 void
 CheckDeadLockAlert(void)
 {
@@ -2001,6 +2467,22 @@ CheckDeadLockAlert(void)
  *
  * The lock table's partition lock must be held on entry and remains held on exit.
  */
+/* (中文)收集一把锁的全部持有者与等待者的 PID,填充进日志字符串。
+ *
+ * 【作用】供 ProcSleep 的日志逻辑(log_lock_waits)使用:遍历锁的
+ * procLocks 链表(PROCLOCK 同时记录"持有"与"等待"两类关系),把持有者
+ * PID 拼进 lock_holders_sbuf、等待者 PID 拼进 lock_waiters_sbuf,并
+ * 统计持有者个数。
+ *
+ * 【设计思想】判断是持有还是等待:某进程的 waitProcLock 指向当前
+ * PROCLOCK 即"该 PROCLOCK 代表一次等待"(见 JoinWaitQueue 设置的
+ * MyProc->waitProcLock),否则是持有。调用者须持有分区锁(进入与返回
+ * 时都是),保证链表不被并发修改;输出格式为逗号分隔的 PID 列表。
+ *
+ * 【参数】locallock —— 本地锁记账(取其 LOCK);lock_holders_sbuf /
+ *         lock_waiters_sbuf —— 输出:StringInfo 缓冲,接收持有者/等待者
+ *         PID 列表;lockHoldersNum —— 输出:持有者数量。
+ * 【返回值】无 */
 void
 GetLockHoldersAndWaiters(LOCALLOCK *locallock, StringInfo lock_holders_sbuf,
 						 StringInfo lock_waiters_sbuf, int *lockHoldersNum)
@@ -2075,6 +2557,20 @@ GetLockHoldersAndWaiters(LOCALLOCK *locallock, StringInfo lock_holders_sbuf,
  * unrelated wakeups: Always check that the desired state has occurred, and
  * wait again if not.
  */
+/* (中文)等待来自其他进程的信号(基于进程 latch 的通用等待)。
+ *
+ * 【作用】把本进程挂起在 MyLatch 上,直到被 SetLatch 唤醒或 postmaster
+ * 退出;醒来后复位 latch 并处理挂起的中断。供"等别的进程发信号"的
+ * 场景使用(如 autovacuum 协调、procsignal 交互等)。
+ *
+ * 【设计思想】latch 是"会丢失事件的共享内存通知"的替代品,但"被置位"
+ * 不保证目标事件已发生(可能有无关唤醒来源),故调用方必须循环检查
+ * 自己的目标条件,不满足就再次等待(见英文注释);WL_EXIT_ON_PM_DEATH
+ * 保证 postmaster 死亡时立即醒来以便退出。
+ *
+ * 【参数】wait_event_info —— 等待期间在 pg_stat_activity.wait_event
+ *         中展示的事件标识。
+ * 【返回值】无 */
 void
 ProcWaitForSignal(uint32 wait_event_info)
 {
@@ -2087,6 +2583,18 @@ ProcWaitForSignal(uint32 wait_event_info)
 /*
  * ProcSendSignal - set the latch of a backend identified by ProcNumber
  */
+/* (中文)按 ProcNumber 设置目标后端的 latch,唤醒它。
+ *
+ * 【作用】在已知对方 ProcNumber(ProcArray 下标)时向其发信号:校验范围
+ * 后 SetLatch 目标 PGPROC 的共享 latch。
+ *
+ * 【设计思想】比"按 PID 查找再发信号"更直接,且 ProcNumber 是稳定的
+ * 槽位标识(进程在槽位上时其 procLatch 恒定有效,不被回收)。调用方需
+ * 自行保证目标进程仍在该槽位上(如持有 ProcArrayLock 或目标状态
+ * 明确);SetLatch 是异步信号安全操作。
+ *
+ * 【参数】procNumber —— 目标进程的 ProcNumber(须 < allProcCount)。
+ * 【返回值】无;越界时 elog(ERROR)。 */
 void
 ProcSendSignal(ProcNumber procNumber)
 {
@@ -2102,6 +2610,20 @@ ProcSendSignal(ProcNumber procNumber)
  * Once this function has returned, other processes can join the lock group
  * by calling BecomeLockGroupMember.
  */
+/* (中文)把本进程指定为锁组组长(创建只含自己的锁组)。
+ *
+ * 【作用】并行查询(Parallel Query)的 leader 进程在让 worker 加入锁组
+ * 前调用:在 leader 自己的分区锁保护下,把 lockGroupLeader 指向自己、
+ * 把自己链入 lockGroupMembers。之后其他进程可调用
+ * BecomeLockGroupMember 加入。
+ *
+ * 【设计思想】锁组的访问全部经由组长分区锁(LockHashPartitionLockByProc
+ * 按 PGPROC 槽位计算)串行化;重复调用是幂等的(已是组长则直接返回)。
+ * 锁组的意义:组内成员共享的锁不互相阻塞(见 JoinWaitQueue 与 lock.c
+ * 的组锁逻辑),用于并行查询间协调。
+ *
+ * 【参数】无
+ * 【返回值】无(前置条件:本进程不是任何组的跟随者)。 */
 void
 BecomeLockGroupLeader(void)
 {
@@ -2132,6 +2654,20 @@ BecomeLockGroupLeader(void)
  * an interlock.  Returns true if we successfully join the intended lock
  * group, and false if not.
  */
+/* (中文)把本进程加入指定 leader 的锁组。
+ *
+ * 【作用】并行查询的 worker 进程在拿到 leader 的 PGPROC 指针后调用:
+ * 在组长分区锁保护下,校验"leader 槽位仍是目标进程(pid 匹配)且确为
+ * 组长"后,把本进程链入其 lockGroupMembers;校验失败返回 false(leader
+ * 已退出、槽位被回收等)。
+ *
+ * 【设计思想】leader 可能在本进程加入前退出、其 PGPROC 槽位可能已被
+ * 回收给别的进程,故要求调用方传 PID 作为交叉校验(英文注释称之为
+ * interlock);分区锁按槽位计算,即使 leader 正在被回收也能取到正确的
+ * 锁,配合 PID 校验消除"加入错误的组"的窗口。
+ *
+ * 【参数】leader —— 目标组长的 PGPROC 指针;pid —— 期望的组长 PID。
+ * 【返回值】true = 成功加入;false = 组长状态不符(未加入)。 */
 bool
 BecomeLockGroupMember(PGPROC *leader, int pid)
 {

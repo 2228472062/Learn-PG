@@ -34,6 +34,48 @@
  * happen, it would tie up KnownAssignedXids indefinitely, so we protect
  * ourselves by pruning the array when a valid list of running XIDs arrives.
  *
+ * 【模块总览(中文)】
+ * 本文件是 PostgreSQL 事务可见性判定的核心模块。它维护一个位于共享内存
+ * 的"进程数组"(ProcArrayStruct),登记所有活跃后端与两阶段提交
+ * (prepared)事务的 PGPROC,并据此回答 MVCC 体系最根本的问题:"给定的
+ * xid 是否仍然活跃?"。快照(snapshot)构造、VACUUM 清理边界、热备
+ * 冲突处理、hot_standby_feedback、checkpoint 延时判定等大量子系统都
+ * 依赖本模块。
+ *
+ * 【核心数据结构】
+ * - ProcArrayStruct(procArray):共享控制结构。核心是 pgprocnos[] 数组,
+ *   存放"当前活跃"PGPROC 在 allProcs[] 中的下标,并按 PGPROC 地址升序
+ *   排列(见 ProcArrayAdd 的注释,为的是遍历时的 cache 局部性);
+ *   ProcGlobal->xids[] / subxidStates[] / statusFlags[] 是与之一一对应的
+ *   并行数组,分别保存各后端的 xid、子事务缓存状态与状态标志。取快照时
+ *   只需顺序遍历这三个紧凑数组,而无需触碰整个 PGPROC,大幅降低缓存
+ *   缺失。PGPROC 的 pgxactoff 字段是它在这些并行数组中的下标。
+ * - ProcArrayLock:保护上述共享结构的 LWLock。读方(取快照、判断 xid
+ *   是否活跃、计算水位)持 SHARED;写方(提交/中止时清除 xid、
+ *   ProcArrayAdd/Remove)持 EXCLUSIVE。设置与清除 xid 的锁协议细节见
+ *   src/backend/access/transam/README。
+ * - KnownAssignedXids:热备(hot standby)模式下在备机维护的"主库上
+ *   正在运行事务"的 xid 集合。备机的 PGPROC 不持有 xid,必须靠重放
+ *   WAL 记录推断主库的运行状态,否则这些事务在备机快照中会看起来已经
+ *   完成,导致 MVCC 错误(见文件头英文注释与 KnownAssignedXids 子模块)。
+ * - xmin/xmax 与水位(horizon):GetSnapshotData() 收集 xmin(仍在运行的
+ *   最小 xid)、xmax(最新已完成 xid + 1)与 xip 数组(xmin 与 xmax 之间
+ *   正在运行的 xid 列表);ComputeXidHorizons() 计算各类清理边界
+ *   (shared/catalog/data/temp 表各有各的"最老不可删除 xid")。
+ *
+ * 【设计思想】
+ * - 锁协议:清除 xid 必须持 EXCLUSIVE 锁,使"正在运行集合"的变化对
+ *   取快照者原子可见;快照构造持 SHARED 锁即可,因为 xid 只能"从无到有"
+ *   (赋新值),取快照者不会漏掉任何已提交的事务;
+ * - 性能考量:提交/取快照是全系统最热门的路径,本模块做了大量优化——
+ *   xactCompletionCount 计数允许快照整体复用(GetSnapshotDataReuse);
+ *   组提交(group XID clearing)用一次加锁替一批进程清除 xid;
+ *   latch 与锁的获取顺序、原子读(见 UINT32_ACCESS_ONCE)等细节都为了
+ *   把 ProcArrayLock 的持有时间与争用压到最低;
+ * - 协作关系:与 access/transam/xact.c(事务开始/结束)、clog 与
+ *   pg_subtrans(提交状态、父子事务链)、snapmgr.c(快照缓存)、
+ *   replication(槽位 xmin)、standby.c(恢复冲突)紧密配合。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -71,8 +113,35 @@
 #include "utils/wait_event.h"
 
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
+/* (中文)对 32 位变量做"单次读取"的辅助宏:强制编译器把 var 当作
+ * volatile 一次性读入,防止并发修改(如其他后端正在设置/清除 xid)时
+ * 出现撕裂读,也避免编译器多次重读造成前后不一致。procarray 读取别的
+ * 进程的 xid 时一律走这个宏,与 GetNewTransactionId() 的写入侧配合。 */
 
 /* Our shared memory area */
+/* (中文)进程数组的共享控制结构(ProcArrayStruct),位于共享内存,
+ * 由 ProcArrayLock 保护。它登记"当前所有活跃后端 + prepared 事务",
+ * 是 MVCC 可见性判定的数据基础。
+ *
+ * 字段含义:
+ * - numProcs  : 当前有效的条目数(逻辑数组长度);
+ * - maxProcs  : pgprocnos[] 的分配容量(固定为 PROCARRAY_MAXPROCS =
+ *               MaxBackends + max_prepared_xacts,永不增长);
+ * - KnownAssignedXids 一族字段 : 热备模式专用的 xid 表(见本文件
+ *   KnownAssignedXids 子模块的注释):maxKnownAssignedXids 是容量,
+ *   numKnownAssignedXids 是当前有效条目数,tail/head 是该数组
+ *   [tail, head) 区间的两个指针(head 指向最新元素之后一位)。数组
+ *   允许中间有"空洞"(被标记为无效但未物理清除的槽位),以换取删除
+ *   O(1) 的代价,定期压缩(见 KnownAssignedXidsCompress);
+ * - lastOverflowedXid : 从 KnownAssignedXids 中"被丢弃"的最晚子事务
+ *   xid,无则 InvalidTransactionId。语义与 PGPROC 子事务缓存溢出
+ *   (overflowed)完全对应:只要目标 xid 不晚于它,就不能断言快照中
+ *   的子事务信息是完整的。修改须持 EXCLUSIVE 锁,读取持 SHARED 锁;
+ * - replication_slot_xmin / replication_slot_catalog_xmin : 所有复制槽
+ *   要求的最老 xmin(数据表 / 系统目录分别)。计算清理水位时必须计入,
+ *   防止 VACUUM 删除复制客户端仍需要的数据;
+ * - pgprocnos[] : 柔性数组,保存 allProcs[] 中当前活跃 PGPROC 的下标,
+ *   按下标升序排列(见 ProcArrayAdd 的排序注释)。 */
 typedef struct ProcArrayStruct
 {
 	int			numProcs;		/* number of valid procs entries */
@@ -108,8 +177,17 @@ static void ProcArrayShmemRequest(void *arg);
 static void ProcArrayShmemInit(void *arg);
 static void ProcArrayShmemAttach(void *arg);
 
+/* (中文)指向共享内存中 ProcArrayStruct 的指针:启动阶段由
+ * ProcArrayShmemInit 初始化(借助 ShmemRequestStruct 分配的地址),
+ * 本文件其余函数都通过它访问进程数组。 */
 static ProcArrayStruct *procArray;
 
+/* (中文)向共享内存子系统注册的 request/init/attach 回调集:
+ * - request : 启动阶段声明"Proc Array"结构与热备所需的 KnownAssignedXids
+ *   数组各需要多少共享内存;
+ * - init    : postmaster 内负责把共享内存清零并设初值;
+ * - attach  : postmaster 派生的其他进程(如 bgworker)启动时重新取得
+ *   共享指针。 */
 const struct ShmemCallbacks ProcArrayShmemCallbacks = {
 	.request_fn = ProcArrayShmemRequest,
 	.init_fn = ProcArrayShmemInit,
@@ -181,6 +259,26 @@ const struct ShmemCallbacks ProcArrayShmemCallbacks = {
  *
  * The typedef is in the header.
  */
+/* (中文)GlobalVisTest* 系列函数使用的"全局可见性状态":用两个粗糙的
+ * 边界回答"某 xid 是否可能仍被某个快照认为在运行",避免每次都精确
+ * 计算水位(见上方英文注释)。
+ *
+ * - definitely_needed : XID >= 该值的行"一定仍可见"(边界本身含义为
+ *   "xid 大于等于此值则可能仍被某些后端视为运行"),即上界;
+ * - maybe_needed      : XID < 该值的行"一定可以删除/被所有人看到已提交",
+ *   即下界。
+ *
+ * 落在 [maybe_needed, definitely_needed) 之间的 xid 无法确定,需要用
+ * ComputeXidHorizons() 重新精确计算边界后再判断(见
+ * GlobalVisTestIsRemovableFullXid)。
+ *
+ * 之所以用 FullTransactionId(64 位)而非 32 位 TransactionId,是为了
+ * 避免回绕(如果用一个 32 位值作"比它老就安全"的基准,事务 id 回绕后
+ * 这个判断就失效了,详见英文注释)。
+ *
+ * 进程内共维护四份这样的状态(见下方四个静态变量),分别用于共享表 /
+ * 系统目录 / 普通数据表 / 临时表:前三种的可删除边界可以越来越激进
+ * (共享表受所有库影响,普通表只受本库影响),临时表只与当前会话有关。 */
 struct GlobalVisState
 {
 	/* XIDs >= are considered running by some backend */
@@ -193,6 +291,25 @@ struct GlobalVisState
 /*
  * Result of ComputeXidHorizons().
  */
+/* (中文)ComputeXidHorizons() 的计算结果:一组"水位"(horizon)值,
+ * 每种水位都回答"删除/清理到哪个 xid 为止是安全的"。字段含义:
+ *
+ * - latest_completed : 持锁时 TransamVariables->latestCompletedXid 的值
+ *   (最新已提交/中止的事务 id),后续水位计算都以它为时间基准;
+ * - slot_xmin / slot_catalog_xmin : 复制槽要求的数据 / catalog 水位
+ *   (与 procArray 中的对应字段一致);
+ * - oldest_considered_running : 可能仍被任意后端(含 VACUUM、逻辑解码)
+ *   认为在运行的最老 xid。注意与普通清理水位不同,连 VACUUM 进程都
+ *   必须计入——VACUUM 判断可见性时也要查 pg_subtrans,因此这是
+ *   pg_subtrans 能安全截断的最低界限(见英文注释);
+ * - shared_oldest_nonremovable : 共享表(所有库可见)中已删除元组必须
+ *   保留到的最老 xid,含复制槽影响;
+ * - shared_oldest_nonremovable_raw : 同上,但不含 catalog_xmin 的影响,
+ *   用于 hot_standby_feedback:主库收到普通反馈只对数据表收紧,
+ *   catalog 反馈只对目录收紧,从而让数据表清理得更积极;
+ * - catalog_oldest_nonremovable : 非共享系统目录表中必须保留到的最老 xid;
+ * - data_oldest_nonremovable    : 普通用户表中必须保留到的最老 xid;
+ * - temp_oldest_nonremovable    : 本会话临时表中必须保留到的最老 xid。 */
 typedef struct ComputeXidHorizonsResult
 {
 	/*
@@ -263,6 +380,13 @@ typedef struct ComputeXidHorizonsResult
 /*
  * Return value for GlobalVisHorizonKindForRel().
  */
+/* (中文)GlobalVisHorizonKindForRel() 的返回值:指明某张关系(或
+ * 全局场景,rel == NULL)应使用哪种水位,决定删除元组时的保守程度:
+ * - VISHORIZON_SHARED : 最保守,所有库的会话都计入(共享表、recovery);
+ * - VISHORIZON_CATALOG : 只计本库会话 + 槽位的 catalog xmin
+ *   (系统目录、逻辑解码可访问的关系);
+ * - VISHORIZON_DATA : 只计本库会话 + 槽位普通 xmin(普通用户表);
+ * - VISHORIZON_TEMP : 只计本会话(临时表)。 */
 typedef enum GlobalVisHorizonKind
 {
 	VISHORIZON_SHARED,
@@ -274,6 +398,14 @@ typedef enum GlobalVisHorizonKind
 /*
  * Reason codes for KnownAssignedXidsCompress().
  */
+/* (中文)KnownAssignedXidsCompress() 的"压缩原因"枚举:除了空间不够
+ * (KAX_NO_SPACE)必须压缩外,其余情况是否压缩由启发式决定:
+ * - KAX_NO_SPACE           : 数组尾部空间不足,必须立即压缩腾位;
+ * - KAX_PRUNE              : 刚做过"按 xid 批量删除旧条目"的收尾压缩;
+ * - KAX_TRANSACTION_END    : 事务提交/中止刚删了一批 xid 之后的
+ *                            机会式压缩(每 128 次才考虑一次);
+ * - KAX_STARTUP_PROCESS_IDLE : 启动进程即将进入空闲(等新 WAL),顺手
+ *                            压缩(至少间隔 1 秒,避免与读者争锁)。 */
 typedef enum KAXCompressReason
 {
 	KAX_NO_SPACE,				/* need to free up space at array end */
@@ -282,16 +414,39 @@ typedef enum KAXCompressReason
 	KAX_STARTUP_PROCESS_IDLE,	/* startup process is about to sleep */
 } KAXCompressReason;
 
+/* (中文)指向 ProcGlobal->allProcs 的指针:共享内存中"全部 PGPROC"的
+ * 数组(包含普通后端、辅助进程与 prepared 事务的占位条目,共
+ * MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts 个)。
+ * ProcArrayStruct->pgprocnos[] 里保存的正是这个数组的下标(procno);
+ * 通过 GetPGProcByNumber(procno) 或 &allProcs[procno] 访问。 */
 static PGPROC *allProcs;
 
 /*
  * Cache to reduce overhead of repeated calls to TransactionIdIsInProgress()
  */
+/* (中文)TransactionIdIsInProgress() 的"已确认不在运行"缓存:同一个 xid
+ * 短时间内被反复询问(例如同一页面上多次可见性判断)时,直接命中缓存
+ * 返回 false,避免反复加锁扫描共享内存。注意只缓存"不在运行"的结论:
+ * "正在运行"的 xid 不能缓存——它随时可能结束,缓存的旧结论会变成
+ * 错误的正确答案。 */
 static TransactionId cachedXidIsNotInProgress = InvalidTransactionId;
 
 /*
  * Bookkeeping for tracking emulated transactions in recovery
  */
+/* (中文)热备(recovery)模式下"模拟主库运行事务"的簿记(详见文件头
+ * 英文注释与本文件 KnownAssignedXids 子模块注释):
+ * - KnownAssignedXids : 主库上已知已分配(因而视为仍在运行)的 xid 表,
+ *   按 TransactionIdPrecedes 逻辑序排序,支持二分查找;
+ * - KnownAssignedXidsValid : 与上面数组平行的"有效性"布尔数组:删除
+ *   条目时只把这里置 false、不清 xid 本身,制造"空洞"以换取 O(1) 删除;
+ * - latestObservedXid : 最近一个被观察到(从 WAL 记录中得知)的 xid。
+ *   由于 xid 按序分配、不留空隙,凡是比它新、比某个观察到的 xid 旧的
+ *   xid 都能"推断已分配",一并写入 KnownAssignedXids。初始化时它被设为
+ *   SUBTRANS 已初始化到的位置(见 ProcArrayInitRecovery);
+ * - standbySnapshotPendingXmin : 处于 STANDBY_SNAPSHOT_PENDING 状态时,
+ *   "可能仍在运行、但我们尚未收入 KnownAssignedXids"的最大 xid
+ *   (见 ProcArrayApplyRecoveryInfo)。 */
 
 static TransactionId *KnownAssignedXids;
 
@@ -304,6 +459,10 @@ static TransactionId latestObservedXid = InvalidTransactionId;
  * the highest xid that might still be running that we don't have in
  * KnownAssignedXids.
  */
+/* (中文)处于 STANDBY_SNAPSHOT_PENDING(快照尚不完整)状态时,
+ * standbySnapshotPendingXmin 是"可能仍在运行、但我们没有收进
+ * KnownAssignedXids"的最大 xid;离开 PENDING 状态后恢复为
+ * InvalidTransactionId。含义见上面模块级注释。 */
 static TransactionId standbySnapshotPendingXmin;
 
 /*
@@ -311,6 +470,10 @@ static TransactionId standbySnapshotPendingXmin;
  * GlobalVisState for details. As shared, catalog, normal and temporary
  * relations can have different horizons, one such state exists for each.
  */
+/* (中文)四份全局可见性状态(结构含义见 GlobalVisState 的中文注释):
+ * 共享表(所有库共用,最保守)、系统目录、普通数据表、临时表各一份。
+ * 由于跨库会话看不到对方的普通表/目录,后三者可以比共享表更激进地
+ * 判定"行可删除",代价是临时表以外的三份边界需要根据关系类型选对。 */
 static GlobalVisState GlobalVisSharedRels;
 static GlobalVisState GlobalVisCatalogRels;
 static GlobalVisState GlobalVisDataRels;
@@ -321,11 +484,26 @@ static GlobalVisState GlobalVisTempRels;
  * recomputed, or InvalidTransactionId if it has not. Used to limit how many
  * times accurate horizons are recomputed. See GlobalVisTestShouldUpdate().
  */
+/* (中文)最近一次用 ComputeXidHorizons() 精确重算水位时的 RecentXmin,
+ * 未重算过则为 InvalidTransactionId。GlobalVisTestShouldUpdate() 靠它
+ * 限制精确重算的频率:只有 RecentXmin 变化(最老快照事务已结束)时
+ * 重算才有意义。 */
 static TransactionId ComputeXidHorizonsResultLastXmin;
 
 #ifdef XIDCACHE_DEBUG
 
 /* counters for XidCache measurement */
+/* (中文)(仅 XIDCACHE_DEBUG 编译时)TransactionIdIsInProgress() 各条
+ * 判断路径的命中计数,用于研究 xid 状态缓存的命中率与优化方向:
+ * - xc_by_recent_xmin    : 因 xid < RecentXmin 直接判定"不在运行";
+ * - xc_by_known_xact     : 命中 cachedXidIsNotInProgress 缓存;
+ * - xc_by_my_xact        : 是本进程自己的事务(含子事务);
+ * - xc_by_latest_xid     : xid > latestCompletedXid,必然仍在运行;
+ * - xc_by_main_xid       : 在 ProcGlobal->xids[] 主事务中找到;
+ * - xc_by_child_xid      : 在某个后端的子事务缓存数组中找到;
+ * - xc_by_known_assigned : 在 KnownAssignedXids 中找到(热备);
+ * - xc_no_overflow       : 所有缓存都没溢出,无需查 pg_subtrans;
+ * - xc_slow_answer       : 走了最慢的 pg_subtrans 树查找路径。 */
 static long xc_by_recent_xmin = 0;
 static long xc_by_known_xact = 0;
 static long xc_by_my_xact = 0;
@@ -345,6 +523,7 @@ static long xc_slow_answer = 0;
 #define xc_by_known_assigned_inc()	(xc_by_known_assigned++)
 #define xc_no_overflow_inc()		(xc_no_overflow++)
 #define xc_slow_answer_inc()		(xc_slow_answer++)
+/* (中文)(仅 XIDCACHE_DEBUG)上面各计数器的自增宏:编译时统计用。 */
 
 static void DisplayXidCache(void);
 #else							/* !XIDCACHE_DEBUG */
@@ -359,8 +538,14 @@ static void DisplayXidCache(void);
 #define xc_no_overflow_inc()		((void) 0)
 #define xc_slow_answer_inc()		((void) 0)
 #endif							/* XIDCACHE_DEBUG */
+/* (中文)(未编译 XIDCACHE_DEBUG)上述自增宏全部退化为空操作,使
+ * TransactionIdIsInProgress() 在正式构建里不带任何统计开销。 */
 
 /* Primitives for KnownAssignedXids array handling for standby */
+/* (中文)KnownAssignedXids 数组处理原语的内部函数原型(热备专用)。
+ * 锁要求:除 KnownAssignedXidsAdd 外,各函数都要求调用方已持
+ * ProcArrayLock(读取函数至少 SHARED,修改函数必须 EXCLUSIVE);
+ * KnownAssignedXidsAdd 通常无需持锁,靠内存屏障与读方互锁。 */
 static void KnownAssignedXidsCompress(KAXCompressReason reason, bool haveLock);
 static void KnownAssignedXidsAdd(TransactionId from_xid, TransactionId to_xid,
 								 bool exclusive_lock);
@@ -385,14 +570,45 @@ static void MaintainLatestCompletedXidRecovery(TransactionId latestXid);
 static inline FullTransactionId FullXidRelativeTo(FullTransactionId rel,
 												  TransactionId xid);
 static void GlobalVisUpdateApply(ComputeXidHorizonsResult *horizons);
+/* (中文)其余静态函数原型(自文档化,详见各自函数定义处的注释):
+ * ProcArrayEndTransactionInternal —— 事务结束时实际清除 xid 的公共内联
+ *   实现(要求已持 ProcArrayLock EXCLUSIVE);
+ * ProcArrayGroupClearXid —— 组提交式的批量清除 xid;
+ * MaintainLatestCompletedXid(Recovery) —— 推进全局 latestCompletedXid
+ *   (正常/恢复两个版本);
+ * FullXidRelativeTo —— 32 位 xid 参照某个 64 位基准换算成 FullTransactionId;
+ * GlobalVisUpdateApply —— 把 ComputeXidHorizons 的结果灌入四份
+ *   GlobalVisState。 */
 
 /*
  * Register the shared PGPROC array during postmaster startup.
  */
+/* (中文)共享内存 request 阶段回调:向共享内存子系统申报本模块需要的
+ * 全部共享内存。
+ *
+ * 【作用】postmaster 启动时被调用一次,声明两块内存:
+ * 1. 热备数据(仅 EnableHotStandby 时):KnownAssignedXids 与其有效性
+ *    标志两个数组,容量为 TOTAL_MAX_CACHED_SUBXIDS;
+ * 2. "Proc Array" 主结构(ProcArrayStruct),容量按 PROCARRAY_MAXPROCS
+ *    个 int(procno)计算。
+ * 分配出的共享内存地址直接写入本文件的两个静态指针(KnownAssignedXids
+ * 与 procArray),供后续 init/attach 阶段与所有后端使用。
+ *
+ * 【设计思想】KnownAssignedXids 的容量取 TOTAL_MAX_CACHED_SUBXIDS =
+ * (PGPROC_MAX_CACHED_SUBXIDS + 1) * PROCARRAY_MAXPROCS,与快照的
+ * subxip 数组、TransactionIdIsInProgress 的工作数组保持一致:某些场景
+ * 需要把整份数组互相拷贝,三处必须大小相同(见英文注释)。由于申报
+ * 阶段还不知道本次运行是否会真的进入热备,只要参数 EnableHotStandby
+ * 开启就无条件申报,宁可多占一点共享内存。
+ *
+ * 【参数】arg —— 共享内存子系统透传,本函数不使用。
+ * 【返回值】无。 */
 static void
 ProcArrayShmemRequest(void *arg)
 {
 #define PROCARRAY_MAXPROCS	(MaxBackends + max_prepared_xacts)
+/* (中文)进程数组的容量上限:所有后端 + prepared 事务的占位条目。
+ * pgprocnos[]、ProcGlobal->xids[] 等并行数组都按它分配。 */
 
 	/*
 	 * During Hot Standby processing we have a data structure called
@@ -409,6 +625,10 @@ ProcArrayShmemRequest(void *arg)
 	 */
 #define TOTAL_MAX_CACHED_SUBXIDS \
 	((PGPROC_MAX_CACHED_SUBXIDS + 1) * PROCARRAY_MAXPROCS)
+/* (中文)热备相关的三处大型数组(共享的 KnownAssignedXids / 快照的
+ * subxip / TransactionIdIsInProgress 的工作数组)统一使用的容量:每个
+ * 后端最多 PGPROC_MAX_CACHED_SUBXIDS + 1 个 xid 可能同时"在运行"。
+ * 三处必须同尺寸,因为某些路径会把整份数组整体拷贝(见英文注释)。 */
 
 	if (EnableHotStandby)
 	{
@@ -434,6 +654,18 @@ ProcArrayShmemRequest(void *arg)
 /*
  * Initialize the shared PGPROC array during postmaster startup.
  */
+/* (中文)共享内存 init 阶段回调:在 postmaster 中对进程数组做初始化。
+ *
+ * 【作用】把 ProcArrayStruct 的全部字段置为初值(空数组:numProcs = 0,
+ * 无 KnownAssignedXids、无复制槽水位);把 xactCompletionCount 置 1;
+ * 记住 allProcs 的基址。之后 ProcArrayAdd() 才会开始填充数组。
+ *
+ * 【设计思想】xactCompletionCount(事务完成计数)初始为 1 而不是 0,
+ * 与快照中 snapXactCompletionCount 的 0 初值区分:0 表示"该快照从未
+ * 参与复用判定",见 GetSnapshotDataReuse()。
+ *
+ * 【参数】arg —— 共享内存子系统透传,本函数不使用。
+ * 【返回值】无。 */
 static void
 ProcArrayShmemInit(void *arg)
 {
@@ -456,10 +688,35 @@ ProcArrayShmemAttach(void *arg)
 {
 	allProcs = ProcGlobal->allProcs;
 }
+/* (中文)共享内存 attach 阶段回调:postmaster 派生的其他进程(如
+ * 后台工作者 bgworker)启动时,把 allProcs 重新绑定到共享的 PGPROC
+ * 数组(进程私有的地址映射可能不同)。init 阶段已完成的其余初始化
+ * 都是共享内存里的,无需重做。 */
 
 /*
  * Add the specified PGPROC to the shared array.
  */
+/* (中文)把一个 PGPROC 登记进共享进程数组(后端或 prepared 事务启动时)。
+ *
+ * 【作用】把 proc 的 procno 插入 pgprocnos[],并把它的 xid / 子事务
+ * 状态 / statusFlags 同步写入 ProcGlobal 的三个并行数组,保证后续所有
+ * 快照与可见性判定能看见它。数组按 procno 升序排列,插入处之后的
+ * 元素全部后移,同时把它们的 pgxactoff 相应加 1。
+ *
+ * 【设计思想】
+ * - 为什么按 procno 排序:让遍历进程数组时的内存访问尽量局部化
+ *   (相邻条目往往在同一条缓存行里)。添加/删除远比遍历少,排序成本
+ *   摊下来微不足道(见英文注释);
+ * - 为什么同时持 ProcArrayLock 与 XidGenLock:进程数组(快照读方)
+ *   与 xid 分配(GetNewTransactionId 的写方)必须互斥,防止取快照的
+ *   人看到"有 xid 却不在数组里"的中间状态。释放时按相反顺序
+ *   (先 XidGenLock 后 ProcArrayLock),减少"持 ProcArrayLock 等
+ *   XidGenLock"的等待频率;
+ * - pgxactoff 是 PGPROC 在并行数组里的下标,数组插入后所有后续
+ *   条目的 pgxactoff 都要 +1,同步维护(allProcs[procno].pgxactoff)。
+ *
+ * 【参数】proc —— 要登记的后端 PGPROC。
+ * 【返回值】无。数组已满(理论不可能)时报 FATAL "too many clients"。 */
 void
 ProcArrayAdd(PGPROC *proc)
 {
@@ -557,6 +814,29 @@ ProcArrayAdd(PGPROC *proc)
  * the ProcArrayLock only once, and don't damage the content of the PGPROC;
  * twophase.c depends on the latter.)
  */
+/* (中文)把指定的 PGPROC 从共享进程数组中移除(后端退出或 prepared
+ * 事务结束)。
+ *
+ * 【作用】按 pgxactoff 从四个并行数组中删除该条目,后续条目前移并
+ * 修正 pgxactoff。若传入了合法的 latestXid(移除"活着的"prepared
+ * 事务时),说明此刻必须宣告该事务不再运行,于是像
+ * ProcArrayEndTransaction 那样推进 latestCompletedXid 与
+ * xactCompletionCount,但不清 PGPROC 内容——twophase.c 还依赖
+ * PGPROC 里的 xid 等字段做后续清理。
+ *
+ * 【设计思想】
+ * - 同时持 ProcArrayLock(EXCLUSIVE)与 XidGenLock(EXCLUSIVE),理由
+ *   与 ProcArrayAdd 相同:移除条目会让"正在运行的 xid 集合"缩小,
+ *   必须对取快照者原子可见;
+ * - 数组保持 procno 升序,删除即前移,与 ProcArrayAdd 对称;
+ * - XIDCACHE_DEBUG 构建时,普通后端(pid != 0)退出前打印 XID 缓存
+ *   统计,prepared 事务结束不算"后端退出",不打印。
+ *
+ * 【参数】
+ *   proc      —— 要移除的 PGPROC;
+ *   latestXid —— 若是"活着的"2PC 事务被移除,传它的最新 xid(用于
+ *                推进 latestCompletedXid);否则 InvalidTransactionId。
+ * 【返回值】无。 */
 void
 ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 {
@@ -659,6 +939,35 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
  * contents, because the subxid information in the PGPROC might be
  * incomplete.)
  */
+/* (中文)事务结束时调用:把事务从"正在运行"集合中移除(提交与中止
+ * 共用此函数)。
+ *
+ * 【作用】清除本进程在 ProcArray 中宣告的 xid、xmin、子事务缓存等,
+ * 并推进全局 latestCompletedXid 与 xactCompletionCount,使所有后来
+ * 构造的快照都能看到该事务已完成。事务的 commit/abort 必须先写进
+ * WAL 与 pg_xact,本函数只是"宣告结束"。
+ *
+ * 【设计思想】
+ * - 为什么必须持锁清 xid:取快照的人(持 SHARED 锁)必须看到"正在
+ *   运行集合"的完整变迁。若不加锁清除,可能出现快照把已提交事务
+ *   当作还在运行(或反之)的窗口,详见 access/transam/README;
+ * - 无 xid 的事务(只读事务)不需要加锁:它不在任何人的快照里,
+ *   清了 xmin 只会让全局 xmin 的估计略不精确,无碍正确性;
+ * - 性能:提交路径热点竞争 ProcArrayLock,因此先试"条件加锁"
+ *   (LWLockConditionalAcquire):立刻拿到就自己清(走
+ *   ProcArrayEndTransactionInternal);拿不到就加入"组清除"队列
+ *   由带头人统一处理(ProcArrayGroupClearXid),避免把锁传来传去;
+ * - statusFlags 的 VACUUM 状态位与 xid/xmin 必须同时清除,否则清理
+ *   进程会误判该后端的 xmin 是否要计入水位;无锁路径下只在这个位
+ *   置必要时才单独取锁,避免弄脏共享缓存行。
+ *
+ * 【参数】
+ *   proc      —— 本事务的 PGPROC(当前调用总是 MyProc,显式传参是为
+ *                灵活性与组清除共用);
+ *   latestXid —— 本事务主 xid 与所有子事务中最大的一个;没有 xid
+ *                则为 InvalidTransactionId。必须由调用方传入而不是
+ *                从 PGPROC 里读:PGPROC 的子事务缓存可能不完整。
+ * 【返回值】无。 */
 void
 ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 {
@@ -721,6 +1030,26 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
  *
  * We don't do any locking here; caller must handle that.
  */
+/* (中文)事务结束时的实际清除动作(ProcArrayEndTransaction 与组清除
+ * 带头人共用的内联实现)。
+ *
+ * 【作用】在已持锁的前提下,把 proc 的 xid / xmin / vxid / 子事务缓存
+ * 全部清零,清除 VACUUM 状态位,并推进 latestCompletedXid 与
+ * xactCompletionCount。
+ *
+ * 【设计思想】
+ * - 调用者必须已持 ProcArrayLock EXCLUSIVE(函数内有 Assert):清除
+ *   别人的 xid 改变的是整个"正在运行集合",只能排他;
+ * - 清 statusFlags 的 PROC_VACUUM_STATE_MASK 位与 xid/xmin 同步进行,
+ *   且只在确实置位时才写,避免不必要的共享缓存行弄脏;
+ * - 子事务缓存一并清零(它的内容随事务结束全部失效);
+ * - MaintainLatestCompletedXid 与 xactCompletionCount 的递增都必须在
+ *   持锁期间完成,使"事务完成"这一事件对读取者原子可见。
+ *
+ * 【参数】
+ *   proc      —— 要清除的 PGPROC(可以是别人的,组清除时由带头人代劳);
+ *   latestXid —— 该事务的最新 xid,用于推进 latestCompletedXid。
+ * 【返回值】无。 */
 static inline void
 ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 {
@@ -780,6 +1109,37 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
  * since the lock need not be repeatedly handed off from one committing
  * process to the next.
  */
+/* (中文)组 XID 清除(组提交优化):拿不到 ProcArrayLock 时的备用提交路径。
+ *
+ * 【作用】提交时若条件加锁失败,把自己挂进 ProcGlobal->procArrayGroupFirst
+ * 指向的无锁单向链表,然后:
+ * - 若链上已有其他进程(nextidx != INVALID_PROC_NUMBER),说明已有
+ *   "带头人"在干活:在自己的信号量上睡眠,等带头人把自己的 xid 清掉
+ *   后再唤醒;
+ * - 若是第一个入链的进程(带头人):一次取得 EXCLUSIVE 锁,遍历整条链,
+ *   替所有成员调用 ProcArrayEndTransactionInternal 清除 xid,然后释放
+ *   锁,最后逐个唤醒成员。
+ *
+ * 【设计思想】
+ * - 为什么值得这么做:高并发提交时,每个进程都试图独占 ProcArrayLock,
+ *   锁会在提交进程间反复交接,持有时间被"排队-获得-释放"的开销放大。
+ *   组清除把 N 次加锁合并成 1 次,大幅降低争用(见英文注释);
+ * - 链表用原子 CAS 维护(procArrayGroupNext / procArrayGroupFirst),
+ *   入链完全无锁;取出链头用 pg_atomic_exchange 一次交换为空,避免
+ *   逐个 pop 造成的 ABA 问题(见英文注释);
+ * - 唤醒放在释放锁之后:唤醒他人要发信号(系统调用),比锁内的普通
+ *   内存写慢得多,不应占用锁持有时间;
+ * - 睡眠期间可能有额外的信号到达(extraWaits 计数),醒来后要按计数
+ *   补发信号量,保持信号量计数平衡;
+ * - 内存序:带头人写 xid 清除结果后,用 pg_write_barrier 再置成员
+ *   的 procArrayGroupMember = false,保证成员醒来看到的清除结果
+ *   一定是完整的。
+ *
+ * 【参数】
+ *   proc      —— 本进程 PGPROC;
+ *   latestXid —— 本事务最新 xid(记入 procArrayGroupMemberXid,由带头人
+ *                传给 ProcArrayEndTransactionInternal)。
+ * 【返回值】无。 */
 static void
 ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 {
@@ -895,6 +1255,26 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
  * will still appear as running because the 2PC's gxact is in the ProcArray
  * too.  We just have to clear out our own PGPROC.
  */
+/* (中文)2PC 事务 PREPARE 成功后的清理:清空本后端自己的 PGPROC 事务
+ * 字段,但"事务仍在运行"的宣告由已插入的 gxact(prepared 事务占位
+ * PGPROC)继续承担。
+ *
+ * 【作用】PREPARE 时把 ProcGlobal->xids[pgxactoff] 与本进程的
+ * xid/xmin/vxid/子事务缓存清掉,并递增 xactCompletionCount。此时
+ * 进程数组中已插入同 xid 的 gxact,所以从快照角度看事务仍然"在运行",
+ * 本函数不会改变任何人的可见性视图。
+ *
+ * 【设计思想】
+ * - 为什么递增 xactCompletionCount:GetSnapshotData() 构造快照时会把
+ *   自己的 xid 排除在 xip 之外;若不递增计数,PREPARE 前后构造的快照
+ *   内容相同,可能被 GetSnapshotDataReuse() 判定"可以复用",而复用的
+ *   旧快照没把 prepared 事务算作运行,导致可见性错误(见英文注释);
+ * - 锁级别:理论上有"清除动作本身"用 SHARED 锁就够,但 xactCompletionCount
+ *   的递增要求 EXCLUSIVE,故整体取 EXCLUSIVE(把 2PC 提交后紧跟着的
+ *   ProcArrayRemove 合并考虑也许是未来的优化方向)。
+ *
+ * 【参数】proc —— 本后端 PGPROC。
+ * 【返回值】无。 */
 void
 ProcArrayClearTransaction(PGPROC *proc)
 {
@@ -954,6 +1334,24 @@ ProcArrayClearTransaction(PGPROC *proc)
  * Update TransamVariables->latestCompletedXid to point to latestXid if
  * currently older.
  */
+/* (中文)推进全局"最新已完成事务"水位 latestCompletedXid(正常运行时
+ * 版本)。
+ *
+ * 【作用】若 latestXid 比当前 latestCompletedXid 新,则把
+ * latestCompletedXid 更新为 latestXid。所有快照的 xmax 都取自它
+ * (xmax = latestCompletedXid + 1),因此它必须"单调不后退"且在任何
+ * 事务完成后立即推进。
+ *
+ * 【设计思想】
+ * - 为什么必须持锁调用:latestCompletedXid 与"正在运行集合"必须
+ *   一致推进,否则取快照者可能看到 xid 已经"完成"却还留在运行集合
+ *   中(或反过来)。函数内有 Assert(LWLockHeldByMe(ProcArrayLock));
+ * - 64 位换算:用 FullXidRelativeTo(以当前 latestCompletedXid 为基准)
+ *   把 32 位 latestXid 还原成 FullTransactionId,避免事务 id 回绕导致
+ *   错误(这里的最新值必然在 32 位空间内处于当前基准附近)。
+ *
+ * 【参数】latestXid —— 刚完成事务的最新 xid。
+ * 【返回值】无。 */
 static void
 MaintainLatestCompletedXid(TransactionId latestXid)
 {
@@ -976,6 +1374,23 @@ MaintainLatestCompletedXid(TransactionId latestXid)
 /*
  * Same as MaintainLatestCompletedXid, except for use during WAL replay.
  */
+/* (中文)推进 latestCompletedXid 的恢复(recovery)版本:在备机重放
+ * WAL 期间由 startup 进程调用。
+ *
+ * 【作用】与 MaintainLatestCompletedXid 语义相同(单调推进到 latestXid),
+ * 但基准不同:正常运行时基准是"当前的 latestCompletedXid"(恒有效),
+ * 恢复期间该值可能尚未初始化,改用 TransamVariables->nextXid 作基准。
+ *
+ * 【设计思想】
+ * - 恢复期间只有 startup 进程写 nextXid,且它自己就是本函数的调用者,
+ *   无需加锁读 nextXid(函数内只有 ProcArrayLock 的 Assert,因为调用方
+ *   承诺持锁——恢复期间推进该值同样要与 KnownAssignedXids 的删除
+ *   原子一致);
+ * - FullTransactionId 还原依然用 FullXidRelativeTo,基准换成 nextXid
+ *   后得到的仍是正确的 64 位表示。
+ *
+ * 【参数】latestXid —— 从 WAL 记录中得知的最新完成事务 xid。
+ * 【返回值】无。 */
 static void
 MaintainLatestCompletedXidRecovery(TransactionId latestXid)
 {
@@ -1010,6 +1425,20 @@ MaintainLatestCompletedXidRecovery(TransactionId latestXid)
  * so we can ensure it's initialized gaplessly up to the point where necessary
  * while in recovery.
  */
+/* (中文)初始化恢复期的 xid 管理环境。
+ *
+ * 【作用】记录 startup 进程把 CLOG 与 pg_subtrans 初始化到了哪个 xid
+ * (initializedUptoXID),作为 latestObservedXid 的起点。此后
+ * RecordKnownAssignedTransactionIds() 与 ProcArrayApplyRecoveryInfo()
+ * 会从这一点开始"无缝隙"地补齐 pg_subtrans 的扩展,保证任何时刻
+ * 需要查询的父子事务链都可用。
+ *
+ * 【设计思想】latestObservedXid 的含义是"已知已分配的最大 xid"。
+ * 把它先退一格(TransactionIdRetreat)再交给后续逻辑:后续代码总是
+ * "先推进一步、再检查",这样能干净地处理"下一个待观察 xid"的边界。
+ *
+ * 【参数】initializedUptoXID —— pg_subtrans 已初始化到的最远 xid。
+ * 【返回值】无。 */
 void
 ProcArrayInitRecovery(TransactionId initializedUptoXID)
 {
@@ -1041,6 +1470,34 @@ ProcArrayInitRecovery(TransactionId initializedUptoXID)
  *
  * See comments for LogStandbySnapshot().
  */
+/* (中文)应用主库传来的"运行事务快照"(XLOG_RUNNING_XACTS),初始化
+ * 备机的 KnownAssignedXids,并推进 standbyState 状态机。
+ *
+ * 【作用】备机一致性恢复开始时调用,可能多次(每次收到新的
+ * RUNNING_XACTS 记录)。处理步骤:
+ * 1. 用快照的 oldestRunningXid 修剪过期的 KnownAssignedXids 与锁
+ *    (防溢出:主库可能因崩溃没写 abort 记录,遗留的 xid 需要清掉);
+ * 2. 推进 nextXid(StandbyReleaseOldLocks 需要它来识别 2PC 事务);
+ * 3. 把快照里"尚未完成"的 xid 排序后全部装入 KnownAssignedXids
+ *    (去重,跳过已在 clog 中完成的事务);
+ * 4. 把 pg_subtrans 无缝隙扩展到 nextXid - 1;
+ * 5. 根据快照是否溢出设置 standbyState:
+ *    - 完整快照 -> STANDBY_SNAPSHOT_READY(快照立即可用);
+ *    - 快照缺失子事务(SUBXIDS_MISSING) -> STANDBY_SNAPSHOT_PENDING:
+ *      记下 standbySnapshotPendingXmin = 已知最晚 xid,等后续
+ *      RUNNING_XACTS 的 oldestRunningXid 超过它,说明丢失的信息已被
+ *      完全取代,才转为 READY(见英文注释里的判定逻辑)。
+ *
+ * 【设计思想】
+ * - KnownAssignedXids 必须有序:内部用二分查找,所以先 qsort;
+ * - 为什么不此时建 pg_subtrans 父子链:未溢出时全部子事务都在快照里,
+ *   不需要;溢出时信息本来就不全,建了也白建。链的建立留给后续
+ *   XLOG_XACT_ASSIGNMENT 记录(ProcArrayApplyXidAssignment);
+ * - latestCompletedXid 可能已比快照里记录的新(快照生成与落盘之间有
+ *   提交发生),所以用"取较大者"语义的 MaintainLatestCompletedXidRecovery。
+ *
+ * 【参数】running —— 主库日志的快照数据(见 RunningTransactionsData)。
+ * 【返回值】无。 */
 void
 ProcArrayApplyRecoveryInfo(RunningTransactions running)
 {
@@ -1305,6 +1762,30 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
  * ProcArrayApplyXidAssignment
  *		Process an XLOG_XACT_ASSIGNMENT WAL record
  */
+/* (中文)处理 XLOG_XACT_ASSIGNMENT WAL 记录(备机侧:主库某事务分配了
+ * 一批子事务 xid)。
+ *
+ * 【作用】
+ * 1. 把这些子事务在 pg_subtrans 中登记为 topxid 的孩子
+ *    (SubTransSetParent,供 TransactionIdIsInProgress 的树查找使用);
+ * 2. 把已收入 KnownAssignedXids 的对应子事务 xid 删除——与主库侧
+ *    子事务进入 PGPROC 缓存后"从主事务宣告中剥离"的行为对应;
+ * 3. 推进 lastOverflowedXid 到这批子事务的最大值:这些子事务从此
+ *    不在 KnownAssignedXids 里,快照对"不晚于该值的子事务"信息不完
+ *    整,见 ProcArrayStruct 字段注释。
+ *
+ * 【设计思想】
+ * - 用 topxid 而不是直接父 xid 登记:恢复期子事务的提交状态在 clog
+ *   中要等顶层提交才标记,而中止的已标记;直接把子事务连到顶层,可
+ *   以跳过中间状态直接查顶层,是"仍正确"的简化(见英文注释);
+ * - RecordKnownAssignedTransactionIds(max_xid) 会顺带把中间未观察
+ *   到的 xid 也"推断已分配"收入数组,保证无缝隙;
+ * - 与正常事务提交同样的加锁(EXCLUSIVE)删除 KnownAssignedXids 条目。
+ *
+ * 【参数】
+ *   topxid  —— 顶层事务 xid;
+ *   nsubxids、subxids —— 子事务的数量与数组。
+ * 【返回值】无。 */
 void
 ProcArrayApplyXidAssignment(TransactionId topxid,
 							int nsubxids, TransactionId *subxids)
@@ -1389,6 +1870,46 @@ ProcArrayApplyXidAssignment(TransactionId topxid,
  * This buys back some concurrency (and we can't retrieve the main Xids from
  * ProcGlobal->xids[] again anyway; see GetNewTransactionId).
  */
+/* (中文)核心可见性查询:判断给定 xid 是否仍被某个后端当作"正在运行"
+ * (含自己)的事务。
+ *
+ * 【作用】这是 MVCC 可见性判定的关键一步(例如 HeapTupleSatisfiesMVCC
+ * 判断 xmax 是否仍活跃)。除了若干廉价捷径,寻找"正在运行"的事务有
+ * 四条途径,按成本从低到高:
+ * 1. 主事务 xid 直接匹配 ProcGlobal->xids[](排他共享数组,一次遍历);
+ * 2. 匹配某后端子事务缓存数组里的子 xid;
+ * 3. 热备时查 KnownAssignedXids(主库上运行的事务);
+ * 4. 最后手段:查 pg_subtrans 把 xid 上升到其最顶层父事务,再看该
+ *    顶层是否在上面 1/3 的集合里——这要求子事务缓存曾经溢出
+ *    (overflowed),否则第 1/2 步已经能给出确定答案。
+ *
+ * 执行捷径(均无需进入共享内存):
+ * - xid < RecentXmin:必然已完成(顺带排除了 Invalid/Frozen 等特殊值);
+ * - 命中 cachedXidIsNotInProgress:上次已确认不在运行;
+ * - 是自己的事务(TransactionIdIsCurrentTransactionId,含子事务链):
+ *   必在运行;
+ * - 持锁后比较 latestCompletedXid:xid 比它新,必然还在运行。
+ *
+ * 【设计思想】
+ * - 锁协议:步骤 1/2/3 持 ProcArrayLock SHARED(防止并发提交/删除把
+ *   数组改动);期间把"需要进 pg_subtrans 复查的顶层 xid"先收集到
+ *   私有数组 xids[],再释放锁做步骤 4——父链查询不需要数组稳定,
+ *   而且提交者已把 xid 清出数组,复查时也必须用收集的快照值;
+ * - 溢出标志的不可逆性保证了收集无遗漏:overflowed 一旦置位不会被
+ *   清除(持锁期间),所以"需要复查"的集合只会变大不会变小;
+ * - 已知全部相关缓存未溢出(nxids == 0)时直接断定"不在运行",
+ *   这就是绝大多数情况下热路径的终点;
+ * - 步骤 4 前先查 TransactionIdDidAbort:已中止的子事务即使父事务
+ *   还在运行,也必须回答"不在运行";
+ * - 工作数组 xids[] 用 malloc 一次性分配、永久复用(按热备需求取
+ *   TOTAL_MAX_CACHED_SUBXIDS 大小),避免每次查询的分配开销;
+ * - 频繁的小值读取使用 UINT32_ACCESS_ONCE 防撕裂读(与
+ *   GetNewTransactionId 的写入侧配对)。
+ *
+ * 【参数】xid —— 待查询的事务 id。
+ * 【返回值】true = 仍在运行(可能由步骤 1/2/3 直接判定,或由步骤 4
+ *         经父事务链判定);false = 肯定不在运行(并把 xid 记入
+ *         cachedXidIsNotInProgress 缓存)。 */
 bool
 TransactionIdIsInProgress(TransactionId xid)
 {
@@ -1670,6 +2191,38 @@ TransactionIdIsInProgress(TransactionId xid)
  * horizon than later when deciding which tuples can be removed - which the
  * code doesn't expect (breaking HOT).
  */
+/* (中文)计算各种"水位"(horizon):一个 xid 达到多少才能安全清理。
+ *
+ * 【作用】在持 ProcArrayLock SHARED 期间,扫描进程数组收集所有活跃
+ * 后端的 xid 与 xmin,并综合复制槽水位,计算并填充
+ * ComputeXidHorizonsResult 中的一组下界(结果字段含义见该结构的中文
+ * 注释)。封装函数 GetOldestNonRemovableTransactionId() /
+ * GetOldestTransactionIdConsideredRunning() / GetReplicationHorizons()
+ * 以及 GlobalVisUpdate() 都依赖它。
+ *
+ * 【设计思想】
+ * - 计算原则:一切"最老不可删除 xid"的初值都取 latestCompletedXid + 1
+ *   ——这是"将来可能出现在进程数组中的最小 xid"的下界,防止对未来
+ *   加入的事务过度乐观(见英文注释);再对所有候选 xid/xmin 取 MIN;
+ * - 为什么同时看 xmin 和 xid:事务可能"有 xmin 还没 xid"(只读事务
+ *   也保快照),也可能"有 xid 还没设 xmin"(见英文注释);
+ * - 按关系类别区分保守度:共享表要把所有库的后端都计入;普通数据表
+ *   只计本库后端(其他库的会话看不到本库的表),但 MyDatabaseId 尚未
+ *   设置(启动中)、带 PROC_AFFECTS_ALL_HORIZONS(如 walsender 反馈)
+ *   或处于恢复期时必须全部计入,否则可能把仍需要的数据剪掉;
+ * - 恢复期用 KnownAssignedXids 的最老 xid 补充(备机的 PGPROC 没有
+ *   xid);VACUUM 进程/逻辑解码进程不进"非共享"水位,但永远计入
+ *   oldest_considered_running(他们还要查 pg_subtrans);
+ * - 锁只持有到共享数据读完为止,其余纯计算在锁外进行,缩短持锁时间;
+ * - 结果可能比上次更激进(更小):返回值都是"保守有效"的,例如当前
+ *   库没有事务时数据表水位是 latestCompletedXid,新事务随后开始会把
+ *   它压低。重复调用允许回退,但任何一次结果对当时的使用都是安全
+ *   的(详情与复制相关的回退场景见英文注释);
+ * - 顺带更新 GlobalVisUpdateApply 维护的四份近似边界,这是正确性
+ *   要求(heap vacuum 的 prune 调用需要一致的水位,见英文注释)。
+ *
+ * 【参数】h —— 输出:计算出的各组水位。
+ * 【返回值】无(结果写入 h)。 */
 static void
 ComputeXidHorizons(ComputeXidHorizonsResult *h)
 {
@@ -1906,6 +2459,21 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
  * Determine what kind of visibility horizon needs to be used for a
  * relation. If rel is NULL, the most conservative horizon is used.
  */
+/* (中文)决定某张关系应该使用哪种水位(保守度)。
+ *
+ * 【作用】把关系分类映射到 GlobalVisHorizonKind 四档:
+ * - rel == NULL(未指定关系)或共享表或处于恢复期:取最保守的
+ *   VISHORIZON_SHARED;
+ * - 系统目录、逻辑解码需要访问的关系:VISHORIZON_CATALOG;
+ * - 普通非本地表:VISHORIZON_DATA;
+ * - 临时表(仅本会话可见):VISHORIZON_TEMP。
+ *
+ * 【设计思想】其他 relkind(索引、序列等)不直接存 xid,也不带逻辑
+ * 解码标记,所以函数只接受堆/物化视图/TOAST(有 Assert 检查)。
+ * 分类依据见 GlobalVisHorizonKind 枚举的中文注释。
+ *
+ * 【参数】rel —— 关系描述符;NULL 表示"所有关系的通用答案"。
+ * 【返回值】对应的水位类别枚举。 */
 static inline GlobalVisHorizonKind
 GlobalVisHorizonKindForRel(Relation rel)
 {
@@ -1940,6 +2508,19 @@ GlobalVisHorizonKindForRel(Relation rel)
  * This is used by VACUUM to decide which deleted tuples must be preserved in
  * the passed in table.
  */
+/* (中文)VACUUM 用:返回"指定表中已删除元组必须保留到的最老 xid"。
+ *
+ * 【作用】调用 ComputeXidHorizons() 后,按关系的类别
+ * (GlobalVisHorizonKindForRel)挑选对应的水位返回:共享表/目录/普通
+ * 表/临时表各有各的边界。
+ *
+ * 【设计思想】传具体关系能拿到比全局答案更"激进"(更新)的边界——
+ * 例如普通用户表不需要为其他库的会话保守;rel == NULL 时返回对一切
+ * 关系都安全(但不够优)的值。VACUUM 用返回值的含义是:凡是 xmax
+ * 早于它的已删除元组都可以移除。
+ *
+ * 【参数】rel —— 目标关系;NULL 表示"对所有关系都安全"的通用水位。
+ * 【返回值】该表可删除元组的 xid 下界(早于此 xid 的删除可见/可清理)。 */
 TransactionId
 GetOldestNonRemovableTransactionId(Relation rel)
 {
@@ -1969,6 +2550,19 @@ GetOldestNonRemovableTransactionId(Relation rel)
  * determinations (see GetOldestNonRemovableTransactionId()), but for
  * decisions like up to where pg_subtrans can be truncated.
  */
+/* (中文)返回"可能仍被任何后端认为在运行的最老 xid"。
+ *
+ * 【作用】调用 ComputeXidHorizons() 返回 oldest_considered_running。
+ * 该值的用途不是可见性/清理判定(那是
+ * GetOldestNonRemovableTransactionId 的事),而是类似"pg_subtrans 可以
+ * 截断到哪个 xid"这种决策——它把 VACUUM、逻辑解码等所有仍可能做
+ * pg_subtrans 查询的进程都考虑进去了。
+ *
+ * 【设计思想】与普通清理水位不同,该值不能忽略 VACUUM 进程(它们判断
+ * 可见性时也要查 pg_subtrans,见 ComputeXidHorizons 的中文注释)。
+ *
+ * 【参数】无。
+ * 【返回值】最老的可能被视为运行的事务 xid。 */
 TransactionId
 GetOldestTransactionIdConsideredRunning(void)
 {
@@ -1982,6 +2576,21 @@ GetOldestTransactionIdConsideredRunning(void)
 /*
  * Return the visibility horizons for a hot standby feedback message.
  */
+/* (中文)计算要发给主库的 hot_standby_feedback 消息里的水位。
+ *
+ * 【作用】walsender 周期性地调用本函数,把备机上"仍可能需要的 xid"
+ * 反馈给主库,主库据此收紧 VACUUM 的清理边界。
+ *
+ * 【设计思想】刻意不用 shared_oldest_nonremovable(它已计入复制槽的
+ * catalog_xmin),而是返回 shared_oldest_nonremovable_raw(不受
+ * catalog_xmin 影响)与槽位的 slot_catalog_xmin 分开:这样主库可以对
+ * 数据表采用更激进的清理,只对系统目录(逻辑解码还要用)采取保守
+ * 边界(见英文注释)。
+ *
+ * 【参数】
+ *   xmin         —— 输出:数据表水位;
+ *   catalog_xmin —— 输出:系统目录水位。
+ * 【返回值】无。 */
 void
 GetReplicationHorizons(TransactionId *xmin, TransactionId *catalog_xmin)
 {
@@ -2004,6 +2613,18 @@ GetReplicationHorizons(TransactionId *xmin, TransactionId *catalog_xmin)
  *
  * We have to export this for use by snapmgr.c.
  */
+/* (中文)返回快照 xip 数组(主事务 xid 列表)的最大容量。
+ *
+ * 【作用】导出给 snapmgr.c:取快照前按此容量一次性 malloc xip 数组。
+ * 容量固定为 procArray->maxProcs = PROCARRAY_MAXPROCS,即"所有后端
+ * 都可能同时各持一个主 xid"的极端情况。
+ *
+ * 【设计思想】快照复用机制(GetSnapshotDataReuse)依赖 xip 数组在多次
+ * 调用间保持不变(调用方传静态 SnapshotData),因此容量一次定死、不
+ * 随 numProcs 变化(见 GetSnapshotData 的英文注释)。
+ *
+ * 【参数】无。
+ * 【返回值】xip 数组容量。 */
 int
 GetMaxSnapshotXidCount(void)
 {
@@ -2015,6 +2636,15 @@ GetMaxSnapshotXidCount(void)
  *
  * We have to export this for use by snapmgr.c.
  */
+/* (中文)返回快照 subxip 数组(子事务 xid 列表)的最大容量。
+ *
+ * 【作用】导出给 snapmgr.c:取快照前按此容量 malloc subxip 数组。
+ * 容量为 TOTAL_MAX_CACHED_SUBXIDS,即所有后端子事务缓存总和的上限
+ * (热备时 KnownAssignedXids 的容量与之相同,因为热备快照会把全部
+ * xid 塞进 subxip,见 GetSnapshotData 的英文注释)。
+ *
+ * 【参数】无。
+ * 【返回值】subxip 数组容量。 */
 int
 GetMaxSnapshotSubxidCount(void)
 {
@@ -2030,6 +2660,26 @@ GetMaxSnapshotSubxidCount(void)
  * This very likely can be evolved to not need ProcArrayLock held (at very
  * least in the case we already hold a snapshot), but that's for another day.
  */
+/* (中文)GetSnapshotData 的快照复用判定:检查旧快照的可见性信息是否
+ * 仍然有效,有效则就地刷新后返回 true。
+ *
+ * 【作用】取快照时发现"自上次构造以来没有任何带 xid 的事务完成"
+ * (xactCompletionCount 未变),则"正在运行集合"必然与上次相同,快照
+ * 的 xmin/xmax/xip/subxip 都可以直接沿用,只需刷新 curcid 与引用计数
+ * 等易变字段。
+ *
+ * 【设计思想】
+ * - 正确性依据(见英文注释):快照内容只取决于"带 xid 的事务集合";
+ *   每个带 xid 的事务结束时都会在持 EXCLUSIVE 锁的情况下递增
+ *   xactCompletionCount。因此计数相同 => 内容相同;
+ * - 复用时仍要把 xmin 重新登记进 MyProc->xmin:并发取快照的进程之间
+ *   必须满足"xmin 单调不后退"的约定(两个进程的 xmin 互相覆盖会破坏
+ *   VACUUM 的清理判定),且旧快照中可见的行不可能已被删除;
+ * - snapXactCompletionCount == 0 表示快照从未参与复用(首用),直接
+ *   返回 false 走完整重建。
+ *
+ * 【参数】snapshot —— 目标快照(须是静态分配、xip/subxip 已分配)。
+ * 【返回值】true = 复用成功(快照字段已被更新);false = 必须重建。 */
 static bool
 GetSnapshotDataReuse(Snapshot snapshot)
 {
@@ -2110,6 +2760,44 @@ GetSnapshotDataReuse(Snapshot snapshot)
  * Note: this function should probably not be called with an argument that's
  * not statically allocated (see xip allocation below).
  */
+/* (中文)构造事务快照:收集"正在运行的事务"集合,这是 MVCC 可见性
+ * 判定的核心数据。
+ *
+ * 【作用】在持 ProcArrayLock SHARED 锁期间,遍历进程数组(正常运行时
+ * 用 ProcGlobal->xids[] 与子事务缓存;热备时用 KnownAssignedXids),
+ * 产出快照:
+ * - xmin : 仍在运行的最小 xid(所有小于它的 xid 视为已结束);
+ * - xmax : 最新已完成 xid + 1(所有 >= 它的 xid 视为仍在运行);
+ * - xip[]: [xmin, xmax) 之间"正在运行"的 xid 列表(xcnt 个)——落在
+ *   此区间内的 xid 必须查这张表才能判定;
+ * - subxip[]: 各活跃后端子事务缓存里收集的子 xid(subxcnt 个);
+ * - suboverflowed: 是否有后端子事务缓存溢出(溢出时子 xid 信息不全,
+ *   判定方必须走 pg_subtrans 复查,见 XidInMVCCSnapshot);
+ * 同时更新后端全局量 TransactionXmin / RecentXmin 与四份
+ * GlobalVisState 的 definitely_needed 上界。
+ *
+ * 【设计思想】
+ * - 快照的不变性承诺:取快照者持锁期间,"正在运行集合"只能变大不能
+ *   变小(事务只能从无 xid 变成有 xid,有 xid 的必须持 EXCLUSIVE 锁
+ *   才能清除),因此构造出的快照保证了"我看到的运行集合在事务期间
+ *   不会向后变化"——这正是 MVCC 可重复读的基础;
+ * - 自己的 xid 不进 xip(自己当然算运行,但不需要写进快照;xmin 的
+ *   计算单独提前处理它);
+ * - 跳过逻辑解码与 LAZY VACUUM 进程(它们的 xmin 单独管理,见英文
+ *   注释);xid >= xmax 的也跳过(反正被视为运行);
+ * - 热备时把全部 xid 塞进 subxip:恢复期不区分主/子 xid(设计取舍,
+ *   见英文注释),xip 留空;
+ * - 子事务拷贝只读一次 nsubxids(对方可以并发"增加"子事务但不能
+ *   删除,而新加的子事务必然 >= xmax,对快照无关紧要,见英文注释);
+ * - xip/subxip 用 malloc 一次分配永久复用(调用方须传静态 Snapshot),
+ *   取锁前分配以免持锁做内存分配;
+ * - 快照封顶:数组容量固定为 maxProcs / TOTAL_MAX_CACHED_SUBXIDS
+ *   (见 GetMaxSnapshotXidCount 等),不会出现"收集途中数组不够"的
+ *   情况。
+ *
+ * 【参数】snapshot —— 输出:填充好的快照(须为静态分配,首次调用时
+ *                    xip/subxip 为 NULL,由本函数分配)。
+ * 【返回值】同一快照指针(字段已填充)。 */
 Snapshot
 GetSnapshotData(Snapshot snapshot)
 {
@@ -2475,6 +3163,30 @@ GetSnapshotData(Snapshot snapshot)
  *
  * Returns true if successful, false if source xact is no longer running.
  */
+/* (中文)把"从其他事务导入的 xmin"安装进 MyProc->xmin。
+ *
+ * 【作用】快照导入(snapshot import,如 REFRESH MATERIALIZED VIEW 的
+ * CONCURRENTLY 或内部跨会话借用快照)时调用:先核对"源事务"仍活着
+ * 且其 xmin 能覆盖我们,再把 xmin 写入 MyProc->xmin 与 TransactionXmin。
+ * 失败(源事务已不在运行)时返回 false,由调用方决定如何处理。
+ *
+ * 【设计思想】
+ * - 为什么要原子地做:全局最老 xmin(影响 VACUUM 清理边界)只允许
+ *   后退、不允许前进。若源事务已结束,它的 xmin 对 VACUUM 已无约束,
+ *   我们拿着它当自己的 xmin 会把全局下界"抬高"(变激进),可能删掉
+ *   源事务仍在看的数据。因此必须在持 SHARED 锁期间验证源事务还在
+ *   procarray 里(结束方要持 EXCLUSIVE 锁才能移除,互斥成立);
+ * - 用 vxid(虚拟事务 id = procNumber + 本地事务号)而非 xid 标识源
+ *   事务:源事务可能还没有分配 xid(只读事务);
+ * - 源事务必须与本进程同库(异库会话的 xmin 不覆盖本库表),且其
+ *   xmin 不晚于要导入的 xmin(否则说明它在保护更旧的数据,我们导入
+ *   的是它的快照,取其最老的边界);
+ * - VACUUM 进程(带 PROC_IN_VACUUM)被跳过:其 xmin 语义特殊。
+ *
+ * 【参数】
+ *   xmin       —— 要安装的 xmin(须为正常 xid);
+ *   sourcevxid —— 源事务的虚拟事务 id。
+ * 【返回值】true = 安装成功;false = 源事务已不在运行或条件不满足。 */
 bool
 ProcArrayInstallImportedXmin(TransactionId xmin,
 							 VirtualTransactionId *sourcevxid)
@@ -2559,6 +3271,25 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
  *
  * Returns true if successful, false if source xact is no longer running.
  */
+/* (中文)把"恢复的 xmin"安装进 MyProc->xmin(ProcArrayInstallImportedXmin
+ * 的变体:直接持有源事务的 PGPROC 指针)。
+ *
+ * 【作用】与 ProcArrayInstallImportedXmin 相同(安装 xmin,防止全局
+ * xmin 后退),但源事务是直接以 PGPROC 指针给出的;此外还会把源
+ * PGPROC 的 statusFlags 中影响 xmin 解释的位(PROC_XMIN_FLAGS)复制
+ * 过来——这些标志(如"xmin 是否为 VACUUM 相关")决定水位计算时该
+ * 后端要不要被跳过,不复制会导致 MyProc 的 xmin 被错误对待。
+ *
+ * 【设计思想】
+ * - 取 EXCLUSIVE 锁而不是 SHARED:要写 MyProc->statusFlags 与
+ *   ProcGlobal->statusFlags[pgxactoff],两者是并行数组的关系;
+ * - 同样的前提校验:同库、xmin 有效且不晚于要安装的值(防止全局与
+ *   库级 xmin 后退)。
+ *
+ * 【参数】
+ *   xmin —— 要安装的 xmin(须为正常 xid);
+ *   proc —— 源事务的 PGPROC(不能为 NULL)。
+ * 【返回值】true = 安装成功;false = 源事务已不在运行或条件不满足。 */
 bool
 ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
 {
@@ -2632,6 +3363,35 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
  * Note that if any transaction has overflowed its cached subtransactions
  * then there is no real need include any subtransactions.
  */
+/* (中文)返回"运行事务数据"(RUNNING_XACTS 快照素材):比
+ * GetSnapshotData 信息更全、专供 WAL 日志记录用。
+ *
+ * 【作用】checkpoint / 周期性日志运行时调用,生成主库发送给备机的
+ * RunningTransactionsData:
+ * - 包含所有持有 xid 的 PGPROC,包括 VACUUM 进程与 prepared 事务
+ *   (备机需要完整信息来初始化 KnownAssignedXids);
+ * - 记录 oldestRunningXid(清理备机过期数据用)、oldestDatabaseRunningXid
+ *   (本库的最老运行 xid,用于获取各库 xmin 反馈)、latestCompletedXid、
+ *   nextXid 与 xcnt/subxcnt/subxid_status;
+ * - 子事务缓存有溢出时不再收集子事务(subxid_status = SUBXIDS_IN_SUBTRANS,
+ *   备机据此把快照标记为"子事务不完整")。
+ *
+ * 【设计思想】
+ * - 持 XidGenLock SHARED + ProcArrayLock SHARED,但不释放、交还调用
+ *   方:调用方要先把这份快照写进 WAL,再释放锁。XidGenLock 保证写
+ *   WAL 期间没有新 xid 进入数组(否则备机可能漏掉),ProcArrayLock
+ *   保证没有事务提交;
+ * - 故意不把复制槽水位算进 oldestRunningXid:槽位的 xmin 只增不减,
+ *   若算进去会和 running xacts 互相牵制形成死锁般的循环(见英文注释);
+ * - 结果存放在静态的 RunningTransactionsData 里,反复复用同一块
+ *   xids 缓冲,调用方不得跨调用保留结果;
+ * - 恢复期不执行本函数,无需考虑 KnownAssignedXids;由于 prepared
+ *   事务的 gxact 与真实后端可能持同一 xid,结果中可能含重复 xid,
+ *   不去重(不为去重多持锁,备机侧 ProcArrayApplyRecoveryInfo 会去重)。
+ *
+ * 【参数】无。
+ * 【返回值】填充好的 RunningTransactions(静态存储,调用方负责在返回
+ *         后先记 WAL 再释放两个锁)。 */
 RunningTransactions
 GetRunningTransactionData(void)
 {
@@ -2828,6 +3588,26 @@ GetRunningTransactionData(void)
  * inCommitOnly indicates getting the oldestActiveXid among the transactions
  * in the commit critical section.
  */
+/* (中文)返回当前仍活跃的最老事务 xid(简化版 GetSnapshotData)。
+ *
+ * 【作用】遍历进程数组收集所有合法 xid 的最小值(初始化为 nextXid,
+ * 即"仍可能活跃"的天然上界)。与 GetSnapshotData 不同,它不区分
+ * 主/子事务、不跳过 VACUUM 进程,也不更新任何全局计数器。
+ *
+ * 【设计思想】
+ * - 先读 nextXid 再遍历:必须保证"小于 nextXid 的 xid 要么已在数组
+ *   里、要么已完成",否则会漏算(加 XidGenLock 短锁);
+ * - inCommitOnly = true 时只看处于提交临界区(DELAY_CHKPT_IN_COMMIT)
+ *   的事务:这是 checkpoint 判断"是否可以立刻推进 checkpoint 位置"
+ *   的专用查询——只关心正准备提交的事务;
+ * - allDbs = false 时跳过其他库的后端(热备冲突判定只需本库);
+ *   walsender 无需计入(它不影响冲突判定)。
+ * - 恢复期不执行(备机的运行事务由 KnownAssignedXids 表达)。
+ *
+ * 【参数】
+ *   inCommitOnly —— true 时只统计处于提交临界区的事务;
+ *   allDbs       —— true 时统计所有库,false 时只统计本库。
+ * 【返回值】最老活跃事务的 xid。 */
 TransactionId
 GetOldestActiveTransactionId(bool inCommitOnly, bool allDbs)
 {
@@ -2902,6 +3682,28 @@ GetOldestActiveTransactionId(bool inCommitOnly, bool allDbs)
  * although most callers will want to use exclusive mode since it is expected
  * that the caller will immediately use the xid to peg the xmin horizon.
  */
+/* (中文)返回"可保证未被 VACUUM 影响"的最老 xid(新建逻辑复制槽时的
+ * 起始解码水位)。
+ *
+ * 【作用】新建 changeset extraction 复制槽时,用返回值初始化解码的
+ * cutoff xid:任何 >= 该值的行都保证还没被 VACUUM 清掉(除非所属事务
+ * 已中止),从它之后开始解码不会漏数据。注意该值通常比真实情况保守
+ * 得多(见英文注释)。
+ *
+ * 【设计思想】
+ * - 初始化为 nextXid(必然安全的保守值),再取复制槽已有的 xmin
+ *   与其比较取更小(已有槽保护的数据也一并保护);catalogOnly 时
+ *   再考虑槽位的 catalog_xmin;
+ * - 非恢复期再遍历进程数组取所有正常 xid 的最小值:由于调用方已持
+ *   ProcArrayLock 且本函数再拿 XidGenLock,条目不会凭空消失或增加
+ *   (ProcGlobal->xids[i] 的设置持 XidGenLock、清除持 ProcArrayLock,
+ *   见英文注释);
+ * - 恢复期不能再用 KnownAssignedXids 求最老值:该机制可能漏值,给出
+ *   的"最老"不可靠(见英文注释),只能停留在上面算出的保守值,等
+ *   恢复结束后再精确化。
+ *
+ * 【参数】catalogOnly —— true 时把槽位 catalog_xmin 也算入保护。
+ * 【返回值】最老的、保证未被 VACUUM 影响过的 xid。 */
 TransactionId
 GetOldestSafeDecodingTransactionId(bool catalogOnly)
 {
@@ -3000,6 +3802,24 @@ GetOldestSafeDecodingTransactionId(bool catalogOnly)
  * takes a little while for clearing of delayChkptFlags to propagate is
  * unimportant for correctness.
  */
+/* (中文)收集"正在拖延 checkpoint 的事务"的虚拟事务 id(VXID)列表。
+ *
+ * 【作用】checkpoint 推进前调用:找出所有 PGPROC 中 delayChkptFlags
+ * 带有指定 type 位的后端(即正处在提交临界区、尚未完成关键 WAL 写入
+ * 的事务),返回它们的 VXID 数组。checkpoint 得到空列表才敢推进。
+ *
+ * 【设计思想】
+ * - 用 VXID 而非 xid:提交临界区可能跨越"分配 xid"这个时点,用虚拟
+ *   事务 id 才稳定可比较;
+ * - delayChkptFlags 的置位/清除不加锁,结果"有点模糊",但语义足够:
+ *   只要提交记录已插入,WAL 里就有它,是否立刻看到标志位只影响
+ *   checkpoint 多等一轮,不影响正确性(见英文注释);
+ * - 结果数组按 maxProcs 大小 palloc(必然够装),由调用方负责释放。
+ *
+ * 【参数】
+ *   nvxids —— 输出:有效条目数;
+ *   type   —— 要匹配的 delayChkptFlags 位掩码(非零)。
+ * 【返回值】VXID 数组(palloc 分配,调用方释放)。 */
 VirtualTransactionId *
 GetVirtualXIDsDelayingChkpt(int *nvxids, int type)
 {
@@ -3045,6 +3865,20 @@ GetVirtualXIDsDelayingChkpt(int *nvxids, int type)
  * Note: this is O(N^2) in the number of vxacts that are/were delaying, but
  * those numbers should be small enough for it not to be a problem.
  */
+/* (中文)检查指定的 VXID 们是否仍有事务在拖延 checkpoint。
+ *
+ * 【作用】与 GetVirtualXIDsDelayingChkpt 配套使用:把上次收集到的
+ * VXID 列表与本轮扫描到的"仍处于临界区"的 VXID 求交集,返回是否有
+ * 任一命中。checkpoint 用它循环等待"上一批拖延者全部退出临界区"。
+ *
+ * 【设计思想】O(N^2) 的双重循环(对每个当前拖延者线性查传入列表),
+ * 但拖延者数量级很小,不值得为此引入哈希表(见英文注释)。
+ *
+ * 【参数】
+ *   vxids  —— 要检查的 VXID 列表;
+ *   nvxids —— 列表长度;
+ *   type   —— delayChkptFlags 位掩码(非零)。
+ * 【返回值】true = 列表中有 VXID 仍处于临界区。 */
 bool
 HaveVirtualXIDsDelayingChkpt(VirtualTransactionId *vxids, int nvxids, int type)
 {
@@ -3094,6 +3928,19 @@ HaveVirtualXIDsDelayingChkpt(VirtualTransactionId *vxids, int nvxids, int type)
  * must be careful about how this information is used.  NULL is
  * returned if the backend is not active.
  */
+/* (中文)按进程号(procNumber)取得某后端的 PGPROC。
+ *
+ * 【作用】把"全局 PGPROC 数组下标"翻译成 PGPROC 指针,并过滤掉
+ * 不活跃的条目:进程号越界或对应 PGPROC 的 pid == 0(prepared 事务
+ * 占位或空闲槽)时返回 NULL。
+ *
+ * 【设计思想】返回的指针可能立刻过期(对方随时退出、槽位被复用),
+ * 调用方必须自己保证"问题在一段时间内仍有意义";pid == 0 既是
+ * "dummy PGPROC"的标志也是"空闲槽"的标志,不能当活跃后端返回。
+ * 不加锁(返回后锁也没有意义)。
+ *
+ * 【参数】procNumber —— 目标进程号(0 基)。
+ * 【返回值】对应 PGPROC 指针;无效或非活跃返回 NULL。 */
 PGPROC *
 ProcNumberGetProc(ProcNumber procNumber)
 {
@@ -3116,6 +3963,21 @@ ProcNumberGetProc(ProcNumber procNumber)
  * result may be out of date arbitrarily quickly, so the caller must be
  * careful about how this information is used.
  */
+/* (中文)按进程号取某后端的事务状态(xid、xmin、子事务数与溢出标志)。
+ *
+ * 【作用】把指定 PGPROC 的事务字段整体读出(通过输出参数返回)。
+ * 进程号越界或后端不活跃时,输出参数保持初值(xid/xmin 为
+ * InvalidTransactionId、子事务数 0、未溢出)。
+ *
+ * 【设计思想】读 PGPROC 时短暂持有 ProcArrayLock SHARED,把"后端
+ * 进/出数组"的窗口排除掉,保证读到的字段来自同一时刻(避免读到
+ * 正在被 ProcArrayRemove 搬移的条目);PGPROC 里的事务字段本身由
+ * 各进程自己写,这里只要求"条目还在数组里"。
+ *
+ * 【参数】
+ *   procNumber —— 目标进程号;
+ *   xid/xmin/nsubxid/overflowed —— 四个输出参数,含义同 PGPROC 字段。
+ * 【返回值】无。 */
 void
 ProcNumberGetTransactionIds(ProcNumber procNumber, TransactionId *xid,
 							TransactionId *xmin, int *nsubxid, bool *overflowed)
@@ -3152,6 +4014,17 @@ ProcNumberGetTransactionIds(ProcNumber procNumber, TransactionId *xid,
  * sure that the question remains meaningful for long enough for the
  * answer to be used ...
  */
+/* (中文)按操作系统 PID 查找后端 PGPROC(带锁版本)。
+ *
+ * 【作用】在进程数组中线性查找 pid 匹配的 PGPROC,返回指针;找不到
+ * (或 pid == 0,用于排除 dummy PGPROC)返回 NULL。内部对
+ * BackendPidGetProcWithLock 做了一次 SHARED 加锁/解锁包装。
+ *
+ * 【设计思想】返回的指针在锁释放后就可能失效(后端随时退出),调用方
+ * 必须自行保证答案在使用期间仍有意义(见英文注释)。
+ *
+ * 【参数】pid —— 目标进程的操作系统 PID。
+ * 【返回值】匹配的 PGPROC 指针,或 NULL。 */
 PGPROC *
 BackendPidGetProc(int pid)
 {
@@ -3175,6 +4048,17 @@ BackendPidGetProc(int pid)
  * Same as above, except caller must be holding ProcArrayLock.  The found
  * entry, if any, can be assumed to be valid as long as the lock remains held.
  */
+/* (中文)按 PID 查找后端 PGPROC(调用方已持锁版本)。
+ *
+ * 【作用】BackendPidGetProc 的内部实现:假定调用方已持有 ProcArrayLock
+ * (任意模式),直接线性扫描 pgprocnos[] 找 pid 匹配的后端。
+ *
+ * 【设计思想】pid == 0 的 PGPROC 是 prepared 事务占位(dummy),永不该
+ * 匹配,直接短路返回 NULL;找到的条目只要锁还持有就保证未被移除,
+ * 这正是把扫描放在锁内的意义。
+ *
+ * 【参数】pid —— 目标进程的操作系统 PID。
+ * 【返回值】匹配的 PGPROC 指针,或 NULL。 */
 PGPROC *
 BackendPidGetProcWithLock(int pid)
 {
@@ -3212,6 +4096,19 @@ BackendPidGetProcWithLock(int pid)
  * Beware that not every xact has an XID assigned.  However, as long as you
  * only call this using an XID found on disk, you're safe.
  */
+/* (中文)按 xid 查找持有它的后端 PID。
+ *
+ * 【作用】在 ProcGlobal->xids[] 中找给定主事务 xid,返回对应后端的
+ * 操作系统 PID;没找到或 xid 非法返回 0。prepared 事务的 pid 为 0,
+ * 天然与"未找到"同值(调用方按语义自行区分,见英文注释)。
+ *
+ * 【设计思想】只匹配"主事务 xid"(数组里就是主 xid,子事务在各自
+ * 缓存里),常用于"这把锁被哪个后端持有"的排查;并非所有事务都有
+ * xid,但磁盘上找到的 xid 一定被分配过,此时调用是安全的(见英文
+ * 注释)。
+ *
+ * 【参数】xid —— 要查找的主事务 xid。
+ * 【返回值】持有该 xid 的后端 PID;0 = 未找到或非法输入。 */
 int
 BackendXidGetPid(TransactionId xid)
 {
@@ -3247,6 +4144,13 @@ BackendXidGetPid(TransactionId xid)
  *
  * This is not called by the backend, but is called by external modules.
  */
+/* (中文)判断给定的 PID 是否是一个正在运行的后端。
+ *
+ * 【作用】外部模块(如复制管理)查询 pid 是否对应某个活跃后端。
+ * 实现就是 BackendPidGetProc() != NULL 的一次薄封装。
+ *
+ * 【参数】pid —— 要查询的进程 PID。
+ * 【返回值】true = 该 PID 正被某个活跃后端使用。 */
 bool
 IsBackendPid(int pid)
 {
@@ -3280,6 +4184,26 @@ IsBackendPid(int pid)
  * consider any transactions as still running that we think are committed
  * (since backends must hold ProcArrayLock exclusive to commit).
  */
+/* (中文)收集当前活跃事务的虚拟事务 id(VXID)数组,支持多种过滤条件。
+ *
+ * 【作用】按需过滤后返回所有活跃后端的 VXID(自己除外):
+ * - limitXmin:跳过 xmin 晚于该值(更"新")的后端——xmin 不早于给定
+ *   快照的会话,其"最老活快照"不会比给定快照更老;
+ * - excludeXmin0:跳过还没设置 xmin 的后端;
+ * - allDbs:false 时只统计本库后端;
+ * - excludeVacuum:跳过 statusFlags 与之有交集的后端(通常用于排除
+ *   VACUUM 与逻辑解码)。
+ *
+ * 【设计思想】
+ * - 为什么只用 SHARED 锁就安全(见英文注释):并发取快照的后端在
+ *   我们扫描期间也可能更新 xmin,但对方必然与我们重叠持有 SHARED
+ *   锁;而提交必须持 EXCLUSIVE 锁,所以"我们扫描时对方正要提交"
+ *   的情况被排除——我们认为已提交的事务,对方不可能正拿着快照;
+ * - 结果数组按 maxProcs 大小 palloc,由调用方释放。
+ *
+ * 【参数】见上面过滤条件说明(limitXmin 可为 InvalidTransactionId 表示
+ *        不限制;excludeVacuum 可为 0 表示不排除)。
+ * 【返回值】VXID 数组(palloc 分配),*nvxids 输出条目数。 */
 VirtualTransactionId *
 GetCurrentVirtualXIDs(TransactionId limitXmin, bool excludeXmin0,
 					  bool allDbs, int excludeVacuum,
@@ -3372,6 +4296,27 @@ GetCurrentVirtualXIDs(TransactionId limitXmin, bool excludeXmin0,
  * Be careful to *not* pfree the result from this function. We reuse
  * this array sufficiently often that we use malloc for the result.
  */
+/* (中文)收集"与恢复冲突"的虚拟事务 id 数组(备机专用)。
+ *
+ * 【作用】热备中 startup 进程判定某清理动作与哪些备机查询冲突时调用:
+ * 返回所有"其快照可能还涉及给定 limitXmin 之前的数据"的后端 VXID,
+ * 数组末尾以哨兵(procNumber = INVALID_PROC_NUMBER)结尾。
+ *
+ * 【设计思想】
+ * - 判定条件:limitXmin 无效 = 杀掉所有人(不管有没有快照);有效时
+ *   只杀"xmin 已设置且不晚于 limitXmin"的后端。已提交事务的清理
+ *   记录只会出现在"比最老运行 xid 还早"的位置(见英文注释),因此
+ *   持 SHARED 锁、与并发取快照者共存是安全的:任何与我们并发的
+ *   快照都不会用我们正在判定的这批数据;
+ * - 跳过 prepared 事务(pid == 0):它们没有查询,不冲突;
+ * - dbOid 有效时只统计该库的后端;
+ * - 结果数组用 malloc 永久复用(频繁调用,避免反复分配),所以调用方
+ *   绝不能 pfree 它(见英文注释)。
+ *
+ * 【参数】
+ *   limitXmin —— 冲突判定水位(见上面设计思想);
+ *   dbOid     —— 只统计该数据库的后端;InvalidOid 表示全部。
+ * 【返回值】以哨兵结尾的 VXID 数组(静态存储,勿释放)。 */
 VirtualTransactionId *
 GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid)
 {
@@ -3450,6 +4395,25 @@ GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid)
  *
  * Returns true if the process was signaled, or false if not found.
  */
+/* (中文)给"阻塞恢复的进程"发送冲突信号(按 PGPROC 定位)。
+ *
+ * 【作用】热备冲突处理:确认 proc 仍对应 pid(防止 PGPROC 已被复用给
+ * 别的进程时误发信号),在它的 pendingRecoveryConflicts 位图中置上
+ * reason 对应位,再发 PROCSIG_RECOVERY_CONFLICT 信号唤醒它处理冲突。
+ *
+ * 【设计思想】
+ * - pid 冗余参数充当交叉校验:进程退出后 PGPROC 槽位可能被新进程
+ *   复用,若 proc->pid != pid 说明对象已换人,不发信号(正好是想要
+ *   的结果:阻塞者已消失);
+ * - 持 SHARED 锁保证 PGPROC 在检查与置位期间不被移除;
+ * - pendingRecoveryConflicts 用原子 fetch_or 置位,与目标进程自己的
+ *   读/清操作并发安全。
+ *
+ * 【参数】
+ *   proc   —— 目标 PGPROC;
+ *   pid    —— 预期进程 PID(交叉校验);
+ *   reason —— 冲突原因(决定置哪一位,也决定备机如何处理)。
+ * 【返回值】true = 信号已发出;false = 进程已不存在(未发)。 */
 bool
 SignalRecoveryConflict(PGPROC *proc, pid_t pid, RecoveryConflictReason reason)
 {
@@ -3480,6 +4444,20 @@ SignalRecoveryConflict(PGPROC *proc, pid_t pid, RecoveryConflictReason reason)
  *
  * Like SignalRecoveryConflict, but the target is identified by VXID
  */
+/* (中文)给"阻塞恢复的进程"发送冲突信号(按虚拟事务 id 定位)。
+ *
+ * 【作用】SignalRecoveryConflict 的 VXID 变体:遍历进程数组找 vxid
+ * 匹配的后端,置位并发送 PROCSIG_RECOVERY_CONFLICT。
+ *
+ * 【设计思想】vxid(procNumber + lxid)能唯一标定一个后端内的一次
+ * 事务;prepared 事务的 pid 为 0,不发送。返回是否有活的后端被信号
+ * 命中(pid != 0),供调用方判断冲突是否已解除。
+ *
+ * 【参数】
+ *   vxid   —— 目标事务的虚拟事务 id;
+ *   reason —— 冲突原因。
+ * 【返回值】true = 有活跃后端被发送信号;false = 目标不存在/是
+ *          prepared 事务。 */
 bool
 SignalRecoveryConflictWithVirtualXID(VirtualTransactionId vxid, RecoveryConflictReason reason)
 {
@@ -3525,6 +4503,20 @@ SignalRecoveryConflictWithVirtualXID(VirtualTransactionId vxid, RecoveryConflict
  *
  * Like SignalRecoveryConflict, but signals all backends using the database.
  */
+/* (中文)给"使用指定数据库的所有后端"发送恢复冲突信号。
+ *
+ * 【作用】DROP DATABASE / 需要把某库所有会话赶走时调用:遍历进程数组,
+ * 对所有 databaseId 匹配(或 databaseid 为 InvalidOid 即全体)的活跃
+ * 后端置位 pendingRecoveryConflicts 并发送 PROCSIG_RECOVERY_CONFLICT。
+ *
+ * 【设计思想】持 EXCLUSIVE 锁执行:这是一次"群体驱逐",期间不允许
+ * 新后端登记进数组;prepared 事务(pid == 0)不发送信号(它们没有
+ * 进程可收)。
+ *
+ * 【参数】
+ *   databaseid —— 目标数据库 OID;InvalidOid 表示所有数据库;
+ *   reason     —— 冲突原因。
+ * 【返回值】无。 */
 void
 SignalRecoveryConflictWithDatabase(Oid databaseid, RecoveryConflictReason reason)
 {
@@ -3572,6 +4564,23 @@ SignalRecoveryConflictWithDatabase(Oid databaseid, RecoveryConflictReason reason
  * Do not count backends that are blocked waiting for locks, since they are
  * not going to get to run until someone else commits.
  */
+/* (中文)统计"活跃事务数"是否超过阈值(启发式)。
+ *
+ * 【作用】提交路径判断"是否值得为等待刷新 WAL 而延迟一下"的启发式:
+ * 统计除自己以外、持有 xid、没有阻塞在锁上、且不是 prepared 事务的
+ * 后端数量,超过 min 即返回 true。
+ *
+ * 【设计思想】
+ * - 不加锁直接扫(速度优先):只判断字段的零/非零,且结果仅用于启发
+ *   式决策,容忍垃圾值。为防并发带来的脏读,遇到 pgprocno == -1
+ *   (被删除的条目)要跳过——有人刚减了 numProcs,数组尾部可能残留
+ *   -1(见英文注释);proc 指针指向的 PGPROC 即使已被回收,内容虽
+ *   无意义但指针仍合法,不影响本函数的安全;
+ * - 排除等锁的后端:它们要等别人提交后才能运行,对"是否值得延迟
+ *   WAL flush 以增加事务并发度"没有贡献(见英文注释)。
+ *
+ * 【参数】min —— 阈值;0 表示"无需计数",直接返回 true。
+ * 【返回值】true = 活跃事务数 >= min。 */
 bool
 MinimumActiveBackends(int min)
 {
@@ -3625,6 +4634,16 @@ MinimumActiveBackends(int min)
 /*
  * CountDBBackends --- count backends that are using specified database
  */
+/* (中文)统计正在使用指定数据库的后端数。
+ *
+ * 【作用】遍历进程数组,统计 databaseId 匹配的活跃后端(prepared 事务
+ * 占位不计)。databaseid 为 InvalidOid 时统计全部。
+ *
+ * 【设计思想】用于数据库管理(DROP DATABASE 前的检查等);计数在
+ * SHARED 锁内完成,保证与后端进出数组互斥。
+ *
+ * 【参数】databaseid —— 目标数据库 OID;InvalidOid 表示全部。
+ * 【返回值】匹配的后端数量。 */
 int
 CountDBBackends(Oid databaseid)
 {
@@ -3654,6 +4673,16 @@ CountDBBackends(Oid databaseid)
 /*
  * CountDBConnections --- counts database backends (only regular backends)
  */
+/* (中文)统计到指定数据库的"连接数"(只统计普通后端进程)。
+ *
+ * 【作用】与 CountDBBackends 类似,但额外要求 backendType == B_BACKEND:
+ * 后台工作者(bgworker)、辅助进程等不计入"连接"。
+ *
+ * 【设计思想】用于统计连接数相关的管理视图/限制逻辑,把"连接"限定
+ * 为真正的用户会话。
+ *
+ * 【参数】databaseid —— 目标数据库 OID;InvalidOid 表示全部。
+ * 【返回值】匹配的普通后端数量。 */
 int
 CountDBConnections(Oid databaseid)
 {
@@ -3686,6 +4715,15 @@ CountDBConnections(Oid databaseid)
  * CountUserBackends --- count backends that are used by specified user
  * (only regular backends, not any type of background worker)
  */
+/* (中文)统计属于指定用户的"会话数"(只统计普通后端进程)。
+ *
+ * 【作用】按 roleId 统计活跃的普通后端数量;prepared 事务占位与后台
+ * 工作者(backendType != B_BACKEND)不计入。
+ *
+ * 【设计思想】服务于连接/角色相关的管理限制(如角色连接数上限)。
+ *
+ * 【参数】roleid —— 目标角色 OID。
+ * 【返回值】匹配的普通后端数量。 */
 int
 CountUserBackends(Oid roleid)
 {
@@ -3738,6 +4776,27 @@ CountUserBackends(Oid roleid)
  * target DB before calling this, which is one reason we mustn't wait
  * indefinitely.
  */
+/* (中文)检查指定数据库是否还有"其他"后端在使用(最多等 5 秒)。
+ *
+ * 【作用】DROP DATABASE 的互斥检查:循环扫描(最多 50 次、每次间隔
+ * 100ms)目标库的后端;发现有 autovacuum 就发 SIGTERM 请它提前退出,
+ * 有可中断的 bgworker 就终止它们,然后等待再查。全部清空返回 false;
+ * 超时仍有人返回 true。
+ *
+ * 【设计思想】
+ * - 计数与发信号分离:kill() 可能在内核里阻塞,不能在持锁时调用,
+ *   所以先扫出 autovacuum 的 pid 列表、释放锁再逐个 SIGTERM(见英文
+ *   注释);TerminateBackgroundWorkersForDatabase 同样在锁外调用;
+ * - 为什么必须限时:调用方通常已持有目标库的排他锁(阻止新后端进入
+ *   也是它的事),无限等待会与其他持锁者死锁,详见英文注释;
+ * - 通过 *nbackends / *nprepared 输出两类阻塞者的数量,供调用方生成
+ *   错误信息;prepared 事务(pid == 0)无法被赶走,只能等待或报错。
+ *
+ * 【参数】
+ *   databaseId —— 目标数据库 OID;
+ *   nbackends  —— 输出:其他普通后端数;
+ *   nprepared  —— 输出:其他 prepared 事务数。
+ * 【返回值】true = 超时仍有冲突;false = 已无其他后端。 */
 bool
 CountOtherDBBackends(Oid databaseId, int *nbackends, int *nprepared)
 {
@@ -3831,6 +4890,24 @@ CountOtherDBBackends(Oid databaseId, int *nbackends, int *nprepared)
  * If the target database has a prepared transaction or permissions checks
  * fail for a connection, this fails without terminating anything.
  */
+/* (中文)强制终止指定数据库的所有连接(DROP DATABASE ... FORCE)。
+ *
+ * 【作用】先扫描收集目标库其他后端的 pid 与 prepared 事务数;有
+ * prepared 事务则直接报错(不能强杀,只能中止整条命令);然后做权限
+ * 检查(放宽了 pg_terminate_backend 的两条限制:允许杀 autovacuum、
+ * 允许杀 bgworker,见英文注释),最后对每个 pid 发 SIGTERM。
+ *
+ * 【设计思想】
+ * - 收集与执行分离:锁内只收集 pid 列表,锁外做权限判断与 kill,
+ *   避免长持锁(且 kill 可能在核内阻塞);
+ * - 先权限后动作:任一连接权限不足就整体失败、什么都不杀(见英文
+ *   注释);
+ * - 发信号前用 BackendPidGetProc 复核会话是否还在(两次遍历之间
+ *   会话可能退出,属可接受的竞态,见英文注释);
+ * - 有 setsid 时对整进程组发信号(-pid),确保该会话的子进程也退出。
+ *
+ * 【参数】databaseId —— 目标数据库 OID。
+ * 【返回值】无(有 prepared 事务或权限不足时 ereport(ERROR))。 */
 void
 TerminateOtherDBBackends(Oid databaseId)
 {
@@ -3946,6 +5023,23 @@ TerminateOtherDBBackends(Oid databaseId)
  * and HOT pruning from removing affected rows still needed by clients with
  * replication slots.
  */
+/* (中文)安装/更新复制槽要求的 xmin 下限。
+ *
+ * 【作用】复制槽管理器在槽位 xmin 变化时调用:把槽位要求的最老 xmin
+ * (数据与 catalog 两个水位)写入 procArray->replication_slot_xmin /
+ * replication_slot_catalog_xmin。此后 ComputeXidHorizons() 与
+ * GetSnapshotData() 都会把这两个值计入清理边界,防止 VACUUM 与 HOT
+ * 剪枝删掉复制客户端还需要的数据。
+ *
+ * 【设计思想】必须持 EXCLUSIVE 锁写入(除非调用方已持锁并传
+ * already_locked):两个字段要成对更新,读者(ComputeXidHorizons 等)
+ * 持 SHARED 锁读取,写读必须互斥;调用方如已持锁则省一次加解锁。
+ *
+ * 【参数】
+ *   xmin          —— 槽位要求的普通 xmin;
+ *   catalog_xmin  —— 槽位要求的 catalog xmin;
+ *   already_locked —— true 表示调用方已持 ProcArrayLock(EXCLUSIVE)。
+ * 【返回值】无。 */
 void
 ProcArraySetReplicationSlotXmin(TransactionId xmin, TransactionId catalog_xmin,
 								bool already_locked)
@@ -3971,6 +5065,16 @@ ProcArraySetReplicationSlotXmin(TransactionId xmin, TransactionId catalog_xmin,
  * Return the current slot xmin limits. That's useful to be able to remove
  * data that's older than those limits.
  */
+/* (中文)读取当前的复制槽 xmin 下限。
+ *
+ * 【作用】把 procArray 里的两个槽位水位读出(SHARED 锁内读取,与
+ * ProcArraySetReplicationSlotXmin 的写入互斥);输出参数可为 NULL
+ * (只取其中一项)。
+ *
+ * 【参数】
+ *   xmin         —— 输出:普通 xmin(可空);
+ *   catalog_xmin —— 输出:catalog xmin(可空)。
+ * 【返回值】无。 */
 void
 ProcArrayGetReplicationSlotXmin(TransactionId *xmin,
 								TransactionId *catalog_xmin)
@@ -3994,6 +5098,31 @@ ProcArrayGetReplicationSlotXmin(TransactionId *xmin,
  * the xids[] array (of length nxids) are removed from the subxids cache.
  * latestXid must be the latest XID among the group.
  */
+/* (中文)从本进程的子事务缓存中移除一批 xid(子事务中止时调用)。
+ *
+ * 【作用】子事务回滚时,把它(主 xid 参数 xid 或 xids[] 数组)从
+ * MyProc->subxids.xids[] 缓存中删掉(交换删除法:与数组末尾元素互换
+ * 再减计数),并同步 ProcGlobal->subxidStates;最后推进
+ * latestCompletedXid 与 xactCompletionCount。
+ *
+ * 【设计思想】
+ * - 为什么必须 EXCLUSIVE 锁:虽然只有本进程写自己的缓存,但"运行中
+ *   事务集合"的缩小必须对取快照者原子可见(同 ProcArrayEndTransaction
+ *   的理由,见英文注释与 access/transam/README);
+ * - 倒序删除避免 O(N^2):缓存按 xid 升序,而传入的 xids[] 也是升序,
+ *   两重倒序扫描让"要删的"总在尾部附近(见英文注释);
+ * - 交换删除(把最后一个元素搬到被删位置)使删除为 O(1),但缓存
+ *   不再有序——这不影响正确性,因为本进程读自己的缓存不依赖顺序;
+ * - pg_write_barrier 保证"计数递减"发生在"数组内容就绪"之后,与
+ *   取快照者的 pg_read_barrier 配对;
+ * - 找不到目标 xid 不报错只告警:缓存可能已溢出(丢失),或同一
+ *   子事务因 AbortSubTransaction 出错被调用了两次(见英文注释)。
+ *
+ * 【参数】
+ *   xid       —— 要删除的主 xid;
+ *   nxids、xids —— 额外要删除的子 xid 数组;
+ *   latestXid —— 本组中最大的 xid(推进 latestCompletedXid 用)。
+ * 【返回值】无。 */
 void
 XidCacheRemoveRunningXids(TransactionId xid,
 						  int nxids, const TransactionId *xids,
@@ -4082,6 +5211,9 @@ XidCacheRemoveRunningXids(TransactionId xid,
 /*
  * Print stats about effectiveness of XID cache
  */
+/* (中文)(仅 XIDCACHE_DEBUG)打印 TransactionIdIsInProgress() 各条
+ * 路径的命中统计(见文件头处九个计数器的中文注释)。后端退出时由
+ * ProcArrayRemove 调用,输出到 stderr,用于评估 xid 缓存的有效性。 */
 static void
 DisplayXidCache(void)
 {
@@ -4110,6 +5242,20 @@ DisplayXidCache(void)
  *
  * See comment for GlobalVisState for details.
  */
+/* (中文)取得与某张关系匹配的全局可见性状态(GlobalVisTest* 系列入口)。
+ *
+ * 【作用】按 GlobalVisHorizonKindForRel 的关系分类,返回四份
+ * GlobalVisState 中对应的一份(共享表/目录/数据表/临时表),供后续
+ * 可删除性判定使用。rel == NULL 返回最保守的共享表状态。
+ *
+ * 【设计思想】
+ * - 必须在"快照已激活或已登记"期间调用:边界值的有效性依赖当前
+ *   快照上下文,否则有回绕等危险(见英文注释);
+ * - 进程退出时四份状态由 GetSnapshotData / ComputeXidHorizons 持续
+ *   维护,这里只是取用指针。
+ *
+ * 【参数】rel —— 目标关系;NULL 表示最保守状态。
+ * 【返回值】对应状态的指针。 */
 GlobalVisState *
 GlobalVisTestFor(Relation rel)
 {
@@ -4150,6 +5296,21 @@ GlobalVisTestFor(Relation rel)
  * since the last update. If the oldest currently running transaction has not
  * finished, it is unlikely that recomputing the horizon would be useful.
  */
+/* (中文)判断"是否值得用 ComputeXidHorizons() 精确重算水位"。
+ *
+ * 【作用】返回 true 时,调用方(GlobalVisTestIsRemovableFullXid)会
+ * 做一次精确重算;false 则沿用现有边界。启发式三条:
+ * 1. 从未重算过(ComputeXidHorizonsResultLastXmin 无效):值得算一次;
+ * 2. maybe_needed 已经追上 definitely_needed:两个边界重合,没有
+ *   悬而未决的区间,重算无益;
+ * 3. 最近一次构造快照的 xmin 与上次重算时相同:最老的事务还没结束,
+ *   重算多半不会改变答案。
+ *
+ * 【设计思想】精确重算要加锁扫全数组,代价不小;而只有"最老活跃
+ * 事务消失"才可能让边界前进,用 RecentXmin 当代理指标非常廉价。
+ *
+ * 【参数】state —— 目标 GlobalVisState(读它的两个边界比较)。
+ * 【返回值】true = 值得重算。 */
 static bool
 GlobalVisTestShouldUpdate(GlobalVisState *state)
 {
@@ -4169,6 +5330,23 @@ GlobalVisTestShouldUpdate(GlobalVisState *state)
 	return RecentXmin != ComputeXidHorizonsResultLastXmin;
 }
 
+/* (中文)把 ComputeXidHorizons() 的精确结果应用到四份 GlobalVisState
+ * 的边界上。
+ *
+ * 【作用】ComputeXidHorizons 收尾时调用(它持有全部精确水位):
+ * 把 shared/catalog/data/temp 各自的老边界(shared_oldest_nonremovable
+ * 等)换算成 FullTransactionId 写入对应状态的 maybe_needed;再把
+ * definitely_needed 向前推进到至少不低于 maybe_needed(长时间运行的
+ * 事务中,之前需要保守对待的 xid 可能已全部结束),最后记录本次重算
+ * 时的 RecentXmin(供 GlobalVisTestShouldUpdate 使用)。
+ *
+ * 【设计思想】
+ * - maybe_needed 与 definitely_needed 的语义见 GlobalVisState 注释:
+ *   精确值更新下界,上界只允许前进不允许后退(FullTransactionIdNewer);
+ * - 换算基准用精确计算时的 latest_completed,保证 64 位表示一致。
+ *
+ * 【参数】horizons —— ComputeXidHorizons 的精确结果。
+ * 【返回值】无(副作用:更新四份全局状态)。 */
 static void
 GlobalVisUpdateApply(ComputeXidHorizonsResult *horizons)
 {
@@ -4208,6 +5386,14 @@ GlobalVisUpdateApply(ComputeXidHorizonsResult *horizons)
  * Update boundaries in GlobalVis{Shared,Catalog, Data}Rels
  * using ComputeXidHorizons().
  */
+/* (中文)用一次精确水位计算更新四份 GlobalVisState 的边界。
+ *
+ * 【作用】GlobalVisTestIsRemovableFullXid 判定"落在不确定区间"时
+ * 调用:执行 ComputeXidHorizons(),其副作用(经 GlobalVisUpdateApply)
+ * 即更新边界,使本次判定能以新边界重查。
+ *
+ * 【参数】无。
+ * 【返回值】无。 */
 static void
 GlobalVisUpdate(void)
 {
@@ -4230,6 +5416,28 @@ GlobalVisUpdate(void)
  *
  * See comment for GlobalVisState for details.
  */
+/* (中文)GlobalVisTest 核心判定:fxid 是否已不被任何快照视为运行
+ * (即其效果对所有人可见,可安全清理)。
+ *
+ * 【作用】三级判定:
+ * 1. fxid < maybe_needed:必已对所有人可见,返回 true;
+ * 2. fxid >= definitely_needed:极可能仍被视为运行,返回 false;
+ * 3. 落在两边界之间(不确定):若允许更新(allow_update)且启发式
+ *    认为值得(GlobalVisTestShouldUpdate),就精确重算边界
+ *    (GlobalVisUpdate)后按新边界重判——重算后 fxid 必然 <
+ *    definitely_needed(断言),答案由 maybe_needed 决定;否则
+ *    保守返回 false。
+ *
+ * 【设计思想】这就是"用廉价近似 + 按需精确化"的两级策略:绝大多数
+ * 判定落在边界外,零开销;只有少数不确定样本才付出加锁扫数组的代价,
+ * 且用 GlobalVisTestShouldUpdate 限制重算频率(见英文注释)。
+ *
+ * 【参数】
+ *   state        —— 与 fxid 来源关系匹配的状态(错配会给出错误答案);
+ *   fxid         —— 要判定的完整事务 id;
+ *   allow_update —— false 时不更新边界(需要基于当前边界的保守答案
+ *                   的调用方使用)。
+ * 【返回值】true = 没有任何快照把 fxid 视为运行。 */
 bool
 GlobalVisTestIsRemovableFullXid(GlobalVisState *state,
 								FullTransactionId fxid,
@@ -4273,6 +5481,22 @@ GlobalVisTestIsRemovableFullXid(GlobalVisState *state,
  * protects against xid wraparounds (e.g. from a table and thus protected by
  * relfrozenxid).
  */
+/* (中文)GlobalVisTestIsRemovableFullXid 的 32 位 xid 包装。
+ *
+ * 【作用】把 32 位 xid 参照 state->definitely_needed(基于快照构造时
+ * 的 [oldestXid, nextXid) 区间)换算成 FullTransactionId 后调用
+ * 64 位版本。
+ *
+ * 【设计思想】换算(FULLXID 的"相对 xid 增量加回基准")只在 xid 与
+ * 基准的差落在 ±2^31 内才可靠——函数的前提条件正是"xid 来自受回绕
+ * 保护的地方",例如表里由 relfrozenxid 保证的 xid(见英文注释);
+ * 不取锁而直接用边界当基准,是"快照上下文有效"这一约定换来的。
+ *
+ * 【参数】
+ *   state        —— 状态(兼作换算基准);
+ *   xid          —— 要判定的 32 位事务 id;
+ *   allow_update —— 透传给 64 位版本。
+ * 【返回值】true = 没有任何快照把 xid 视为运行。 */
 bool
 GlobalVisTestIsRemovableXid(GlobalVisState *state, TransactionId xid,
 							bool allow_update)
@@ -4311,6 +5535,21 @@ GlobalVisTestIsRemovableXid(GlobalVisState *state, TransactionId xid,
  * See the comment above GlobalVisTestIsRemovable[Full]Xid() for details on
  * the required preconditions for calling this function.
  */
+/* (中文)GlobalVisTest 的"是否仍被视为运行"变体(判活元组的插入者)。
+ *
+ * 【作用】GlobalVisTestIsRemovableXid 的取反:true = 至少有一个快照
+ * 可能把该 xid 视为运行。适用于检查"活元组的插入事务是否还在跑"
+ * ——活元组本身不可删,但"事务是否运行"的判定标准与删除场景完全
+ * 相同(见英文注释)。
+ *
+ * 【设计思想】只回答"运行与否"这一语义问题,不判断元组可见性:调用
+ * 方仍需自行结合 xid 的提交状态做完整可见性判定(见英文注释)。
+ *
+ * 【参数】
+ *   state        —— 与来源关系匹配的状态;
+ *   xid          —— 要判定的 xid;
+ *   allow_update —— true 时允许更新边界,false 时绝不更新。
+ * 【返回值】true = 可能仍被视为运行。 */
 bool
 GlobalVisTestXidConsideredRunning(GlobalVisState *state, TransactionId xid,
 								  bool allow_update)
@@ -4322,6 +5561,15 @@ GlobalVisTestXidConsideredRunning(GlobalVisState *state, TransactionId xid,
  * Convenience wrapper around GlobalVisTestFor() and
  * GlobalVisTestIsRemovableFullXid(), see their comments.
  */
+/* (中文)便捷包装:按关系取状态后判定 64 位 xid 是否可删。
+ *
+ * 【作用】GlobalVisTestFor(rel) + GlobalVisTestIsRemovableFullXid
+ * (允许更新边界)一步到位,供"关系已知"的调用方使用。
+ *
+ * 【参数】
+ *   rel  —— 目标关系;
+ *   fxid —— 要判定的完整事务 id。
+ * 【返回值】true = 可安全删除(无快照视为运行)。 */
 bool
 GlobalVisCheckRemovableFullXid(Relation rel, FullTransactionId fxid)
 {
@@ -4336,6 +5584,16 @@ GlobalVisCheckRemovableFullXid(Relation rel, FullTransactionId fxid)
  * Convenience wrapper around GlobalVisTestFor() and
  * GlobalVisTestIsRemovableXid(), see their comments.
  */
+/* (中文)便捷包装:按关系取状态后判定 32 位 xid 是否可删。
+ *
+ * 【作用】GlobalVisTestFor(rel) + GlobalVisTestIsRemovableXid(允许
+ * 更新边界)一步到位;前提条件与 64 位版本相同(xid 须来自防回绕
+ * 的来源)。
+ *
+ * 【参数】
+ *   rel —— 目标关系;
+ *   xid —— 要判定的事务 id。
+ * 【返回值】true = 可安全删除(无快照视为运行)。 */
 bool
 GlobalVisCheckRemovableXid(Relation rel, TransactionId xid)
 {
@@ -4357,6 +5615,23 @@ GlobalVisCheckRemovableXid(Relation rel, TransactionId xid)
  * the xid has to be within that range), or if xid is from the procarray and
  * prevents xid wraparound that way.
  */
+/* (中文)把 32 位事务 id 按"相对差"换算成 64 位 FullTransactionId。
+ *
+ * 【作用】给定 64 位基准 rel,假设 xid 与 XidFromFullTransactionId(rel)
+ * 的差在 ±2^31 之内(即在 32 位事务空间的"半圈"内),用
+ * (rel 的 64 位值 + (int32)(xid - rel_xid)) 恢复 xid 的完整 64 位
+ * 表示。这是把 32 位 xid 安全提升到 64 位、避免回绕歧义的标准手法
+ * (数学上:64 位值单调递增,相对差把符号位一并带回来)。
+ *
+ * 【设计思想】使用条件极其严格:仅当调用方能保证 xid 与 rel 相距
+ * 不超过 MaxTransactionId/2 时可用——例如持有快照时表里的 xid(受
+ * VACUUM 冻结保证)、或来自进程数组的 xid(数组本身限制回绕)。
+ * 函数内有 AssertTransactionIdInAllowableRange 兜底检查。
+ *
+ * 【参数】
+ *   rel —— 64 位基准(当前时刻的某个已知 FullTransactionId);
+ *   xid —— 32 位事务 id(须有效)。
+ * 【返回值】换算后的 64 位 FullTransactionId。 */
 static inline FullTransactionId
 FullXidRelativeTo(FullTransactionId rel, TransactionId xid)
 {
@@ -4427,6 +5702,30 @@ FullXidRelativeTo(FullTransactionId rel, TransactionId xid)
  * XLOG_RUNNING_XACTS arrives, to forestall possible overflow of the
  * array due to such dead XIDs.
  */
+/* (中文)【KnownAssignedXids 子模块(中文)】
+ * 热备模式下,备机用本子模块模拟"主库上正在运行的事务集合"。
+ *
+ * 思路(详见上方英文注释):xid 按序分配、不留空隙,因此只要观察到
+ * 某个 xid,就能推断"它之前的连续区间内所有未观察到的 xid"也已被
+ * 分配;把这些"已知已分配"的 xid 都当作"可能仍在运行",就能保证
+ * 备机快照不会把主库还在跑的事务误判为已完成。数组随观察到的
+ * WAL 记录生长(RecordKnownAssignedTransactionIds),随事务完成记录
+ * 收缩(ExpireTreeKnownAssignedTransactionIds 等),还定期用主库的
+ * RUNNING_XACTS 快照修剪(ProcArrayApplyRecoveryInfo),防止主库进程
+ * 崩溃未写 abort 记录导致的永久残留与溢出。
+ *
+ * 数据结构与算法(详见 KnownAssignedXidsCompress 前的英文注释):
+ * - KnownAssignedXids[] 保持 TransactionIdPrecedes 逻辑序(二分查找
+ *   的前提;只要数组跨度不超过半个 xid 空间,该比较就是全序);
+ * - 删除用"标记无效"实现(平行数组 KnownAssignedXidsValid[]),制造
+ *   空洞换取 O(1) 删除;head/tail 指针标定有效区间 [tail, head),
+ *   空洞定期压缩(KnownAssignedXidsCompress),避免回绕;
+ * - 添加通常无需加锁(只有 startup 进程写),靠写屏障让读者先看到
+ *   数组内容再看到 head 前进;删除/压缩须持 EXCLUSIVE 锁,读取须持
+ *   SHARED 锁。
+ * 性能特征:添加 O(1)、删除 O(logS)、压缩 O(S)、快照拷贝 O(S),
+ * 而 S(数组占用)被"压缩启发式 S >= 2N 即压缩"约束在 2N 内。
+ */
 
 /*
  * RecordKnownAssignedTransactionIds
@@ -4439,6 +5738,29 @@ FullXidRelativeTo(FullTransactionId rel, TransactionId xid)
  *
  * Called during recovery in analogy with and in place of GetNewTransactionId()
  */
+/* (中文)登记"已知已分配"的 xid(热备中,凡是事务相关的 WAL 记录
+ * 到达都要调用,见英文注释)。
+ *
+ * 【作用】把 xid 及其之前"推断已分配"的连续区间全部收入
+ * KnownAssignedXids,并推进 latestObservedXid:
+ * - 若 xid <= latestObservedXid:早已知晓,无事可做;
+ * - 否则:先把 pg_subtrans 无缝隙扩展到 xid(与正常流程
+ *   GetNewTransactionId 的做法对应;clog 不用扩,其扩展已 WAL 日志
+ *   化),再把 (latestObservedXid, xid] 整段加入数组,更新
+ *   latestObservedXid,并推进 nextXid 至少到最新观察值。
+ *
+ * 【设计思想】
+ * - "推断已分配"是正确性关键:主库可能跳过中间 xid 的记录(例如
+ *   崩溃后提交记录不完整),不补全会让这些 xid 在快照里"凭空消失",
+ *   违反无空隙分配的前提(见英文注释);
+ * - 数组尚未建立(STANDBY_INITIALIZED 及以前)时只推进
+ *   latestObservedXid 并扩 subtrans,等 ProcArrayApplyRecoveryInfo
+ *   建立数组后再补登记(它内部会做同样的扩展);
+ * - 加锁要求:KnownAssignedXidsAdd 无锁执行(只有 startup 进程写),
+ *   靠内存屏障保证读者可见性。
+ *
+ * 【参数】xid —— 刚观察到的事务 xid(须有效)。
+ * 【返回值】无。 */
 void
 RecordKnownAssignedTransactionIds(TransactionId xid)
 {
@@ -4508,6 +5830,22 @@ RecordKnownAssignedTransactionIds(TransactionId xid)
  *
  * Called during recovery in analogy with and in place of ProcArrayEndTransaction()
  */
+/* (中文)热备中事务结束时,把该事务整棵树(主 xid + 子 xid)从
+ * KnownAssignedXids 中移除(ProcArrayEndTransaction 的恢复期对应)。
+ *
+ * 【作用】持 EXCLUSIVE 锁删除主 xid 与所有子 xid,再像正常提交那样
+ * 推进 latestCompletedXid(恢复版本)与 xactCompletionCount。
+ *
+ * 【设计思想】与正常提交完全相同的"原子性":删除"正在运行集合"条目
+ * 与推进"最新完成事务"必须对取快照者同时可见,否则备机快照会看到
+ * 相互矛盾的状态。xactCompletionCount 的递增同样是为了快照复用判定
+ * (见 ProcArrayEndTransaction 注释)。
+ *
+ * 【参数】
+ *   xid     —— 顶层事务 xid(可为 InvalidTransactionId,表示只有子事务);
+ *   nsubxids、subxids —— 子事务数量与数组;
+ *   max_xid —— 本组中最大 xid(推进 latestCompletedXid 用)。
+ * 【返回值】无。 */
 void
 ExpireTreeKnownAssignedTransactionIds(TransactionId xid, int nsubxids,
 									  TransactionId *subxids, TransactionId max_xid)
@@ -4534,6 +5872,20 @@ ExpireTreeKnownAssignedTransactionIds(TransactionId xid, int nsubxids,
  * ExpireAllKnownAssignedTransactionIds
  *		Remove all entries in KnownAssignedXids and reset lastOverflowedXid.
  */
+/* (中文)清空整个 KnownAssignedXids 并把相关水位复位。
+ *
+ * 【作用】恢复结束(进入正常运行时)调用:删除全部条目、把
+ * latestCompletedXid 复位为 nextXid - 1(此后所有快照的 xmax 不再
+ * 包含恢复期事务)、推进 xactCompletionCount(清空中所有事务都相当于
+ * "结束")、复位 lastOverflowedXid。
+ *
+ * 【设计思想】从恢复切换到正常运行时,备机的进程数组开始承担职责,
+ * KnownAssignedXids 使命完成;lastOverflowedXid 虽已无用处,仍复位
+ * 以与 ExpireOldKnownAssignedTransactionIds 的行为保持一致(见英文
+ * 注释)。
+ *
+ * 【参数】无。
+ * 【返回值】无。 */
 void
 ExpireAllKnownAssignedTransactionIds(void)
 {
@@ -4568,6 +5920,22 @@ ExpireAllKnownAssignedTransactionIds(void)
  *		Remove KnownAssignedXids entries preceding the given XID and
  *		potentially reset lastOverflowedXid.
  */
+/* (中文)修剪 KnownAssignedXids:删除所有早于给定 xid 的条目。
+ *
+ * 【作用】收到主库 RUNNING_XACTS 快照时调用(见
+ * ProcArrayApplyRecoveryInfo):以 oldestRunningXid 为界,把比它还老
+ * 的条目全部标为无效(能保留的"还可能在运行"的 xid 只可能是比它新
+ * 的),并顺带推进 latestCompletedXid 与 xactCompletionCount。若
+ * lastOverflowedXid 也早于该 xid,说明所有"曾丢失子事务"的 xid 都
+ * 已被跨越,可以安全复位 lastOverflowedXid(否则快照会被多余地标记
+ * 为子事务溢出,见英文注释)。
+ *
+ * 【设计思想】这就是防 KnownAssignedXids 无限膨胀的"消毒"手段:
+ * 主库进程崩溃可能留下没有 abort 记录的僵尸事务,只有主库的快照能
+ * 证明它们早已消失。
+ *
+ * 【参数】xid —— 修剪水位:所有 < xid 的条目被删除。
+ * 【返回值】无。 */
 void
 ExpireOldKnownAssignedTransactionIds(TransactionId xid)
 {
@@ -4600,6 +5968,16 @@ ExpireOldKnownAssignedTransactionIds(TransactionId xid)
  *		Opportunistically do maintenance work when the startup process
  *		is about to go idle.
  */
+/* (中文)startup 进程即将空闲时,机会式地做 KnownAssignedXids 维护。
+ *
+ * 【作用】热备中 WAL 消费暂时耗尽(即将休眠等待新记录)时调用:触发
+ * 一次"空闲压缩"(KAX_STARTUP_PROCESS_IDLE)。空闲期间反正没有新 xid
+ * 到来,压缩不会干扰正常添加;通过限制压缩频率(至少间隔 1 秒)避免
+ * 与快照读者频繁争用 ProcArrayLock(见 KnownAssignedXidsCompress 的
+ * 英文注释)。
+ *
+ * 【参数】无。
+ * 【返回值】无。 */
 void
 KnownAssignedTransactionIdsIdleMaintenance(void)
 {
@@ -4701,6 +6079,30 @@ KnownAssignedTransactionIdsIdleMaintenance(void)
  * Compression requires holding ProcArrayLock in exclusive mode.
  * Caller must pass haveLock = true if it already holds the lock.
  */
+/* (中文)压缩 KnownAssignedXids:把 [tail, head) 中仍有效的条目紧挨着
+ * 搬到数组头部,消除因"标记无效式删除"积累的空洞。
+ *
+ * 【作用】按 reason 决定是否真的压缩:
+ * - KAX_NO_SPACE:必须压缩(数组尾部放不下新 xid);
+ * - KAX_TRANSACTION_END:每 128 次事务结束才考虑一次,且仅当数组
+ *   占用 S >= 2N(有效条目数 N,空洞占了一半以上)时压缩;
+ * - KAX_PRUNE:批量修剪后顺手压缩;
+ * - KAX_STARTUP_PROCESS_IDLE:空闲时压缩,但距上次压缩不足 1 秒则
+ *   跳过(避免频繁争锁)。
+ * 压缩后 head/tail 归零、numKnownAssignedXids 不变。
+ *
+ * 【设计思想】
+ * - 延迟压缩的取舍:立即压缩是 O(S),会把删除的成本从 O(logS) 摊成
+ *   O(S);而"只在快照与添加真的受影响时再压缩"让 S 稳定在 2N 以内,
+ *   快照拷贝的上界因此是 O(N)(算法分析见上方英文注释);
+ * - 为什么必须 EXCLUSIVE 锁:压缩要整体搬移数组,读者必须在锁外
+ *   观察不到中间状态;
+ * - 只有 startup 进程写 head/tail,所以压缩前读它们无需加锁。
+ *
+ * 【参数】
+ *   reason   —— 压缩触发原因(KAXCompressReason 枚举);
+ *   haveLock —— true 表示调用方已持 ProcArrayLock EXCLUSIVE。
+ * 【返回值】无。 */
 static void
 KnownAssignedXidsCompress(KAXCompressReason reason, bool haveLock)
 {
@@ -4818,6 +6220,28 @@ KnownAssignedXidsCompress(KAXCompressReason reason, bool haveLock)
  * concurrent readers.  (Only the startup process ever calls this, so no need
  * to worry about concurrent writers.)
  */
+/* (中文)把 [from_xid, to_xid] 闭区间内的一串连续 xid 追加到
+ * KnownAssignedXids 数组头部(添加原语)。
+ *
+ * 【作用】先算区间长度 nxids,若放不下就先压缩(KAX_NO_SPACE);然后
+ * 从 head 处顺序写入 xid 与有效标志,推进 numKnownAssignedXids 与
+ * head 指针。要求插入严格递增(from_xid 必须大于等于数组中最后一个
+ * 元素,即便那个元素已标记无效,违者报错并打印数组供调试)。
+ *
+ * 【设计思想】
+ * - 无锁添加 + 内存屏障:只有 startup 进程写数组,不存在写写竞争;
+ *   读者(持 SHARED 锁或干脆无锁读取)依赖"先看到数组内容、再看到
+ *   head 前进"的顺序,因此 !exclusive_lock 时用 pg_write_barrier
+ *   保证该顺序(见英文注释);
+ * - exclusive_lock 参数:调用方已持 EXCLUSIVE 锁时(例如
+ *   ProcArrayApplyRecoveryInfo 批量装载),屏障可省且压缩时不再重复
+ *   加锁。
+ *
+ * 【参数】
+ *   from_xid —— 区间起点(含);
+ *   to_xid   —— 区间终点(含),须 >= from_xid;
+ *   exclusive_lock —— true 表示调用方已持 EXCLUSIVE 锁。
+ * 【返回值】无。数组容量不足且压缩后仍放不下时报错。 */
 static void
 KnownAssignedXidsAdd(TransactionId from_xid, TransactionId to_xid,
 					 bool exclusive_lock)
@@ -4922,6 +6346,26 @@ KnownAssignedXidsAdd(TransactionId from_xid, TransactionId to_xid,
  * Caller must hold ProcArrayLock in shared or exclusive mode.
  * Exclusive lock must be held for remove = true.
  */
+/* (中文)在 KnownAssignedXids 中查找(并可选地删除)指定 xid。
+ *
+ * 【作用】标准二分查找:在 [tail, head) 内用 TransactionIdPrecedes
+ * 折半定位 xid;找到且有效(remove 时)则标记为无效、递减计数,若删
+ * 的是 tail 元素则顺带把 tail 前移到下一个有效元素(数组空则双指针
+ * 归零)。返回是否"找到且有效"。
+ *
+ * 【设计思想】
+ * - 二分查找可以无视有效标志:无效条目只是"标记过",xid 值本身仍
+ *   按序摆放,数组整体保持有序(见英文注释);
+ * - 删除用"标无效"而非物理删除,保持 O(logS) 而不是 O(S);
+ * - 读者(remove == false)要先 pg_read_barrier 再读,与
+ *   KnownAssignedXidsAdd 的写屏障配对;删除方(remove == true)只
+ *   有 startup 进程,无需该屏障;
+ * - tail 的前移是启发式加速:tail 处聚集的无效条目不必留到下次压缩。
+ *
+ * 【参数】
+ *   xid    —— 要查找的 xid;
+ *   remove —— true 时执行删除(调用方必须持 EXCLUSIVE 锁)。
+ * 【返回值】true = 找到且条目有效(若 remove,已删除)。 */
 static bool
 KnownAssignedXidsSearch(TransactionId xid, bool remove)
 {
@@ -5010,6 +6454,13 @@ KnownAssignedXidsSearch(TransactionId xid, bool remove)
  *
  * Caller must hold ProcArrayLock in shared or exclusive mode.
  */
+/* (中文)查询指定 xid 是否在 KnownAssignedXids 中(仅查询,不删除)。
+ *
+ * 【作用】TransactionIdIsInProgress 的热备路径入口:命中即说明主库
+ * 上该事务仍可能运行。实现即 KnownAssignedXidsSearch(xid, false)。
+ *
+ * 【参数】xid —— 要查询的 xid(须有效)。
+ * 【返回值】true = 存在且有效。 */
 static bool
 KnownAssignedXidExists(TransactionId xid)
 {
@@ -5023,6 +6474,17 @@ KnownAssignedXidExists(TransactionId xid)
  *
  * Caller must hold ProcArrayLock in exclusive mode.
  */
+/* (中文)从 KnownAssignedXids 中删除单个 xid。
+ *
+ * 【作用】KnownAssignedXidsSearch(xid, true) 的薄封装(忽略返回值)。
+ *
+ * 【设计思想】找不到不算错误:处理 XLOG_XACT_ASSIGNMENT 时会故意先
+ * 删掉子 xid(防数组溢出),顶层事务提交/中止时它们会再被删一次,因此
+ * 第二次删除必然落空(见英文注释);区分"真错误"需要额外记账,不值
+ * 得。
+ *
+ * 【参数】xid —— 要删除的 xid(须有效)。
+ * 【返回值】无。 */
 static void
 KnownAssignedXidsRemove(TransactionId xid)
 {
@@ -5049,6 +6511,18 @@ KnownAssignedXidsRemove(TransactionId xid)
  *
  * Caller must hold ProcArrayLock in exclusive mode.
  */
+/* (中文)从 KnownAssignedXids 中删除一整棵事务树(主 xid + 全部子 xid)。
+ *
+ * 【作用】先删主 xid(若有效)再逐个删子 xid,最后机会式地压缩一次
+ * (KAX_TRANSACTION_END:带频率与空洞比例的启发式)。
+ *
+ * 【设计思想】事务结束时"整树消失"是一次原子事件,压缩与删除在同
+ * 一 EXCLUSIVE 锁区间内完成,读者不会看到半删除状态。
+ *
+ * 【参数】
+ *   xid     —— 顶层事务 xid(可为 InvalidTransactionId);
+ *   nsubxids、subxids —— 子事务数量与数组。
+ * 【返回值】无。 */
 static void
 KnownAssignedXidsRemoveTree(TransactionId xid, int nsubxids,
 							TransactionId *subxids)
@@ -5071,6 +6545,23 @@ KnownAssignedXidsRemoveTree(TransactionId xid, int nsubxids,
  *
  * Caller must hold ProcArrayLock in exclusive mode.
  */
+/* (中文)修剪 KnownAssignedXids:删除所有 < removeXid 的条目
+ * (removeXid 无效时清空整张表)。
+ *
+ * 【作用】从 tail 顺序扫描,凡是 xid < removeXid 的条目标记无效
+ * (prepared 事务除外,见设计思想);更新计数与 tail 指针(顺带把
+ * 连续无效的头部一起吃掉;表空则双指针归零);最后机会式压缩
+ * (KAX_PRUNE)。
+ *
+ * 【设计思想】
+ * - 数组有序,扫描到第一个 >= removeXid 的条目即可停止;
+ * - 跳过 prepared 事务(StandbyTransactionIdIsPrepared):它们是
+ *   两阶段提交的事务,尚未结束,不能当过期条目修剪;
+ * - 与 KnownAssignedXidsSearch 的"单点删除"互补:这里是一次性
+ *   批量删除,用于主库 RUNNING_XACTS 快照到达时的整体梳理。
+ *
+ * 【参数】removeXid —— 修剪水位(不含);InvalidTransactionId = 清空。
+ * 【返回值】无。 */
 static void
 KnownAssignedXidsRemovePreceding(TransactionId removeXid)
 {
@@ -5149,6 +6640,18 @@ KnownAssignedXidsRemovePreceding(TransactionId removeXid)
  *
  * Caller must hold ProcArrayLock in (at least) shared mode.
  */
+/* (中文)把 KnownAssignedXids 中小于 xmax 的全部 xid 拷出到调用方数组。
+ *
+ * 【作用】TransactionIdIsInProgress 的步骤 3(热备、数组溢出时)使用:
+ * 收集所有 < xid 的 KnownAssignedXids 条目——若目标 xid 是子事务,
+ * 它的父事务必然更小,正好从这批候选中继续查。xmin 输出参数用
+ * 一个临时变量承接(不关心),实际逻辑全部委托给
+ * KnownAssignedXidsGetAndSetXmin。
+ *
+ * 【参数】
+ *   xarray —— 输出:拷贝的 xid 数组(容量须足够);
+ *   xmax   —— 过滤水位:>= xmax 的不拷贝。
+ * 【返回值】拷出的 xid 数量。 */
 static int
 KnownAssignedXidsGet(TransactionId *xarray, TransactionId xmax)
 {
@@ -5163,6 +6666,26 @@ KnownAssignedXidsGet(TransactionId *xarray, TransactionId xmax)
  *
  * Caller must hold ProcArrayLock in (at least) shared mode.
  */
+/* (中文)KnownAssignedXidsGet 的增强版:拷贝的同时把 xmin 下压到
+ * 所见最小 xid。
+ *
+ * 【作用】GetSnapshotData 的热备路径调用:把所有有效条目(< xmax)
+ * 拷入 subxip 数组,并让 xmin 不高于数组中第一个(即最小的)有效
+ * xid——数组有序,只检查第一个拷贝的条目即可。
+ *
+ * 【设计思想】
+ * - head 只读一次:持有 SHARED 锁期间,条目只会"从有效变无效"
+ *   (startup 进程删除)或"在 head 处新增";新增的 xid >= xmax(主库
+ *   快照的 xmax 之外),对结果无影响,读到旧的 head 就够了(见英文
+ *   注释);
+ * - 有效性判断跳过"空洞";过滤 >= xmax 的条目同样利用有序性提前
+ *   break。
+ *
+ * 【参数】
+ *   xarray —— 输出:xid 数组(容量须足够);
+ *   xmin   —— 输入输出:初始 xmin,被下压到所见最小值;
+ *   xmax   —— 过滤水位。
+ * 【返回值】拷出的 xid 数量。 */
 static int
 KnownAssignedXidsGetAndSetXmin(TransactionId *xarray, TransactionId *xmin,
 							   TransactionId xmax)
@@ -5219,6 +6742,17 @@ KnownAssignedXidsGetAndSetXmin(TransactionId *xarray, TransactionId *xmin,
  * Get oldest XID in the KnownAssignedXids array, or InvalidTransactionId
  * if nothing there.
  */
+/* (中文)返回 KnownAssignedXids 中最老的 xid。
+ *
+ * 【作用】ComputeXidHorizons 在恢复期调用:备机的"运行事务下界"需要
+ * 用 KnownAssignedXids 的最老条目补充(数组有序,第一个有效条目就是
+ * 最老)。数组为空返回 InvalidTransactionId。
+ *
+ * 【设计思想】head/tail 的读取加读屏障与 KnownAssignedXidsAdd 配对;
+ * 由持 SHARED 锁的调用方使用,保证扫描期间数组不被删除。
+ *
+ * 【参数】无。
+ * 【返回值】最老的有效 xid,或 InvalidTransactionId。 */
 static TransactionId
 KnownAssignedXidsGetOldestXmin(void)
 {
@@ -5254,6 +6788,16 @@ KnownAssignedXidsGetOldestXmin(void)
  * even if the elog message will get discarded.  It's not currently called
  * in any performance-critical places, however, so no need to be tenser.
  */
+/* (中文)把 KnownAssignedXids 的当前内容拼成一条日志输出(调试用)。
+ *
+ * 【作用】在指定 trace_level 打印有效条目数、数组控制字段与每个
+ * 有效条目 [下标]=xid 的清单。
+ *
+ * 【设计思想】只在 startup 进程内调用,无需加锁;构造字符串本身
+ * 有成本,但调用点都不在性能关键路径上(见英文注释)。
+ *
+ * 【参数】trace_level —— elog 级别(如 DEBUG3、LOG)。
+ * 【返回值】无。 */
 static void
 KnownAssignedXidsDisplay(int trace_level)
 {
@@ -5292,6 +6836,16 @@ KnownAssignedXidsDisplay(int trace_level)
  * KnownAssignedXidsReset
  *		Resets KnownAssignedXids to be empty
  */
+/* (中文)把 KnownAssignedXids 重置为空表。
+ *
+ * 【作用】ProcArrayApplyRecoveryInfo 在丢弃旧快照、换用新快照前调用:
+ * 持 EXCLUSIVE 锁把计数与 head/tail 全部归零。
+ *
+ * 【设计思想】只复位指针与计数、不清数组内容:旧内容被 head/tail
+ * 区间自然屏蔽,下一次添加会直接覆盖(数组有序性由新添加保证)。
+ *
+ * 【参数】无。
+ * 【返回值】无。 */
 static void
 KnownAssignedXidsReset(void)
 {

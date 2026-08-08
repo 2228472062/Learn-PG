@@ -36,6 +36,33 @@
  *
  * As ever, Windows requires its own implementation.
  *
+ * 【模块总览(中文)】
+ * 本文件是"动态共享内存(DSM)"的平台层实现:它只负责最原始的系统
+ * 调用,不管理引用计数、不自动清理(那是 dsm.c 的事)。它提供四种
+ * 实现,由 GUC dynamic_shared_memory_type 在启动时选定一种:
+ *
+ * 1. POSIX(USE_DSM_POSIX,通常默认):shm_open()/shm_unlink() 创建与
+ *    删除段,其余操作把段当文件处理(ftruncate/fstat/mmap)。命名空间
+ *    是系统级平坦命名空间(/PostgreSQL.<handle>),可能与其他进程
+ *    (包括别的 PG 实例)冲突,create 时靠 O_EXCL 检测重名并静默返回
+ *    失败让上层换句柄重试。
+ * 2. System V(USE_DSM_SYSV):shmget()/shmat()/shmdt()/shmctl()。
+ *    命名空间更受限(key_t),默认分配上限通常很小;把 dsm_handle 直接
+ *    当 key 用,并避开 IPC_PRIVATE 特殊值。
+ * 3. mmap(USE_DSM_MMAP):在 PG_DYNSHMEM_DIR(默认为 $PGDATA/pg_dynshmem)
+ *    里创建"pg_dynshmem.<handle>"普通文件再 mmap。可用于内存文件系统
+ *    (如 /dev/shm)或作为无 shm_open/shmget 平台的回退;缺点是若放在
+ *    磁盘上,写回会损害性能。创建时逐块写零(而非 ftruncate 留洞),
+ *    确保文件空间真实分配,避免日后访问映射时 SIGBUS。
+ * 4. Windows(USE_DSM_WINDOWS):CreateFileMapping/OpenFileMapping 基于
+ *    系统页文件的映射对象;Windows 在"无引用时自动销毁对象",因此
+ *    DETACH 与 DESTROY 等价。
+ *
+ * 【统一接口】所有实现都实现同一套原语(DSM_OP_CREATE/ATTACH/DETACH/
+ * DESTROY),由 dsm_impl_op() 按类型分派。错误码映射统一由
+ * errcode_for_dynamic_shared_memory() 完成(EFBIG/ENOMEM 归为
+ * OUT_OF_MEMORY,其余按文件访问错误)。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -110,14 +137,22 @@ const struct config_enum_entry dynamic_shared_memory_options[] = {
 };
 
 /* Implementation selector. */
+/* (中文)当前使用的 DSM 实现类型(DSM_IMPL_POSIX/SYSV/WINDOWS/MMAP,
+ * GUC dynamic_shared_memory_type)。 */
 int			dynamic_shared_memory_type = DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE;
 
 /* Amount of space reserved for DSM segments in the main area. */
+/* (中文)主共享内存区为 DSM 预留的空间大小(MB,GUC
+ * min_dynamic_shared_memory):0 表示不预留。dsm.c 的
+ * dsm_main_space_request 用它换算字节数。 */
 int			min_dynamic_shared_memory;
 
 /* Size of buffer to be used for zero-filling. */
+/* (中文)零填充缓冲大小:mmap 实现创建段时,按这个块大小分块写零。 */
 #define ZBUFFER_SIZE				8192
 
+/* (中文)Windows 段名统一前缀("Global/PostgreSQL"),与主共享内存的
+ * 命名方式保持一致(见 GetSharedMemName 的相关说明)。 */
 #define SEGMENT_NAME_PREFIX			"Global/PostgreSQL"
 
 /*------
@@ -155,6 +190,29 @@ int			min_dynamic_shared_memory;
  * case where DSM_OP_CREATE experiences a name collision, which should
  * silently return false.
  *-----
+ */
+/*
+ * dsm_impl_op - (中文)平台层 DSM 操作的统一入口(按实现类型分派)
+ *
+ * 【作用】把"创建/附着/拆除/销毁"四个操作按
+ * dynamic_shared_memory_type 分派给对应的平台实现,统一参数与返回
+ * 约定。
+ *
+ * 【设计思想】dsm.c 只面向本函数编程,不感知平台差异;各平台实现
+ * 共享同一套 (op, handle, request_size, impl_private, mapped_address,
+ * mapped_size, elevel) 接口,使上层代码完全可移植。参数断言先做
+ * 一致性校验。
+ *
+ * 【参数】含义见上方原注释(operation 定义):
+ *   op             —— DSM_OP_CREATE/ATTACH/DETACH/DESTROY;
+ *   handle         —— 段句柄(CREATE 时是期望的新句柄);
+ *   request_size   —— 仅 CREATE 有意义:段大小;其余传 0;
+ *   impl_private   —— 平台私有数据(跨调用保持,首次为 NULL);
+ *   mapped_address —— 当前映射地址(无则为 NULL),成功后更新;
+ *   mapped_size    —— 当前映射大小(无则为 0),成功后更新;
+ *   elevel         —— 错误日志级别。
+ * 【返回值】true 成功;false 失败(调用方应先按 elevel 记录了消息;
+ * CREATE 撞名时静默返回 false,由上层换句柄重试)。
  */
 bool
 dsm_impl_op(dsm_op op, dsm_handle handle, Size request_size,
@@ -208,6 +266,28 @@ dsm_impl_op(dsm_op op, dsm_handle handle, Size request_size,
  * to treat a request for /xyz as a request to create a file by that name
  * in the root directory.  Users of such broken platforms should select
  * a different shared memory implementation.
+ */
+/*
+ * dsm_impl_posix - (中文)POSIX 共享内存实现(shm_open 系列)
+ *
+ * 【作用】实现四个 DSM 操作:
+ * - DETACH/DESTROY:先 munmap(若有映射),DESTROY 再 shm_unlink 删除段;
+ * - CREATE/ATTACH:先 ReserveExternalFD 登记 FD 占用(防 EMFILE,短暂
+ *   持有所以用 Reserve 而非 Acquire),shm_open 打开(CREATE 加
+ *   O_CREAT|O_EXCL,撞名即 EEXIST 静默失败,让上层重试新句柄);
+ *   段名 "/PostgreSQL.<handle>";ATTACH 用 fstat 取现有大小,CREATE
+ *   用 dsm_impl_posix_resize 把段扩到请求大小;最后 mmap 映射。
+ * 每个失败路径都做已做工作的回退(close/ReleaseExternalFD/必要时
+ * shm_unlink)再报错。
+ *
+ * 【设计思想】POSIX 段名位于系统级平坦命名空间,撞名只可能是"别的
+ * 进程(含别的 PG 实例)用过该句柄",因此 CREATE 撞名必须静默返回
+ * false 而非报错——上层会换句柄重试。映射用 MAP_SHARED|MAP_HASSEMAPHORE
+ * |MAP_NOSYNC(Berkeley 系标志,其他平台忽略)。
+ *
+ * 【参数】同 dsm_impl_op。
+ * 【返回值】true 成功;false 失败(消息已按 elevel 记录;CREATE 撞名
+ * 静默)。
  */
 static bool
 dsm_impl_posix(dsm_op op, dsm_handle handle, Size request_size,
@@ -348,6 +428,27 @@ dsm_impl_posix(dsm_op op, dsm_handle handle, Size request_size,
  *
  * Returns non-zero if either truncation or allocation fails, and sets errno.
  */
+/*
+ * dsm_impl_posix_resize - (中文)调整 POSIX 段的尺寸并确保空间真实分配
+ *
+ * 【作用】把 fd 对应的段扩展到 size 字节:Linux 上用 posix_fallocate
+ * (在 tmpfs 上实际分配页,见下方设计思想),其他平台用 ftruncate。
+ * 两者都带 EINTR 重试循环。
+ *
+ * 【设计思想】Linux 下 shm_open 的 fd 背后是 tmpfs 文件:若只用
+ * ftruncate 会在文件里留下"洞",访问洞时 tmpfs 才现场分配页,空间
+ * 不够会直接 SIGBUS 崩溃;因此用 posix_fallocate 现在就分配好,
+ * 失败时优雅地报 ENOSPC。调用期间屏蔽除 SIGQUIT 外的全部信号
+ * (posix_fallocate 可能耗时很长且是全有或全无操作,反复被 SIGUSR1
+ * 打断可能永远无法成功);EINTR 重试循环保留,以应对调试器/作业
+ * 控制(SIGCONT)。
+ *
+ * 【参数】
+ *   fd   —— 段的文件描述符;
+ *   size —— 目标大小。
+ * 【返回值】0 成功;非 0 失败(同时设置 errno;posix_fallocate 的
+ * 返回值被赋给 errno 供调用方读取)。
+ */
 static int
 dsm_impl_posix_resize(int fd, off_t size)
 {
@@ -419,6 +520,29 @@ dsm_impl_posix_resize(int fd, off_t size)
  * shmdt(), and shmctl().  As the default allocation limits for System V
  * shared memory are usually quite low, the POSIX facilities may be
  * preferable; but those are not supported everywhere.
+ */
+/*
+ * dsm_impl_sysv - (中文)System V 共享内存实现(shmget 系列)
+ *
+ * 【作用】实现四个 DSM 操作:用 dsm_handle 作 key(shmget 的键),
+ * 注意三点:1) key 取负修正(负 key 不可移植),2) 撞上 IPC_PRIVATE
+ * 特殊值时模拟 EEXIST 失败,让 CREATE 重试;3) shmget 查找已存在段
+ * 时 size 必须传 0(传非零且偏大会 EINVAL)。把 shmid(段标识)缓存
+ * 在 impl_private(TopMemoryContext 里 palloc 的 int,避免反复查找,
+ * 分配先于资源获取以防内存失败时泄漏资源)。
+ * - CREATE:flags 加 IPC_CREAT|IPC_EXCL,shmget 创建;
+ * - ATTACH:shmget 查标识,shmctl(IPC_STAT) 取实际大小;
+ * - DETACH/DESTROY:shmdt 解除映射,DESTROY 再 shmctl(IPC_RMID) 删除,
+ *   并释放 impl_private 缓存。
+ *
+ * 【设计思想】System V 命名空间窄(key_t 整数),把 handle 强制转换
+ * 截断/扩宽的行为是"每次一致"的,因此跨进程仍能对上同一个段;
+ * IPC_PRIVATE 只能由 shmget 自己生成,永远不该被我们用作 handle,
+ * 撞上就按"重名"处理。
+ *
+ * 【参数】同 dsm_impl_op。
+ * 【返回值】true 成功;false 失败(消息已按 elevel 记录;CREATE 撞名
+ * 静默)。
  */
 static bool
 dsm_impl_sysv(dsm_op op, dsm_handle handle, Size request_size,
@@ -607,6 +731,30 @@ dsm_impl_sysv(dsm_op op, dsm_handle handle, Size request_size,
  * the last reference to them goes away, either explicitly via a CloseHandle or
  * when the process containing the reference exits.
  */
+/*
+ * dsm_impl_windows - (中文)Windows 共享内存实现(CreateFileMapping/OpenFileMapping)
+ *
+ * 【作用】实现四个 DSM 操作:段名为 "Global/PostgreSQL.<handle>" 的
+ * 文件映射对象(基于系统页文件,非物理文件):
+ * - CREATE:CreateFileMapping(INVALID_HANDLE_VALUE = 用页文件)创建,
+ *   返回 ERROR_ALREADY_EXISTS 或 ERROR_ACCESS_DENIED(已有同名对象,
+ *   后者是服务创建的)时关闭句柄并静默失败;
+ * - ATTACH:OpenFileMapping 打开;
+ * - DETACH/DESTROY:UnmapViewOfFile 解除映射 + CloseHandle 关闭句柄;
+ *   Windows 对象在最后引用消失时自动销毁,因此两者等价;
+ * - 映射后一律用 VirtualQuery 取实际区域大小(页粒度 4K 取整),使
+ *   CREATE 与 ATTACH 的 mapped_size 口径一致。映射句柄存进
+ *   impl_private。
+ *
+ * 【设计思想】Global\ 命名空间让任何会话的进程都可能访问对象
+ * (依赖访问权限);命名沿用主共享内存的约定。Windows 没有
+ * shm_unlink 概念——"删除"就是让所有引用消失,所以 pin 机制
+ * (dsm_impl_pin_segment)专门为它复制句柄到 postmaster 保住引用。
+ *
+ * 【参数】同 dsm_impl_op。
+ * 【返回值】true 成功;false 失败(消息已按 elevel 记录;CREATE 撞名
+ * 静默)。
+ */
 static bool
 dsm_impl_windows(dsm_op op, dsm_handle handle, Size request_size,
 				 void **impl_private, void **mapped_address,
@@ -789,6 +937,26 @@ dsm_impl_windows(dsm_op op, dsm_handle handle, Size request_size,
  * which will not serve us well.  The user can relocate the pg_dynshmem
  * directory to a ramdisk to avoid this problem, if available.
  */
+/*
+ * dsm_impl_mmap - (中文)mmap 文件实现(把"共享内存"做成普通文件再映射)
+ *
+ * 【作用】实现四个 DSM 操作:文件名为
+ * "PG_DYNSHMEM_DIR/pg_dynshmem.<handle>":
+ * - DETACH/DESTROY:munmap(若有映射),DESTROY 再 unlink 删文件;
+ * - CREATE/ATTACH:OpenTransientFile 打开(CREATE 加 O_CREAT|O_EXCL,
+ *   撞名静默失败);ATTACH 用 fstat 取现有大小;CREATE 则分块写零
+ *   (见设计思想);最后 mmap 映射并关闭 fd。
+ *
+ * 【设计思想】把文件扩展成"带洞"的文件(仅 ftruncate)会让映射后的
+ * 页面在首次访问时才真正分配,空间不足会 SIGBUS 崩溃;所以创建时
+ * 用 8KB 缓冲逐块 write 把文件空间实打实写出来(代价较大,但换来源
+ * 码注释所称的可靠性)。文件放在磁盘上时,OS 可能把内容写回磁盘,
+ * 性能差;用户可把 PG_DYNSHMEM_DIR 指到内存文件系统(如 /dev/shm)。
+ *
+ * 【参数】同 dsm_impl_op。
+ * 【返回值】true 成功;false 失败(消息已按 elevel 记录;CREATE 撞名
+ * 静默)。
+ */
 static bool
 dsm_impl_mmap(dsm_op op, dsm_handle handle, Size request_size,
 			  void **impl_private, void **mapped_address, Size *mapped_size,
@@ -960,6 +1128,25 @@ dsm_impl_mmap(dsm_op op, dsm_handle handle, Size request_size,
  * the segment handle into the postmaster process.  The postmaster needn't
  * do anything to receive the handle; Windows transfers it automatically.
  */
+/*
+ * dsm_impl_pin_segment - (中文)段被"钉住"时的平台层动作(Windows 需要,其他平台空操作)
+ *
+ * 【作用】dsm_pin_segment() 调用本函数:Windows 下把本进程的段句柄
+ * 用 DuplicateHandle 复制进 postmaster(句柄经 Windows 自动传递,
+ * postmaster 无需准备),结果存入 impl_private_pm_handle。其他平台
+ * 无操作。
+ *
+ * 【设计思想】Windows 的映射对象在"引用计数归零"时自动销毁,而
+ * pin 的语义是"无任何后端附着也要存活":复制到 postmaster 的句柄
+ * 就是那个保住对象的"引线"。该句柄只在 postmaster 进程里有效,但
+ * 我们并不在别处使用它,只等 unpin 时关闭。
+ *
+ * 【参数】
+ *   handle                  —— 段句柄(仅用于错误消息);
+ *   impl_private            —— 本进程的映射对象句柄(Windows);
+ *   impl_private_pm_handle  —— 输出参数:存放到 postmaster 的句柄。
+ * 【返回值】无(失败 ERROR)。
+ */
 void
 dsm_impl_pin_segment(dsm_handle handle, void *impl_private,
 					 void **impl_private_pm_handle)
@@ -1011,6 +1198,23 @@ dsm_impl_pin_segment(dsm_handle handle, void *impl_private,
  * close the extra handle that dsm_impl_pin_segment created in the
  * postmaster's process space.
  */
+/*
+ * dsm_impl_unpin_segment - (中文)段被解除 pin 时的平台层动作(Windows 需要,其他平台空操作)
+ *
+ * 【作用】dsm_unpin_segment() 调用本函数:Windows 下用
+ * DuplicateHandle(DUPLICATE_CLOSE_SOURCE) 关闭并释放 pin 时复制到
+ * postmaster 的那个句柄,让映射对象重新回到"引用归零即销毁"的轨道。
+ * 其他平台无操作。
+ *
+ * 【设计思想】与 dsm_impl_pin_segment 精确配对:复制进 postmaster 的
+ * 句柄若不被显式关闭,对象永远有引用、永远不会销毁。
+ *
+ * 【参数】
+ *   handle       —— 段句柄(仅用于错误消息);
+ *   impl_private —— 指向"存于控制段的 postmaster 句柄"的指针(Windows;
+ *                   函数成功后置 NULL)。
+ * 【返回值】无(失败 ERROR)。
+ */
 void
 dsm_impl_unpin_segment(dsm_handle handle, void **impl_private)
 {
@@ -1044,6 +1248,19 @@ dsm_impl_unpin_segment(dsm_handle handle, void **impl_private)
 	}
 }
 
+/*
+ * errcode_for_dynamic_shared_memory - (中文)把 DSM 操作的 errno 映射为 SQLSTATE
+ *
+ * 【作用】DSM 各实现报错时统一经本函数选 SQLSTATE:EFBIG(文件过大)
+ * 或 ENOMEM 映射为 ERRCODE_OUT_OF_MEMORY,其余按文件访问错误处理
+ * (errcode_for_file_access)。
+ *
+ * 【设计思想】DSM 操作失败常源于"内存/段空间不足",归入 out_of_memory
+ * 便于上层(与应用、监控)正确归类。
+ *
+ * 【参数】无(读全局 errno)。
+ * 【返回值】SQLSTATE 错误码。
+ */
 static int
 errcode_for_dynamic_shared_memory(void)
 {

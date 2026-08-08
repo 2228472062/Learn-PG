@@ -3,6 +3,37 @@
  * procsignal.c
  *	  Routines for interprocess signaling
  *
+ * 【模块总览(中文)】
+ * 本文件实现 PostgreSQL 进程间"信号级"通信机制:任何进程(后端、
+ * 辅助进程、postmaster)都可以通过一块共享内存向另一个特定进程
+ * 投递一个"带原因的软中断";目标进程收到 SIGUSR1 后,按共享内存
+ * 里记录的原因做相应的处理。
+ *
+ * 【与 pmsignal.c / latch 的分工】
+ *  - pmsignal.c 是"postmaster ↔ 子进程"的单向通知通道,用于进程
+ *    管理级别的事件(数据库宕机、配置重载、子进程退出等);
+ *  - procsignal.c 更通用:任何进程之间都能互相发,投递对象按
+ *    ProcNumber(或 PID)精确定位,原因用枚举 ProcSignalReason 区分
+ *    (sinval 追赶、NOTIFY、并行消息、恢复冲突、屏障等);
+ *  - 共享内存通道传递"原因",真正把沉睡中的进程唤醒靠 latch:
+ *    SIGUSR1 处理器检查并清除相应标志后,统一 SetLatch(MyLatch),
+ *    进程主循环由此被唤醒。
+ *
+ * 【实现要点】
+ *  - 共享内存里为每个 ProcNumber(+辅助进程类型)预留一个
+ *    ProcSignalSlot,槽内用 pss_signalFlags 布尔数组记录"有哪些
+ *    原因被投递过",由自旋锁 pss_mutex 保护;同一原因连续投递
+ *    多次可能只被观察到一次(信号合并),这对现有用途无害;
+ *  - 除"通知型"原因外,还有一种"屏障(barrier)"协议
+ *    (EmitProcSignalBarrier / WaitForProcSignalBarrier):用于需要
+ *    确认"每个进程都已吸收某项全局状态变更"的场景(如 smgr 关闭
+ *    文件、数据校验和开关)。每个槽位维护一个"已确认代数"
+ *    pss_barrierGeneration,发起者递增全局代数、在每槽位置位检查
+ *    位图并唤醒所有进程;等待方(如 postmaster)逐个槽位等待代数
+ *    追平,即可确信全局变更已被全员吸收;
+ *  - SendCancelRequest 是客户端"取消查询"请求的入口:按 PID +
+ *    随机取消密钥(cancel key)双重校验后给目标进程发 SIGINT,
+ *    是 procsignal.c 中唯一直接使用 SIGINT(而非 SIGUSR1)的路径。
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California

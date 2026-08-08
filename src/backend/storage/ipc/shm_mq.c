@@ -8,6 +8,37 @@
  * and only the receiver may receive.  This is intended to allow a user
  * backend to communicate with worker backends that it has registered.
  *
+ * 【模块总览(中文)】
+ * 本文件实现"单读单写"的共享内存消息队列(single-reader, single-writer
+ * shared memory message queue),是并行查询(parallel query)与后台工作者
+ * (bgworker)之间传递数据的核心通信原语。队列本体 shm_mq 存放在动态共享
+ * 内存段(DSM)中:一个进程作为发送者(sender)写入,另一个进程作为接收者
+ * (receiver)读出,二者通过各自的进程闩锁(procLatch)互相唤醒。
+ *
+ * 【消息格式与缓冲结构】
+ * 每条消息 = 一个 Size 长度的头部(消息字节数)+ 消息数据,环内写入都按
+ * MAXIMUM_ALIGNOF 对齐。数据存放在环形缓冲区 mq_ring 中,两个单调递增
+ * 的字节计数 mq_bytes_read / mq_bytes_written 之差给出"未读字节数",
+ * 读写游标即计数对环大小取模。
+ *
+ * 【同步设计】
+ * - 环形缓冲区数据区完全不加锁:读方只读"自己确认未读"的区域,写方只写
+ *   "读方已消费掉"的区域,两者永不重叠;游标计数用 64 位原子读写 + 内存
+ *   屏障(barrier)同步;
+ * - 等待/唤醒借助 latch.c 的进程闩锁:发/收方在缓冲区满/空时 WaitLatch
+ *   睡眠,对方写完/读完后 SetLatch 唤醒;
+ * - mq_detached 标志表示任一方已退出,置位后必须唤醒对方,使其从阻塞中
+ *   返回 SHM_MQ_DETACHED 而不是永远等待;
+ * - 小数据的"攒批"优化:大量小消息时,把"推进共享计数 + SetLatch 唤醒
+ *   对方"推迟到攒够 1/4 环大小再一次性执行(见 mqh_send_pending /
+ *   mqh_consume_pending),因为 SetLatch 相当昂贵且会造成 CPU 缓存失效。
+ *
+ * 【典型调用链】
+ * 并行查询建立管道时:shm_mq_create 建队列 → shm_mq_set_sender /
+ * shm_mq_set_receiver 登记两端 → 双方各自 shm_mq_attach 得到句柄 →
+ * 发送方 shm_mq_send(shm_mq_sendv 的包装)→ 接收方 shm_mq_receive →
+ * 结束后 shm_mq_detach。需要等待对方"上线"时用 shm_mq_wait_for_attach。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -70,6 +101,28 @@
  * unsafe for the sender to reread any data after incrementing
  * mq_bytes_written, but fortunately there's no need for any of that.
  */
+/* 共享内存中的消息队列本体(单读单写):
+ * - mq_mutex          : 保护 mq_receiver / mq_sender / mq_detached 的
+ *                       自旋锁(mq_bytes_read/written 与 mq_ring 不用它);
+ * - mq_receiver       : 接收方 PGPROC。只能被"登记方"设置一次,一经设置
+ *                       不再变化,因此"已知被设置"后可以免锁读取;
+ * - mq_sender         : 发送方 PGPROC,语义同上;
+ * - mq_bytes_read     : 已消费(读)的累计字节数,仅接收方写;原子读写,
+ *                       与 mq_ring 的读写之间靠内存屏障同步;
+ * - mq_bytes_written  : 已写入的累计字节数,仅发送方写;语义同上;
+ * - mq_ring_size      : 环形缓冲区字节数(初始化后不变,可免锁读);
+ * - mq_detached       : 任一方已脱离的标志,只从 false 变 true,冗余写
+ *                       无害故无需加锁;置位后必须再置对方 latch,保证
+ *                       对方醒来后必然看到新值(SetLatch 前有内存屏障,
+ *                       ResetLatch 后有);
+ * - mq_ring_offset    : 数据区相对 mq_ring 字段起始的字节偏移(对齐后的
+ *                       真实数据起点,初始化后不变);
+ * - mq_ring[]         : 环形数据区(柔性数组),容量 mq_ring_size。
+ *
+ * 环形缓冲区协议(无锁读写的关键):"未读字节数"= mq_bytes_written -
+ * mq_bytes_read;发送方只写"读方已消费"的区域,接收方只读"自己确认未读"
+ * 的区域,因此双方可以不持锁直接读写各自的区域,游标推进互相独立、互不
+ * 覆盖。 */
 struct shm_mq
 {
 	slock_t		mq_mutex;
@@ -136,6 +189,29 @@ struct shm_mq
  * we make sure any other allocations we do happen in this context as well,
  * to avoid nasty surprises.
  */
+/* 后端私有的队列句柄(本进程 palloc 内存,不进共享内存):
+ * - mqh_queue        : 所附着的队列指针;
+ * - mqh_segment      : 可选:队列所在的 DSM 段;非 NULL 时注册
+ *                       on_dsm_detach 回调,保证段拆除前自动脱离队列;
+ * - mqh_handle       : 可选:对端 bgworker 的句柄,用于在对方启动之前就
+ *                      开始 send/receive——等不到时靠它察觉对方死亡,
+ *                      避免永久等待(见 shm_mq_wait_internal);
+ * - mqh_buffer       : 本进程私有的拼装缓冲,用于"消息过大 / 跨环回绕"
+ *                      需要重组的场景;消息小且连续时直接返回环内指针,
+ *                      省掉一次拷贝;
+ * - mqh_buflen       : mqh_buffer 的已分配字节数;
+ * - mqh_consume_pending: 已从环中读出、但尚未写回共享计数 mq_bytes_read
+ *                      的字节数;攒够 1/4 环大小再一次性提交,减少
+ *                      SetLatch 与 CPU 缓存失效开销;
+ * - mqh_send_pending : 已写入环中、但尚未计入 mq_bytes_written 的字节数,
+ *                      同理延迟提交;
+ * - mqh_partial_bytes: 当前正在发送/接收的"长度字或消息体"中已完成部分
+ *                      的字节数;nowait 模式中途退出后靠它续传;
+ * - mqh_expected_bytes: 接收侧:整个消息体应有的字节数(读长度字后得知);
+ * - mqh_length_word_complete: 长度字是否已完整发送/接收;
+ * - mqh_counterparty_attached: 是否已确认对方已 attach(避免反复取锁);
+ * - mqh_context      : attach 时的内存上下文,句柄与后续所有分配都在其中
+ *                      进行,防止上下文被意外切换。 */
 struct shm_mq_handle
 {
 	shm_mq	   *mqh_queue;
