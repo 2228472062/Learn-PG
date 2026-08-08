@@ -62,6 +62,36 @@
  * the range 42..44 requires an I/O wait before its buffers are returned, as
  * does block 60.
  *
+ * 【模块总览(中文)】
+ * 本文件实现"带前瞻(read-ahead)的流式读"(ReadStream):把用户通过
+ * 回调给出的块号序列,在真正读取之前先行窥探,合并成最多 io_combine_limit
+ * 块的大批量读,并提前交给缓冲管理器(StartReadBuffers / WaitReadBuffers)
+ * 异步执行,让存储子系统始终"有事可做",从而用并发 I/O 掩盖磁盘延迟。
+ *
+ * 核心数据结构是两块并行的循环队列(详见 struct ReadStream):
+ * 1) 缓冲区队列:最多 max_pinned_buffers 个缓冲槽,存放"已 pin、等待
+ *    消费者取走"的 Buffer;队列尾部预留 io_combine_limit-1 个溢出槽,
+ *    保证一次合并读的连续缓冲数组不会因环形绕回而断裂;
+ * 2) 在途 I/O 队列:记录已交给 StartReadBuffers() 但尚未调用
+ *    WaitReadBuffers() 的 ReadBuffersOperation,它们与缓冲区队列通过
+ *    buffer_index 一一对应。
+ *
+ * 前瞻距离的自适应算法(readahead_distance / combine_distance)是全文
+ * 的思想核心:
+ * - 初始假设"数据全在缓冲池",两个距离都为 1;
+ * - 消费缓冲时若被迫等待 I/O,readahead_distance 立即加倍(上限
+ *   max_pinned_buffers),并设置 distance_decay_holdoff 保护期,防止
+ *   在"缓存命中为主、偶发 I/O"的工作负载中距离过快衰减;
+ * - 只要做过 I/O,combine_distance 就加倍(上限 io_combine_limit):
+ *   即使数据全命中内核页缓存,大块读也能摊薄系统调用/提交开销;
+ * - 在一段无 I/O 的窗口内,距离按 1 逐步递减,最终退回 1 并进入
+ *   fast_path(单缓冲槽直通路径)。
+ *
+ * 与异步 I/O 的衔接:构建下一次读取时以批处理模式
+ * (pgaio_enter_batchmode / pgaio_exit_batchmode)暂存多个 I/O、合并后
+ * 一次性提交,摊薄提交开销;调用方也可用 READ_STREAM_USE_BATCHING 主动
+ * 启用。
+ *
  *
  * Portions Copyright (c) 2024-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -83,6 +113,11 @@
 #include "utils/rel.h"
 #include "utils/spccache.h"
 
+/* (中文)一个"已发出、但尚未等待完成"的读操作的记账单元:
+ * - buffer_index : 该 I/O 完成后,受影响的第一块缓冲在缓冲区队列中的下标
+ *                   (read_stream_next_buffer() 据此判断该缓冲是否需要等待);
+ * - op           : ReadBuffersOperation 描述符,记录本次读的目标关系、
+ *                   起始块号、缓冲数组指针等,由 StartReadBuffers() 填充。 */
 typedef struct InProgressIO
 {
 	int16		buffer_index;
@@ -92,6 +127,42 @@ typedef struct InProgressIO
 /*
  * State for managing a stream of reads.
  */
+/* (中文)读流(ReadStream)的主状态对象,一次 palloc 分配、贯穿流的一生。
+ *
+ * 环形缓冲区队列(下标 0..queue_size-1 为主区):
+ * - buffers[]          : 缓冲队列;queue_size 之后的 queue_overflow 个槽
+ *                         是溢出区,存放"一次合并读跨过队尾时"的缓冲副本
+ *                         (双份副本在消费时都会被清空);
+ * - oldest_buffer_index: 下一个要交付给消费者的缓冲槽;
+ * - next_buffer_index  : 下一个要 pin 的缓冲槽;
+ * - pinned_buffers     : 已被 pin、等待消费的缓冲个数;
+ * - initialized_buffers: 已初始化为 InvalidBuffer 的槽数,用于区分
+ *                         "从未用过"与"被消费清空"的槽;
+ * - forwarded_buffers  : 上一次 StartReadBuffers() 因 pin 限额被截短时为
+ *                         本次读"预存"的缓冲个数(这些 pin 已持有,但
+ *                         不计入 pinned_buffers,见 read_stream_start_pending_read)。
+ *
+ * 在途 I/O 环形队列:
+ * - ios[] / oldest_io_index / next_io_index / ios_in_progress:见文件头的
+ *   图示说明。
+ *
+ * 前瞻距离状态机:
+ * - combine_distance / readahead_distance : 允许合并/前瞻的最大块数,
+ *   随"缓存命中/等待 I/O"的历史自适应增减;置 0 表示流已到终点;
+ * - distance_decay_holdoff  : 近期做过 I/O 时的距离衰减保护期;
+ * - resume_readahead_distance / resume_combine_distance:read_stream_pause()
+ *   保存、read_stream_resume() 恢复的距离;
+ * - seq_blocknum / seq_until_processed : 识别顺序访问段,配合内核预读
+ *   (posix_fadvise)建议的发放与收回;
+ * - pending_read_blocknum / pending_read_nblocks : 正在构建、尚未发出的读;
+ * - buffered_blocknum : 单块"退回缓存",解决 I/O 拆分时的流控问题。
+ *
+ * 模式开关:
+ * - sync_mode    : io_method=sync,退化为"建议式预读"伪异步;
+ * - batch_mode   : 启用 AIO 批处理提交(READ_STREAM_USE_BATCHING);
+ * - advice_enabled : 是否给内核发放预读建议;
+ * - fast_path    : 全缓存扫描的直通路径(单缓冲槽、无队列管理);
+ * - temporary    : 目标为临时表,走本地缓冲区。 */
 struct ReadStream
 {
 	int16		max_ios;
@@ -168,6 +239,18 @@ struct ReadStream
 /*
  * Return a pointer to the per-buffer data by index.
  */
+/*
+ * (中文)按下标返回该缓冲槽对应的"每缓冲私有数据"区域指针。
+ *
+ * 【作用】per-buffer 数据是块号回调与消费者之间传递的每块元数据,在
+ * read_stream_begin_impl() 里作为一整块内存分配在流对象末尾,与缓冲区
+ * 队列一一对应。
+ * 【设计思想】用"基址 + per_buffer_data_size * index"直接计算地址,
+ * 省去一张指针数组,也保证各槽数据在内存中彼此相邻(利于缓存局部性)。
+ *
+ * 【参数】buffer_index:缓冲区队列下标。
+ * 【返回值】对应私有数据区域的指针。
+ */
 static inline void *
 get_per_buffer_data(ReadStream *stream, int16 buffer_index)
 {
@@ -178,6 +261,17 @@ get_per_buffer_data(ReadStream *stream, int16 buffer_index)
 /*
  * General-use ReadStreamBlockNumberCB for block range scans.  Loops over the
  * blocks [current_blocknum, last_exclusive).
+ */
+/*
+ * (中文)通用的"块区间扫描"块号回调。
+ *
+ * 【作用】供顺序扫描等场景直接使用:从 current_blocknum 起依次吐出块号,
+ * 到 last_exclusive(不含)为止。
+ *
+ * 【参数】callback_private_data:BlockRangeReadStreamPrivate 结构,内含
+ * current_blocknum(下一次要吐出的块号,调用后自增)与 last_exclusive
+ * (终点,不含);per_buffer_data:本块对应的私有数据区(本例未使用)。
+ * 【返回值】下一个要读的块号;流结束时返回 InvalidBlockNumber。
  */
 BlockNumber
 block_range_read_stream_cb(ReadStream *stream,
@@ -193,11 +287,17 @@ block_range_read_stream_cb(ReadStream *stream,
 }
 
 /*
- * Update stream stats with current pinned buffer depth.
+ * (中文)统计"预读深度":消费者每取出一个缓冲,就记录此刻流中已 pin
+ * 的缓冲个数。
  *
- * Called once per buffer returned to the consumer in read_stream_next_buffer().
- * Records the number of pinned buffers at that moment, so we can compute the
- * average look-ahead depth.
+ * 【作用】用于计算平均前瞻深度(distance_sum / prefetch_count)与最大
+ * 深度(distance_max),供 EXPLAIN ANALYZE 等展示流式扫描的预读效果。
+ *
+ * 【设计思想】采样点选在"返回一个缓冲给消费者"的时刻,恰好反映消费者
+ * 眼中的前瞻余量;每块只采一次样,避免重复计数。
+ *
+ * 【参数】无。
+ * 【返回值】无。
  */
 static inline void
 read_stream_count_prefetch(ReadStream *stream)
@@ -214,10 +314,14 @@ read_stream_count_prefetch(ReadStream *stream)
 }
 
 /*
- * Update stream stats about size of I/O requests.
+ * (中文)统计 I/O 请求:请求次数、总块数、此刻的在途 I/O 数。
  *
- * We count the number of I/O requests, size of requests (counted in blocks)
- * and number of in-progress I/Os.
+ * 【作用】io_count / io_nblocks / io_in_progress 三个指标用于评估"合并
+ * 读"的效果:平均每次请求的块数(io_nblocks / io_count)越大,合并越成功。
+ *
+ * 【参数】nblocks:本次发出的 I/O 覆盖的块数;in_progress:发出后的在途
+ * I/O 总数(含本次)。
+ * 【返回值】无。
  */
 static inline void
 read_stream_count_io(ReadStream *stream, int nblocks, int in_progress)
@@ -233,9 +337,13 @@ read_stream_count_io(ReadStream *stream, int nblocks, int in_progress)
 }
 
 /*
- * Update stream stats about waits for I/O when consuming buffers.
+ * (中文)统计"消费缓冲时被迫等待 I/O"的次数。
  *
- * We count the number of I/O waits while pulling buffers out of a stream.
+ * 【作用】wait_count 是前瞻自适应算法的关键反馈信号:需要等待说明当前
+ * 前瞻距离太小,应在 read_stream_next_buffer() 中加倍 readahead_distance。
+ *
+ * 【参数】无。
+ * 【返回值】无。
  */
 static inline void
 read_stream_count_wait(ReadStream *stream)
@@ -249,7 +357,14 @@ read_stream_count_wait(ReadStream *stream)
 }
 
 /*
- * Enable collection of stats into the provided IOStats.
+ * (中文)把流与一个 IOStats 统计结构绑定,开始收集扫描统计。
+ *
+ * 【作用】EXPLAIN ANALYZE 通过它把流的预读统计上报给执行器;绑定前先把
+ * 距离容量(distance_capacity = max_pinned_buffers)记入统计,供上层换算
+ * 前瞻深度百分比。
+ *
+ * 【参数】stats:目标统计结构(通常已由调用方清零);传 NULL 则关闭统计。
+ * 【返回值】无。
  */
 void
 read_stream_enable_stats(ReadStream *stream, IOStats *stats)
@@ -260,8 +375,18 @@ read_stream_enable_stats(ReadStream *stream, IOStats *stats)
 }
 
 /*
- * Ask the callback which block it would like us to read next, with a one block
- * buffer in front to allow read_stream_unget_block() to work.
+ * (中文)向块号回调询问"下一个想读的块号",前面设有一个单块缓冲槽,使
+ * read_stream_unget_block() 的"退回"成为可能。
+ *
+ * 【设计思想】当回调返回的块号无法立即处理(缓冲不足、I/O 已到上限)时,
+ * 先把该块号暂存到 buffered_blocknum,下次调用优先返回它——在不改变回调
+ * 语义(回调仍按顺序被调用)的前提下实现了流控。
+ *
+ * 【参数】per_buffer_data:准备分配给该块的私有数据区(可为 NULL);交给
+ * 回调前先向 Valgrind 声明其内容未定义,以捕捉"回调没写、消费者却读"的
+ * 漏初始化 bug。
+ * 【返回值】下一个块号;回调报告流结束(InvalidBlockNumber)时返回
+ * InvalidBlockNumber。
  */
 static inline BlockNumber
 read_stream_get_block(ReadStream *stream, void *per_buffer_data)
@@ -291,9 +416,17 @@ read_stream_get_block(ReadStream *stream, void *per_buffer_data)
 }
 
 /*
- * In order to deal with buffer shortages and I/O limits after short reads, we
- * sometimes need to defer handling of a block we've already consumed from the
- * registered callback until later.
+ * (中文)把已从回调消费的一个块号"退回"到单块缓冲槽,留待稍后处理。
+ *
+ * 【作用】应对"缓冲区短缺 / 短读后的 I/O 限额"等场景:前瞻算法必须先
+ * 把当前 pending read 发出才能继续构建下一个,于是把刚取到的块号退回,
+ * 下次 read_stream_get_block() 会优先返回它。
+ *
+ * 【设计思想】只用单块缓存即可:一次最多只会退回一个块号,且退回的块号
+ * 必然紧接着被消费,不存在累积。
+ *
+ * 【参数】blocknum:要退回的块号(必须有效)。
+ * 【返回值】无。
  */
 static inline void
 read_stream_unget_block(ReadStream *stream, BlockNumber blocknum)
@@ -305,14 +438,33 @@ read_stream_unget_block(ReadStream *stream, BlockNumber blocknum)
 }
 
 /*
- * Start as much of the current pending read as we can.  If we have to split it
- * because of the per-backend buffer limit, or the buffer manager decides to
- * split it, then the pending read is adjusted to hold the remaining portion.
+ * (中文)把当前 pending read 尽量多地发出。若因每后端 pin 限额或缓冲
+ * 管理器决定截短,则剩余部分留在 pending read 中,由下一次调用续发。
  *
- * We can always start a read of at least size one if we have no progress yet.
- * Otherwise it's possible that we can't start a read at all because of a lack
- * of buffers, and then false is returned.  Buffer shortages also reduce the
- * distance to a level that prevents look-ahead until buffers are released.
+ * 【作用】读操作的发起者:把 [pending_read_blocknum,
+ * pending_read_blocknum + nblocks) 这一连续区间交给 StartReadBuffers(),
+ * 并维护 pinned_buffers / ios_in_progress / forwarded_buffers / 距离衰减
+ * 等全部记账字段。
+ *
+ * 【设计思想】
+ * - 截短与转发(forward):StartReadBuffers() 返回的 nblocks 是实际
+ *   pin 到的块数,可能小于请求(缓冲限额、页已由并发者读入等)。若实际
+ *   pin 的缓冲区比请求多,多出的部分已在前一次调用中顺手 pin 好
+ *   (forwarded buffers,留在队列原处),本函数把它们当作本次读的"前导
+ *   块"计入限额、下次调用继续使用;流提前结束时这些缓冲会被释放;
+ * - 循环队列绕回:给 StartReadBuffers() 的缓冲数组必须连续,因此把
+ *   "跨过队尾"的缓冲复制一份到溢出区(queue_size 之后),主区那份留给
+ *   消费者——两份在消费时都会被清空(见 read_stream_next_buffer());
+ * - 距离衰减:若本次不需要等待 I/O 且此刻没有在途 I/O,则距离按 1
+ *   递减(distance_decay_holdoff 保护期内不衰减),使全缓存扫描最终
+ *   退回 fast_path;combine_distance 的递减也是为了让 fast_path 的
+ *   进入条件(combine_distance == 1)可以满足;
+ * - 保证进展:即使每后端限额为 0 且流中一个缓冲都没有,也强制发一个
+ *   单块读(buffer_limit 至少为 1),确保流不会卡死。
+ *
+ * 【参数】stream:目标读流。
+ * 【返回值】true 表示已尽最大努力发起(可能截短);false 表示因缓冲
+ * 不足完全无法发起(此时调用方应暂停前瞻,等消费者释放缓冲)。
  */
 static bool
 read_stream_start_pending_read(ReadStream *stream)
@@ -547,8 +699,25 @@ read_stream_start_pending_read(ReadStream *stream)
 }
 
 /*
- * Should we continue to perform look ahead?  Looking ahead may allow us to
- * make the pending IO larger via IO combining or to issue more read-ahead.
+ * (中文)判断是否应继续向前窥视:或把 pending read 拼得更大(合并),或
+ * 发起更多预读。
+ *
+ * 【设计思想】决定继续前瞻的三种情形各有讲究:
+ * 1) 回调已报告流结束(readahead_distance == 0):无块可看;
+ * 2) 在途 I/O 已达 max_ios 上限:再发无益;
+ * 3) 正在构建的 pending read 还小于 combine_distance,且流中一个缓冲都
+ *    没有(pinned_buffers == 0):继续取块把它拼大——即使 readahead
+ *    distance 很小(如 I/O 子系统跟得上),大块读也更省 CPU。这里故意
+ *    可以突破 readahead 距离上限,但不会突破 pin 上限,因为
+ *    combine_distance 被 max_pinned_buffers 封顶;一旦有读已发出
+ *    (pinned_buffers > 0)就不再需要这条路径——等待 I/O 会让距离自动
+ *    涨起来;
+ * 4) 其余情况:pinned_buffers + pending_read_nblocks 不得超过
+ *    readahead_distance(同样被 max_pinned_buffers 封顶),防止前瞻过远
+ *    超过 pin 上限。
+ *
+ * 【参数】stream:目标读流。
+ * 【返回值】true:应继续向前取块;false:应把 pending read 发出或停止。
  */
 static inline bool
 read_stream_should_look_ahead(ReadStream *stream)
@@ -610,10 +779,20 @@ read_stream_should_look_ahead(ReadStream *stream)
 }
 
 /*
- * We don't start the pending read just because we've hit the distance limit,
- * preferring to give it another chance to grow to full io_combine_limit size
- * once more buffers have been consumed.  But this is not desirable in all
- * situations - see below.
+ * (中文)判断"当前是否应把 pending read 立刻发出"。
+ *
+ * 【设计思想】默认策略是把 pending read 尽量拼到 combine_distance 再
+ * 发出,但下列情形必须立即发出:
+ * 1) 没有 pending read(pending_read_nblocks == 0):无事可发;
+ * 2) 在途 I/O 已达 max_ios 上限:不允许再多发;
+ * 3) 流已结束(readahead_distance == 0):没有继续合并的可能;
+ * 4) 已拼满 combine_distance:再等也不会更大;
+ * 5) 既没有在途读、也没有已准备的读(pinned_buffers == 0)且前瞻已
+ *    到头:此时必须发出,保证消费者任何时候都有缓冲可取(至少有一个
+ *    读处于已准备状态)。
+ *
+ * 【参数】stream:目标读流。
+ * 【返回值】true:应立刻调用 read_stream_start_pending_read()。
  */
 static inline bool
 read_stream_should_issue_now(ReadStream *stream)
@@ -654,6 +833,27 @@ read_stream_should_issue_now(ReadStream *stream)
 	return false;
 }
 
+/*
+ * (中文)前瞻主循环:持续取块、合并、必要时发出 pending read,直到满足
+ * 停止条件。
+ *
+ * 【作用】read_stream_next_buffer() 每次调用后都通过它"为下一次调用做
+ * 准备"(补充 pin 缓冲、构建/发出读);也是 AIO 批处理提交的现场——整个
+ * 前瞻过程以 pgaio_enter_batchmode() / pgaio_exit_batchmode() 包裹,把
+ * 构建期间产生的多个暂存 I/O 合并为一次提交,摊薄提交开销。
+ *
+ * 【设计思想】循环由 read_stream_should_look_ahead() 与
+ * read_stream_should_issue_now() 两个谓词驱动:
+ * - 若应立即发出则发出(可能被截短),然后继续下一轮;
+ * - 否则向回调取下一个块:与当前 pending read 的块号连续则并入
+ *   (合并);不连续则必须先清空 pending read(若因限额无法清空,把该
+ *   块号退回、停止前瞻),再以该块开启新的 pending read;
+ * - 循环退出后,若 pending read 已满足发出条件再补发一次,保证离开
+ *   本函数时流中总有缓冲可交付(流已结束除外)。
+ *
+ * 【参数】stream:目标读流。
+ * 【返回值】无。
+ */
 static void
 read_stream_look_ahead(ReadStream *stream)
 {
@@ -747,13 +947,36 @@ read_stream_look_ahead(ReadStream *stream)
 }
 
 /*
- * Create a new read stream object that can be used to perform the equivalent
- * of a series of ReadBuffer() calls for one fork of one relation.
- * Internally, it generates larger vectored reads where possible by looking
- * ahead.  The callback should return block numbers or InvalidBlockNumber to
- * signal end-of-stream, and if per_buffer_data_size is non-zero, it may also
- * write extra data for each block into the space provided to it.  It will
- * also receive callback_private_data for its own purposes.
+ * (中文)创建读流对象的真正实现(两个公开入口都转到这里)。
+ *
+ * 【作用】一次性算出并分配"流对象 + 缓冲队列 + 溢出区 + 在途 I/O 数组 +
+ * per-buffer 数据"的整块内存,根据 GUC / 表空间配置决定并发度与距离上限,
+ * 并完成各字段的初始化。
+ *
+ * 【设计思想】关键的数量关系:
+ * - max_ios:可同时在途的 I/O 数,来自 effective_io_concurrency 或表空间
+ *   的 io concurrency 设置;目录表 / 未连接数据库时回退到全局 GUC,避免
+ *   在 spccache 就绪前产生循环依赖;
+ * - max_pinned_buffers = min((max_ios + 1) * io_combine_limit, 各上限):
+ *   多留"一个满 I/O 的缓冲"余量,使上一批 I/O 结束后不必等消费者取走
+ *   缓冲就能开新一批;随后还要受"策略环 pin 上限"
+ *   (GetAccessStrategyPinLimit)与缓冲管理器的每后端 pin 限额
+ *   (GetAdditionalPinLimit / GetAdditionalLocalPinLimit)约束;上限为
+ *   0 时(缓冲过少的系统)强制到 1,保证流能推进;
+ * - queue_size = max_pinned_buffers + 1:多出的一个空槽作为 head 与
+ *   tail 之间的间隙,保证 per-buffer 数据在消费者访问期间不被覆盖;
+ * - 缓冲槽额外预留 queue_overflow = io_combine_limit - 1 个溢出槽,使
+ *   一次合并读的连续缓冲数组不会因环形队列绕回而断裂;
+ * - 初始化时把每个 InProgressIO 中"整个流不变"的字段(rel / smgr /
+ *   策略 / 持久性 / fork)预先填好,避免每次读重复赋值;
+ * - READ_STREAM_FULL(将读整个关系)时跳过初始爬升,直接以全尺寸距离
+ *   起步;否则从 1 开始,等待"命中/未命中"历史来自适应。
+ *
+ * 【参数】flags:READ_STREAM_* 位标志;strategy:缓冲访问策略(可为 NULL);
+ * rel:目标关系(可为 NULL);smgr:存储管理器关系;persistence:关系持久性;
+ * forknum:分支号;callback:块号回调;callback_private_data:回调私有数据;
+ * per_buffer_data_size:每块私有数据大小(0 表示不需要)。
+ * 【返回值】新建的 ReadStream*,随后用 read_stream_next_buffer() 消费。
  */
 static ReadStream *
 read_stream_begin_impl(int flags,
@@ -969,8 +1192,14 @@ read_stream_begin_impl(int flags,
 }
 
 /*
- * Create a new read stream for reading a relation.
- * See read_stream_begin_impl() for the detailed explanation.
+ * (中文)创建读流的公开入口(基于 Relation 的 relcache 条目)。
+ *
+ * 【作用】从 relcache 条目取出 smgr 与持久性,再转调 read_stream_begin_impl,
+ * 是顺序扫描等场景的主要入口。
+ *
+ * 【参数】flags / strategy / forknum / callback / callback_private_data /
+ * per_buffer_data_size:语义同 read_stream_begin_impl;rel:目标关系。
+ * 【返回值】新建的 ReadStream*。
  */
 ReadStream *
 read_stream_begin_relation(int flags,
@@ -993,8 +1222,15 @@ read_stream_begin_relation(int flags,
 }
 
 /*
- * Create a new read stream for reading a SMgr relation.
- * See read_stream_begin_impl() for the detailed explanation.
+ * (中文)创建读流的公开入口(基于 SMgrRelation,不要求 relcache 条目)。
+ *
+ * 【作用】供没有 relcache 条目的场景(如某些扩展算子)使用:rel 传 NULL,
+ * 持久性由调用方显式给出(smgr_persistence)。
+ *
+ * 【参数】flags / strategy / forknum / callback / callback_private_data /
+ * per_buffer_data_size:语义同 read_stream_begin_impl;smgr:存储管理器
+ * 关系;smgr_persistence:关系持久性。
+ * 【返回值】新建的 ReadStream*。
  */
 ReadStream *
 read_stream_begin_smgr_relation(int flags,
@@ -1018,13 +1254,37 @@ read_stream_begin_smgr_relation(int flags,
 }
 
 /*
- * Pull one pinned buffer out of a stream.  Each call returns successive
- * blocks in the order specified by the callback.  If per_buffer_data_size was
- * set to a non-zero size, *per_buffer_data receives a pointer to the extra
- * per-buffer data that the callback had a chance to populate, which remains
- * valid until the next call to read_stream_next_buffer().  When the stream
- * runs out of data, InvalidBuffer is returned.  The caller may decide to end
- * the stream early at any time by calling read_stream_end().
+ * (中文)从流中取出一块已 pin 的缓冲交给调用者;每次调用返回一块,顺序
+ * 与块号回调给出的顺序一致。
+ *
+ * 【作用】流的对外核心接口:处理"等待在途 I/O、自适应调整距离、清理
+ * 队列槽位、为下次调用前瞻补货"等全部内部状态,并在全缓存扫描时切入
+ * fast_path 直通路径。
+ *
+ * 【设计思想】本函数是自适应算法的反馈回路所在:
+ * - 若最老的缓冲对应一个在途 I/O,先 WaitReadBuffers() 等它完成,并把
+ *   "是否需要等待"当作反馈:需要等待则 readahead_distance 加倍(上限
+ *   max_pinned_buffers)并设置 distance_decay_holdoff(上限
+ *   max_pinned_buffers)抑制后续衰减;不需要等待则距离保持不变(现有
+ *   距离显然足够)。sync 模式下同步 I/O 一律视为"需要等待",否则
+ *   effective_io_concurrency = 0 时距离永远涨不起来、无法合并 I/O;
+ * - combine_distance 只要做过 I/O 就加倍(上限 io_combine_limit):即使
+ *   数据命中内核页缓存,大块读也能摊薄系统调用 / 提交开销;对 io_uring
+ *   尤其重要——它不会因缓存命中而报告需要等待,只能靠此规则涨距离;
+ * - 取出缓冲后清空队列槽位(溢出区双份副本一并清理),递减
+ *   pinned_buffers 并把 oldest_buffer_index 前移,最后调用
+ *   read_stream_look_ahead() 为下次调用补货;
+ * - fast_path:当流处于"全缓存、无私有数据、两个距离都为 1"的稳态时,
+ *   退化为"单缓冲槽 + StartReadBuffer()"直通路径,跳过全部队列管理;
+ *   若该块是缓存未命中(StartReadBuffer 发起 I/O),立即退出 fast_path;
+ * - Valgrind / CLOBBER_FREED_MEMORY 下还会把上一个槽的私有数据区擦掉
+ *   (置 noaccess),捕捉消费者持有的悬垂指针。
+ *
+ * 【参数】stream:目标读流;per_buffer_data:可空;若 per_buffer_data_size
+ * 非 0,这里收到回调为本次返回的块写入的私有数据指针(该数据有效到下次
+ * 调用本函数)。
+ * 【返回值】块对应的 Buffer(pin 已转移给调用者,应由调用者释放);流
+ * 结束时返回 InvalidBuffer。
  */
 Buffer
 read_stream_next_buffer(ReadStream *stream, void **per_buffer_data)
@@ -1367,11 +1627,14 @@ read_stream_next_buffer(ReadStream *stream, void **per_buffer_data)
 }
 
 /*
- * Transitional support for code that would like to perform or skip reads
- * itself, without using the stream.  Returns, and consumes, the next block
- * number that would be read by the stream's look-ahead algorithm, or
- * InvalidBlockNumber if the end of the stream is reached.  Also reports the
- * strategy that would be used to read it.
+ * (中文)过渡性支持接口:让调用方绕过流、自己执行(或跳过)读取。
+ *
+ * 【作用】返回并消费"前瞻算法本要读取的下一块号",同时报告将使用的缓冲
+ * 策略;返回 InvalidBlockNumber 表示流已到终点。供"先自读一块、决定是否
+ * 改用流"的迁移期代码使用。
+ *
+ * 【参数】stream:目标读流;strategy:输出参数,收到该块将使用的策略。
+ * 【返回值】下一块号;流结束时为 InvalidBlockNumber。
  */
 BlockNumber
 read_stream_next_block(ReadStream *stream, BufferAccessStrategy *strategy)
@@ -1381,9 +1644,17 @@ read_stream_next_block(ReadStream *stream, BufferAccessStrategy *strategy)
 }
 
 /*
- * Temporarily stop consuming block numbers from the block number callback.
- * If called inside the block number callback, its return value should be
- * returned by the callback.
+ * (中文)暂停流式前瞻:保存当前距离,并把两个距离置 0 使前瞻停止。
+ *
+ * 【作用】用于"自引用块"等场景:回调需要先消费一块缓冲、查看内容才能
+ * 给出后续块号。暂停后由 read_stream_resume() 恢复。
+ *
+ * 【设计思想】用 resume_*_distance 保存当前距离、距离置 0 表示"暂时
+ * 没有块可看"。若在块号回调内部调用,回调应把本函数的返回值(恒为
+ * InvalidBlockNumber)直接返回,向流宣告暂停。
+ *
+ * 【参数】stream:目标读流。
+ * 【返回值】恒为 InvalidBlockNumber(供回调直接返回)。
  */
 BlockNumber
 read_stream_pause(ReadStream *stream)
@@ -1396,9 +1667,13 @@ read_stream_pause(ReadStream *stream)
 }
 
 /*
- * Resume looking ahead after the block number callback reported
- * end-of-stream. This is useful for streams of self-referential blocks, after
- * a buffer needed to be consumed and examined to find more block numbers.
+ * (中文)恢复前瞻:把 read_stream_pause() 保存的两个距离还原。
+ *
+ * 【作用】配合 read_stream_pause() 支持"自引用块"流:消费并查看缓冲后
+ * 恢复前瞻,继续从回调取得更多块号。
+ *
+ * 【参数】stream:目标读流。
+ * 【返回值】无。
  */
 void
 read_stream_resume(ReadStream *stream)
@@ -1408,10 +1683,20 @@ read_stream_resume(ReadStream *stream)
 }
 
 /*
- * Reset a read stream by releasing any queued up buffers, allowing the stream
- * to be used again for different blocks.  This can be used to clear an
- * end-of-stream condition and start again, or to throw away blocks that were
- * speculatively read and read some different blocks instead.
+ * (中文)重置读流:释放所有已 pin / 已转发的缓冲,清除终点状态与
+ * fast_path,使流可以重新用于不同的块序列。
+ *
+ * 【作用】两种典型用途:清除"流已结束"状态后重新开始;或丢弃已投机预读
+ * 的块、改读别的块。
+ *
+ * 【设计思想】先停止前瞻并把距离置 0,再反复调用 read_stream_next_buffer()
+ * 把队列中剩余缓冲全部取出并 ReleaseBuffer(顺带清空队列槽与溢出区双份
+ * 副本);之后单独清扫"转发缓冲"(forwarded_buffers:已 pin、但还没进入
+ * 队列、未计入 pinned_buffers 的缓冲);最后把距离重置为 1、清空
+ * distance_decay_holdoff,回到"初始假设数据全在缓存"的起点。
+ *
+ * 【参数】stream:目标读流。
+ * 【返回值】无。
  */
 void
 read_stream_reset(ReadStream *stream)
@@ -1461,7 +1746,13 @@ read_stream_reset(ReadStream *stream)
 }
 
 /*
- * Release and free a read stream.
+ * (中文)结束并销毁读流。
+ *
+ * 【作用】先调用 read_stream_reset() 释放全部缓冲 pin 与转发缓冲,再释放
+ * 流对象本身(整块 palloc 内存)。
+ *
+ * 【参数】stream:目标读流。
+ * 【返回值】无。
  */
 void
 read_stream_end(ReadStream *stream)

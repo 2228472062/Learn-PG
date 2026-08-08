@@ -37,6 +37,40 @@
  * The Windows implementation uses Windows events that are inherited by all
  * postmaster child processes. There's no need for the self-pipe trick there.
  *
+ * 【模块总览(中文)】
+ * 本文件实现"等待事件集合"(WaitEventSet):把若干事件(latch 置位、socket
+ * 可读/可写/对端关闭、postmaster 死亡、超时)组织进一个集合,用一次系统
+ * 调用同时等待。这是 latch.c 的底层支撑:WaitLatch / WaitLatchOrSocket
+ * 最终都落到本模块。语义上等价于 ppoll()/pselect() 的"无竞态"版本:
+ * 信号在进入睡眠之前到达也不会丢失。
+ *
+ * 【支持的等待对象】
+ * - WL_LATCH_SET:等待本进程拥有的 latch 被置位(SetLatch 可来自其他进程
+ *   或本进程的信号处理器);
+ * - WL_SOCKET_* :socket 可读 / 可写 / 建立连接 / 可 accept / 对端关闭;
+ * - WL_POSTMASTER_DEATH / WL_EXIT_ON_PM_DEATH:postmaster 死亡(后者在
+ *   检测到时直接 proc_exit 退出,而不是把事件返回给调用者);
+ * - WL_TIMEOUT:超时。
+ *
+ * 【四种内核后端与"唤醒竞态"】
+ * 编译期按平台选择 poll / epoll / kqueue / Win32 之一(可用 WAIT_USE_*
+ * 宏手工指定以便测试)。核心难题是"信号处理器置位 latch"的竞态:信号本身
+ * 不保证打断 poll() 的睡眠,且信号若在 poll() 之前到达,poll() 照样会睡
+ * 过去。三种解决思路:
+ * - self-pipe 技巧(poll):信号处理器往管道写一个字节,管道里有数据必然
+ *   使 poll 立即返回(写端非阻塞,满了也无害);
+ * - signalfd(epoll + Linux):阻塞 SIGURG,由内核把它转成文件描述符上的
+ *   可读事件,直接加入 epoll 集合;
+ * - kqueue:用 EVFILT_SIGNAL 过滤器直接等待 SIGURG 信号事件。
+ * Windows 用继承的事件对象 + WaitForMultipleObjects。
+ *
+ * 【其他要点】
+ * - WaitEventSet 与 ResourceOwner 挂钩,事务 / 会话结束自动释放;
+ * - epoll 的 ADD / MOD / DEL 三种内核操作由 WaitEventAdjustEpoll 统一
+ *   封装,内核事件位与 WL_* 位在此映射;
+ * - latch 的 maybe_sleeping 标志 + 内存屏障用于"置位者"与"即将睡眠者"
+ *   的握手,细节见 latch.c。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -85,6 +119,9 @@
  * useful to manually specify the used primitive.  If desired, just add a
  * define somewhere before this block.
  */
+/* 选择底层就绪检测原语:默认取系统支持的最"现代"的
+ * (epoll > kqueue > poll > Win32 事件),允许在编译期用 WAIT_USE_*
+ * 宏手工覆盖,便于分别测试各实现。 */
 #if defined(WAIT_USE_EPOLL) || defined(WAIT_USE_POLL) || \
 	defined(WAIT_USE_KQUEUE) || defined(WAIT_USE_WIN32)
 /* don't overwrite manual choice */
@@ -104,6 +141,9 @@
  * By default, we use a self-pipe with poll() and a signalfd with epoll(), if
  * available.  For testing the choice can also be manually specified.
  */
+/* 在 poll / epoll 后端里,再选择"如何把 SIGURG 变成 fd 可读":Linux 上
+ * 优先用 signalfd,其余平台用 self-pipe(管道字节)。同样允许手工指定,
+ * 以测不同路径。 */
 #if defined(WAIT_USE_POLL) || defined(WAIT_USE_EPOLL)
 #if defined(WAIT_USE_SELF_PIPE) || defined(WAIT_USE_SIGNALFD)
 /* don't overwrite manual choice */
@@ -115,6 +155,27 @@
 #endif
 
 /* typedef in waiteventset.h */
+/* 等待事件集合本体(进程私有内存):
+ * - owner            : 登记本集合的 ResourceOwner(NULL 表示会话级生命期);
+ * - nevents          : 已注册的事件数;
+ * - nevents_space    : 集合容量(创建时指定,不可再扩);
+ * - events[]         : 事件定义数组(长度为 nevents_space,含 pos / fd /
+ *                       events / user_data 等字段,见 waiteventset.h);
+ * - latch / latch_pos: 若集合含 WL_LATCH_SET 事件,这里记录 latch 指针与
+ *                      对应事件在数组中的下标;等待前先检查 latch 状态可
+ *                      省去系统调用;
+ * - exit_on_postmaster_death: WL_EXIT_ON_PM_DEATH 会先把事件转成
+ *                      WL_POSTMASTER_DEATH 并置此标志,检测到 postmaster
+ *                      死亡时直接 proc_exit(1) 而非返回事件;
+ * - 各后端专用字段:
+ *   - epoll_fd / epoll_ret_events : epoll 描述符与一次性分配的结果数组;
+ *   - kqueue_fd / kqueue_ret_events / report_postmaster_not_running :
+ *     同上;后者记录"postmaster 已退出但需推迟上报"的状态(kqueue 对同一
+ *     进程退出事件只报告一次,靠它维持电平语义);
+ *   - pollfds                      : poll() 每次调用都要传完整事件数组,
+ *                                    预先准备一份;
+ *   - handles                      : Win32 事件句柄数组(元素 0 恒为
+ *                                    pgwin32_signal_event,其余按下标 +1)。 */
 struct WaitEventSet
 {
 	ResourceOwner owner;
@@ -169,16 +230,23 @@ struct WaitEventSet
 
 #ifndef WIN32
 /* Are we currently in WaitLatch? The signal handler would like to know. */
+/* 本进程当前是否正阻塞在等待循环里(信号处理器想知道的):
+ * latch_sigurg_handler 仅在 waiting 时写 self-pipe,避免没人在等时白白
+ * 灌满管道。 */
 static volatile sig_atomic_t waiting = false;
 #endif
 
 #ifdef WAIT_USE_SIGNALFD
 /* On Linux, we'll receive SIGURG via a signalfd file descriptor. */
+/* Linux:接收 SIGURG 的 signalfd 描述符(初始化后不变) */
 static int	signal_fd = -1;
 #endif
 
 #ifdef WAIT_USE_SELF_PIPE
 /* Read and write ends of the self-pipe */
+/* self-pipe 的读端 / 写端描述符,以及所属进程 PID:
+ * fork 后子进程要关闭继承的管道、创建自己的(见
+ * InitializeWaitEventSupport);owner_pid 用于识别"这份管道归谁"。 */
 static int	selfpipe_readfd = -1;
 static int	selfpipe_writefd = -1;
 
@@ -186,6 +254,7 @@ static int	selfpipe_writefd = -1;
 static int	selfpipe_owner_pid = 0;
 
 /* Private function prototypes */
+/* 内部函数前置声明,权威注释见各定义处。 */
 static void latch_sigurg_handler(SIGNAL_ARGS);
 static void sendSelfPipeByte(void);
 #endif
@@ -210,6 +279,9 @@ static inline int WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 /* ResourceOwner support to hold WaitEventSets */
 static void ResOwnerReleaseWaitEventSet(Datum res);
 
+/* WaitEventSet 的资源所有者描述符:在"锁之后"的阶段
+ * (RESOURCE_RELEASE_AFTER_LOCKS)释放,优先级 RELEASE_PRIO_WAITEVENTSETS,
+ * 保证锁被释放后、会话收尾时才回收事件集,避免使用中的集合被提前销毁。 */
 static const ResourceOwnerDesc wait_event_set_resowner_desc =
 {
 	.name = "WaitEventSet",
@@ -220,6 +292,7 @@ static const ResourceOwnerDesc wait_event_set_resowner_desc =
 };
 
 /* Convenience wrappers over ResourceOwnerRemember/Forget */
+/* 把 WaitEventSet 登记到 / 从 ResourceOwner 解除的便捷包装 */
 static inline void
 ResourceOwnerRememberWaitEventSet(ResourceOwner owner, WaitEventSet *set)
 {
@@ -237,6 +310,24 @@ ResourceOwnerForgetWaitEventSet(ResourceOwner owner, WaitEventSet *set)
  *
  * This must be called once during startup of any process that can wait on
  * latches, before it issues any InitLatch() or OwnLatch() calls.
+ */
+/*
+ * InitializeWaitEventSupport - (中文)初始化进程级等待基础设施
+ *
+ * 【作用】任何要等待 latch 的进程,在使用 latch(InitLatch / OwnLatch)
+ * 之前必须调用一次:创建 self-pipe(或 signalfd)并挂接 SIGURG 相关处理。
+ *
+ * 【设计思想】postmaster 先建好管道,子进程 fork 时会继承 fd;子进程必须
+ * 关闭继承的管道、创建自己的(否则多进程共享一个管道会互相误唤醒),这
+ * 是"隔离等待者"的关键(EXEC_BACKEND 下靠 FD_CLOEXEC 自动关闭)。管道
+ * 两端都设 O_NONBLOCK 与 FD_CLOEXEC:写端非阻塞保证 SetLatch 在管道满
+ * 时不卡死,读端非阻塞方便 drain 清空;CLOEXEC 防止 exec 后的程序乱碰。
+ * Linux 分支还把 SIGURG 加进 UnBlockSig(使信号被阻塞、由内核转成
+ * signalfd 可读事件)并创建 signalfd;两个长活 fd 都要向 fd.c 记账
+ * (ReserveExternalFD)。
+ *
+ * 【参数】无。
+ * 【返回值】无(失败 FATAL)。
  */
 void
 InitializeWaitEventSupport(void)
@@ -361,6 +452,24 @@ InitializeWaitEventSupport(void)
  * The WaitEventSet is tracked by the given 'resowner'.  Use NULL for session
  * lifetime.
  */
+/*
+ * CreateWaitEventSet - (中文)创建能容纳 nevents 个事件的等待集合
+ *
+ * 【作用】分配并初始化 WaitEventSet:在一块 MAXALIGN 对齐的连续内存里
+ * 装下"结构体 + 事件数组 + 内核后端所需数组"(epoll_event / pollfd /
+ * kevent / HANDLE),并创建 epoll / kqueue 句柄。之后用
+ * AddWaitEventToSet 往里加事件,用 WaitEventSetWait 统一等待。
+ *
+ * 【设计思想】一次性分配避免多次 malloc 与指针管理;MAXALIGN 对齐保证
+ * 后面的 epoll_event 等结构满足平台对齐要求(纯 sizeof 累加可能破坏
+ * 对齐);集合受 resowner 管理(NULL 则活到进程结束);fd 创建走
+ * AcquireExternalFD 记账,防止超出进程 fd 限额。
+ *
+ * 【参数】
+ *   resowner —— 归属的资源所有者(NULL = 会话级);
+ *   nevents  —— 计划注册的最大事件数。
+ * 【返回值】新集合;不再使用须 FreeWaitEventSet。
+ */
 WaitEventSet *
 CreateWaitEventSet(ResourceOwner resowner, int nevents)
 {
@@ -477,6 +586,19 @@ CreateWaitEventSet(ResourceOwner resowner, int nevents)
  * when the FD is created.  For the Windows case, we assume that the handles
  * involved are non-inheritable.
  */
+/*
+ * FreeWaitEventSet - (中文)释放等待事件集合
+ *
+ * 【作用】解下 ResourceOwner、关闭内核句柄(epoll / kqueue)、按平台清理
+ * Win32 事件对象,最后释放内存。
+ *
+ * 【设计思想】所有 fd 在创建时都带 CLOEXEC(epoll 用 EPOLL_CLOEXEC,
+ * Win32 句柄不可继承),所以本函数不担心"资源被 exec 继承"的泄漏问题,
+ * 可以放心释放。
+ *
+ * 【参数】set —— 待释放的集合。
+ * 【返回值】无。
+ */
 void
 FreeWaitEventSet(WaitEventSet *set)
 {
@@ -519,6 +641,19 @@ FreeWaitEventSet(WaitEventSet *set)
 
 /*
  * Free a previously created WaitEventSet in a child process after a fork().
+ */
+/*
+ * FreeWaitEventSetAfterFork - (中文)fork 之后在子进程里释放集合
+ *
+ * 【作用】子进程 fork 后调用:关闭从父进程继承的 epoll / kqueue 描述符
+ * 并释放内存(kqueue 本身不会被子进程继承,只需还掉 fd 记账)。
+ *
+ * 【设计思想】子进程继承了父进程的内存镜像与 fd;epoll fd 是进程相关的
+ * 内核对象,子进程里继续持有它没有意义,必须关闭并释放对应记账,避免
+ * fd 泄漏。
+ *
+ * 【参数】set —— 待释放的集合。
+ * 【返回值】无。
  */
 void
 FreeWaitEventSetAfterFork(WaitEventSet *set)
@@ -565,6 +700,31 @@ FreeWaitEventSetAfterFork(WaitEventSet *set)
  * The user_data pointer specified here will be set for the events returned
  * by WaitEventSetWait(), allowing to easily associate additional data with
  * events.
+ */
+/*
+ * AddWaitEventToSet - (中文)向集合注册一个等待事件
+ *
+ * 【作用】把"等待什么"登记进集合:事件类型(位掩码)、fd、latch、用户数据。
+ * 返回事件在集合内的下标 pos,供 ModifyWaitEvent 后续修改。
+ *
+ * 【设计思想】
+ * - WL_EXIT_ON_PM_DEATH 立即折算成 WL_POSTMASTER_DEATH + 集合级标志
+ *   exit_on_postmaster_death;
+ * - latch 必须是本进程拥有(owner_pid 校验),且整个集合最多一个 latch,
+ *   事件类型必须恰好是 WL_LATCH_SET;等待 socket 事件必须有 fd;
+ * - latch 事件在 Unix 后端复用 self-pipe / signalfd 的读端作为 fd——所有
+ *   latch 共用这一个 fd,内核只监听它,具体是哪个 latch 由用户态检查
+ *   is_set 区分;postmaster 死亡事件监听 postmaster_alive_fds 的读端
+ *   (postmaster 崩溃时写端被关闭,读端出现可读/挂断);
+ * - 最后调用平台专用的 WaitEventAdjust* 把事件登记进内核。
+ *
+ * 【参数】
+ *   set       —— 集合;
+ *   events    —— 事件位掩码(WL_*);
+ *   fd        —— socket 事件对应的 fd;
+ *   latch     —— latch 事件对应的 latch;
+ *   user_data —— 事件发生时随事件返回给调用者的指针。
+ * 【返回值】事件在集合中的下标(从 0 起)。
  */
 int
 AddWaitEventToSet(WaitEventSet *set, uint32 events, pgsocket fd, Latch *latch,
@@ -652,6 +812,31 @@ AddWaitEventToSet(WaitEventSet *set, uint32 events, pgsocket fd, Latch *latch,
  *
  * 'pos' is the id returned by AddWaitEventToSet.
  */
+/*
+ * ModifyWaitEvent - (中文)修改已注册事件的掩码(及 latch 事件对象)
+ *
+ * 【作用】按 AddWaitEventToSet 返回的 pos 修改事件:常见于同一个 socket
+ * 在"等可读"与"等可写"之间切换。latch 事件可临时改成 NULL(禁用)再改回。
+ *
+ * 【设计思想】
+ * - 只允许在 WL_POSTMASTER_DEATH 与 WL_EXIT_ON_PM_DEATH 之间切换,不
+ *   允许移除(集合级标志随之更新),因此该分支要在"事件没变就提前返回"
+ *   的快路径之前判断;
+ * - 事件与 latch 都没变时直接返回——这是重要优化:libpq 等 socket 层
+ *   经常以高频调用本函数切换读写等待,应避免不必要的系统调用;
+ * - latch 事件本身不允许改类型(只许换 latch 对象);Unix 后端所有 latch
+ *   共用同一个 self-pipe / signalfd,内核对象无需改动,直接返回即可;
+ *   只有 Win32 需要更新句柄数组(旧句柄留着,容忍失效事件的虚假唤醒);
+ * - 其余情况把新掩码下推到平台专用 Adjust 例程(epoll 走 EPOLL_CTL_MOD,
+ *   kqueue 要按旧掩码算差集)。
+ *
+ * 【参数】
+ *   set    —— 集合;
+ *   pos    —— 目标事件下标;
+ *   events —— 新的事件掩码;
+ *   latch  —— 新的 latch(仅 latch 事件有意义,可为 NULL 禁用)。
+ * 【返回值】无。
+ */
 void
 ModifyWaitEvent(WaitEventSet *set, int pos, uint32 events, Latch *latch)
 {
@@ -734,6 +919,26 @@ ModifyWaitEvent(WaitEventSet *set, int pos, uint32 events, Latch *latch)
 /*
  * action can be one of EPOLL_CTL_ADD | EPOLL_CTL_MOD | EPOLL_CTL_DEL
  */
+/*
+ * WaitEventAdjustEpoll - (中文)把事件注册 / 修改 / 删除到 epoll 集合
+ *
+ * 【作用】action 为 EPOLL_CTL_ADD / EPOLL_CTL_MOD / EPOLL_CTL_DEL,把
+ * event 的 fd 与感兴趣的事件位登记到 set->epoll_fd。epoll_event.data.ptr
+ * 存 WaitEvent 指针,这样 epoll_wait 返回时能直接拿回对应事件。
+ *
+ * 【设计思想】内核位与 WL_* 位的映射:WL_LATCH_SET → EPOLLIN
+ * (self-pipe / signalfd 可读),WL_POSTMASTER_DEATH → EPOLLIN(死亡管道
+ * 可读),socket 事件:READABLE → EPOLLIN,WRITEABLE → EPOLLOUT,
+ * CLOSED → EPOLLRDHUP;恒加 EPOLLERR | EPOLLHUP,保证错误 / 挂断也
+ * 会上报。ADD / DEL 都传同一个 epoll_event 参数(历史上 epoll 有个要求
+ * 如此的旧 bug,带上也无害)。
+ *
+ * 【参数】
+ *   set    —— 集合;
+ *   event  —— 目标事件;
+ *   action —— EPOLL_CTL_ADD / EPOLL_CTL_MOD / EPOLL_CTL_DEL。
+ * 【返回值】无(失败 ERROR)。
+ */
 static void
 WaitEventAdjustEpoll(WaitEventSet *set, WaitEvent *event, int action)
 {
@@ -786,6 +991,22 @@ WaitEventAdjustEpoll(WaitEventSet *set, WaitEvent *event, int action)
 #endif
 
 #if defined(WAIT_USE_POLL)
+/*
+ * WaitEventAdjustPoll - (中文)把事件同步到 poll() 的 pollfd 数组
+ *
+ * 【作用】把 event 的 fd 与事件位翻译成 pollfd 填入 set->pollfds[event->pos]
+ * (poll() 每次调用都要传完整数组,所以"准备一次、反复使用")。
+ *
+ * 【设计思想】映射:WL_LATCH_SET → POLLIN;WL_POSTMASTER_DEATH → POLLIN;
+ * socket:READABLE → POLLIN,WRITEABLE → POLLOUT,CLOSED → POLLRDHUP
+ * (平台不支持 POLLRDHUP 时省略,调用方可用 WaitEventSetCanReportClosed
+ * 查询)。每次先清 revents(内核的输出字段)。
+ *
+ * 【参数】
+ *   set   —— 集合;
+ *   event —— 目标事件。
+ * 【返回值】无。
+ */
 static void
 WaitEventAdjustPoll(WaitEventSet *set, WaitEvent *event)
 {
@@ -834,6 +1055,9 @@ WaitEventAdjustPoll(WaitEventSet *set, WaitEvent *event)
  */
 #define AccessWaitEvent(k_ev) (*((WaitEvent **)(&(k_ev)->udata)))
 
+/* 构造一个通用 kevent 的小工具:ident = fd,filter / flags 由调用方给出,
+ * udata 记录 WaitEvent 指针(经 AccessWaitEvent 宏解决各 BSD 系统
+ * udata 成员类型不同的差异)。 */
 static inline void
 WaitEventAdjustKqueueAdd(struct kevent *k_ev, int filter, int action,
 						 WaitEvent *event)
@@ -846,6 +1070,9 @@ WaitEventAdjustKqueueAdd(struct kevent *k_ev, int filter, int action,
 	AccessWaitEvent(k_ev) = event;
 }
 
+/* 构造"postmaster 退出"事件的 kevent:监听 PostmasterPid 的进程退出
+ * (EVFILT_PROC + NOTE_EXIT)。kqueue 对同一进程的退出只报告一次,因此
+ * 之后要靠 report_postmaster_not_running 维持"电平"语义。 */
 static inline void
 WaitEventAdjustKqueueAddPostmaster(struct kevent *k_ev, WaitEvent *event)
 {
@@ -858,6 +1085,8 @@ WaitEventAdjustKqueueAddPostmaster(struct kevent *k_ev, WaitEvent *event)
 	AccessWaitEvent(k_ev) = event;
 }
 
+/* 构造"latch 置位"事件的 kevent:监听 SIGURG(EVFILT_SIGNAL)。SIGURG
+ * 已被设为忽略,进程不会真的收到信号,只是由 kqueue 捕获通知。 */
 static inline void
 WaitEventAdjustKqueueAddLatch(struct kevent *k_ev, WaitEvent *event)
 {
@@ -872,6 +1101,25 @@ WaitEventAdjustKqueueAddLatch(struct kevent *k_ev, WaitEvent *event)
 
 /*
  * old_events is the previous event mask, used to compute what has changed.
+ */
+/*
+ * WaitEventAdjustKqueue - (中文)把事件掩码变化同步到 kqueue
+ *
+ * 【作用】对比 old_events 与新掩码,计算需要 ADD / DELETE 的 kevent 并
+ * 用一次 kevent() 提交。kqueue 把"可读 / 可写"看成两个独立事件,因此
+ * 要做差集运算;latch 与 postmaster 死亡事件只加不删。
+ *
+ * 【设计思想】postmaster 事件登记时若失败(ESRCH / EACCES,说明进程已
+ * 不存在)或检测到 PostmasterPid != getppid() 且 PostmasterIsAlive()
+ * 为假,就置 report_postmaster_not_running,由下一次
+ * WaitEventSetWaitBlock 上报——因为 postmaster 可能已死甚至 PID 已被
+ * 复用,此刻不能当成普通事件立即返回。
+ *
+ * 【参数】
+ *   set        —— 集合;
+ *   event      —— 目标事件;
+ *   old_events —— 修改前的事件掩码。
+ * 【返回值】无(kevent 调用失败 ERROR)。
  */
 static void
 WaitEventAdjustKqueue(WaitEventSet *set, WaitEvent *event, int old_events)
@@ -981,6 +1229,22 @@ WaitEventAdjustKqueue(WaitEventSet *set, WaitEvent *event, int old_events)
 #if defined(WAIT_USE_WIN32)
 StaticAssertDecl(WSA_INVALID_EVENT == NULL, "");
 
+/*
+ * WaitEventAdjustWin32 - (中文)把事件同步到 Win32 句柄数组
+ *
+ * 【作用】按事件类型把 set->handles[event->pos + 1] 填成对应句柄:
+ * latch → latch 的 Win32 event;postmaster 死亡 → PostmasterHandle;
+ * socket → 用 WSAEventSelect 把 fd 与新建 / 复用的 WSA event 关联,
+ * 掩码恒含 FD_CLOSE(错误 / EOF 总是上报)。
+ *
+ * 【设计思想】socket 的 WSA event 按需惰性创建;每次调整都用
+ * WSAEventSelect 重设通知掩码,使"读 / 写 / 连接"的切换生效。
+ *
+ * 【参数】
+ *   set   —— 集合;
+ *   event —— 目标事件。
+ * 【返回值】无(失败 ERROR)。
+ */
 static void
 WaitEventAdjustWin32(WaitEventSet *set, WaitEvent *event)
 {
@@ -1035,6 +1299,33 @@ WaitEventAdjustWin32(WaitEventSet *set, WaitEvent *event)
  *
  * Returned events will have the fd, pos, user_data fields set to the
  * values associated with the registered event.
+ */
+/*
+ * WaitEventSetWait - (中文)等待集合中的事件发生(顶层循环)
+ *
+ * 【作用】阻塞直到至少一个注册事件发生或超时;把发生的事件(最多 nevents
+ * 个)填入 occurred_events 数组,返回个数。timeout = -1 无限等待,
+ * = 0 只查不睡,> 0 最多等那么多毫秒。
+ *
+ * 【设计思想】
+ * - 先检查 latch 是否已置位:是则不必进内核睡眠,直接返回;若还没置位,
+ *   置 maybe_sleeping 并内存屏障再复查,与 SetLatch 侧的屏障配对,堵住
+ *   "检查-睡眠"间隙里信号到达的竞态;
+ * - latch 已置位时仍以 0 超时做一次内核轮询,尽量在同一批返回里带上
+ *   其他非 latch 事件(满足调用方"一次等多样"的语义);
+ * - 返回 0(被 EINTR 打断等)时重算剩余超时再循环,保证总等待时长不变;
+ * - 等待期间通过 pgstat_report_wait_start / End 登记等待事件,用于
+ *   pg_stat_activity;Unix 侧维护 waiting 标志供信号处理器判断是否
+ *   要写 self-pipe(Win32 侧则先派发排队的信号)。
+ *
+ * 【参数】
+ *   set              —— 集合;
+ *   timeout          —— 毫秒(-1 无限,0 不阻塞,>0 上限);
+ *   occurred_events  —— 输出:发生的事件数组(由调用方分配);
+ *   nevents          —— 输出数组容量(至少 1);
+ *   wait_event_info  —— 等待事件标识(供 pg_stat_activity)。
+ * 【返回值】发生的事件数;超时返回 0。事件的 fd / pos / user_data 均
+ *          来自注册时的值。
  */
 int
 WaitEventSetWait(WaitEventSet *set, long timeout,
@@ -1180,6 +1471,31 @@ WaitEventSetWait(WaitEventSet *set, long timeout,
  * epoll_event struct contain a pointer to our events, making association
  * easy.
  */
+/*
+ * WaitEventSetWaitBlock - (中文)epoll 内核睡眠与事件翻译(单次)
+ *
+ * 【作用】执行一次 epoll_wait,把返回的 epoll 事件翻译成 WaitEvent 填进
+ * 输出数组。返回 -1 表示超时,0 表示被 EINTR 打断需重试,>0 为事件数。
+ *
+ * 【设计思想】epoll 的 data.ptr 直接指向 WaitEvent,免去逐一扫描全部
+ * 事件的代价(相比 poll 后端的主要优势);对每个 epoll 事件:
+ * - latch 事件:先 drain() 排空 self-pipe / signalfd,再校验
+ *   maybe_sleeping && is_set 才上报 WL_LATCH_SET(防止"管道里有旧字节
+ *   但 latch 未置位"的误报);
+ * - postmaster 死亡:EPOLLIN / EPOLLERR / EPOLLHUP 都算候选,但必须
+ *   PostmasterIsAliveInternal() 复核(警惕旧平台的虚假事件;PID 可能被
+ *   复用),确认后按 exit_on_postmaster_death 决定 proc_exit 或上报;
+ * - socket 事件:EPOLLIN / EPOLLOUT / EPOLLRDHUP 与请求的掩码取交集,
+ *   错误位(EPOLLERR / EPOLLHUP)也按可读 / 可写 / 关闭上报,让调用方
+ *   自己处理 EOF 条件。
+ *
+ * 【参数】
+ *   set              —— 集合;
+ *   cur_timeout      —— 本次睡眠毫秒数;
+ *   occurred_events  —— 输出数组;
+ *   nevents          —— 本次最多返回的事件数。
+ * 【返回值】-1 超时;0 重试;>=1 事件数。
+ */
 static inline int
 WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 					  WaitEvent *occurred_events, int nevents)
@@ -1315,6 +1631,28 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
  * For now this mirrors the epoll code, but in future it could modify the fd
  * set in the same call to kevent as it uses for waiting instead of doing that
  * with separate system calls.
+ */
+/*
+ * WaitEventSetWaitBlock - (中文)kqueue 内核睡眠与事件翻译(单次,BSD 系)
+ *
+ * 【作用】执行一次 kevent 等待,把返回的事件翻译成 WaitEvent。返回 -1
+ * 表示超时,0 表示被 EINTR 打断需重试,>0 为事件数。
+ *
+ * 【设计思想】超时毫秒换算成 timespec;先处理此前登记时发现的上报挂起
+ * 的 postmaster 死亡(report_postmaster_not_running);事件翻译:
+ * - latch 事件(EVFILT_SIGNAL):同样校验 maybe_sleeping && is_set;
+ * - postmaster 死亡(EVFILT_PROC + NOTE_EXIT):内核只通知一次,因此
+ *   置 report_postmaster_not_running 记录,维持"电平"语义供后续调用
+ *   持续上报,并按 exit_on_postmaster_death 决定退出还是返回;
+ * - socket:EVFILT_READ 对应可读与对端关闭(EV_EOF 才报 CLOSED),
+ *   EVFILT_WRITE 对应可写。
+ *
+ * 【参数】
+ *   set              —— 集合;
+ *   cur_timeout      —— 本次睡眠毫秒数;
+ *   occurred_events  —— 输出数组;
+ *   nevents          —— 本次最多返回的事件数。
+ * 【返回值】-1 超时;0 重试;>=1 事件数。
  */
 static int
 WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
@@ -1469,6 +1807,24 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
  * This allows to receive readiness notifications for several events at once,
  * but requires iterating through all of set->pollfds.
  */
+/*
+ * WaitEventSetWaitBlock - (中文)poll 内核睡眠与事件翻译(单次)
+ *
+ * 【作用】执行一次 poll() 并遍历全部 pollfds 的 revents,把就绪事件翻译
+ * 成 WaitEvent。返回 -1 表示超时,0 表示被 EINTR 打断需重试,>0 为事件数。
+ *
+ * 【设计思想】poll 后端需要"全量扫描 + 全量翻内核位",且无法直接拿到
+ * 事件指针,只能按数组下标对应 set->events;错误位组合
+ * (POLLHUP | POLLERR | POLLNVAL) 统一按可读 / 可写 / 关闭上报;latch
+ * 与 postmaster 死亡事件的处理同 epoll 后端(先 drain / 先复核存活)。
+ *
+ * 【参数】
+ *   set              —— 集合;
+ *   cur_timeout      —— 本次睡眠毫秒数;
+ *   occurred_events  —— 输出数组;
+ *   nevents          —— 本次最多返回的事件数。
+ * 【返回值】-1 超时;0 重试;>=1 事件数。
+ */
 static inline int
 WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 					  WaitEvent *occurred_events, int nevents)
@@ -1602,6 +1958,33 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
  * the behavior of the other implementations.
  *
  * https://blogs.msdn.microsoft.com/oldnewthing/20150409-00/?p=44273
+ */
+/*
+ * WaitEventSetWaitBlock - (中文)Win32 等待与事件翻译(单次)
+ *
+ * 【作用】用 WaitForMultipleObjects 等待句柄数组(元素 0 恒为信号事件),
+ * 把命中的事件翻译成 WaitEvent;一次只"消费"一个句柄,所以用零超时的
+ * 第二轮轮询尽量把多个就绪事件凑进同一次返回,与其他后端行为对齐。
+ *
+ * 【设计思想】
+ * - 睡眠前先处理标记为需要重置的事件,并对每个 socket 做"预检":用
+ *   WSARecv(MSG_PEEK) 探测可读(补 FD_READ 通知可能已丢的竞态)、用
+ *   零字节 WSASend 探测可写(Windows 不会自动报 FD_WRITE 除非上次发送
+ *   失败过 WSAEWOULDBLOCK);
+ * - WAIT_OBJECT_0 表示信号事件,派发排队信号后返回 0 重试;
+ * - latch 事件需 ResetEvent 手动重置;postmaster 死亡同样复核
+ *   PostmasterIsAliveInternal;socket 事件用 WSAEnumNetworkEvents 取
+ *   FD_READ / FD_WRITE / FD_CONNECT / FD_ACCEPT / FD_CLOSE 位,
+ *   FD_CLOSE 会把所有请求的 socket 位都置上(EOF / 错误),并置
+ *   cur_event->reset 以便下次等待前重设,避免可读事件丢失造成永久挂起;
+ * - 处理完一个事件后,继续用零超时轮询剩余句柄,直到输出缓冲满或扫完。
+ *
+ * 【参数】
+ *   set              —— 集合;
+ *   cur_timeout      —— 本次睡眠毫秒数;
+ *   occurred_events  —— 输出数组;
+ *   nevents          —— 本次最多返回的事件数。
+ * 【返回值】-1 超时;0 重试;>=1 事件数。
  */
 static inline int
 WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
@@ -1866,6 +2249,16 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 /*
  * Return whether the current build options can report WL_SOCKET_CLOSED.
  */
+/*
+ * WaitEventSetCanReportClosed - (中文)查询当前编译配置能否报告
+ * WL_SOCKET_CLOSED
+ *
+ * 【作用】构建期查询:WL_SOCKET_CLOSED 依赖 poll 的 POLLRDHUP(或 epoll /
+ * kqueue 原生支持)。调用方(如 libpq)据此决定能否依赖该事件。
+ *
+ * 【参数】无。
+ * 【返回值】true 可报告;false 不可(等待该事件将永远不触发)。
+ */
 bool
 WaitEventSetCanReportClosed(void)
 {
@@ -1881,6 +2274,14 @@ WaitEventSetCanReportClosed(void)
 /*
  * Get the number of wait events registered in a given WaitEventSet.
  */
+/*
+ * GetNumRegisteredWaitEvents - (中文)返回集合中已注册的事件个数
+ *
+ * 【作用】查询 set->nevents,供调用方遍历或判断集合使用状态。
+ *
+ * 【参数】set —— 集合。
+ * 【返回值】已注册的事件个数。
+ */
 int
 GetNumRegisteredWaitEvents(WaitEventSet *set)
 {
@@ -1894,6 +2295,20 @@ GetNumRegisteredWaitEvents(WaitEventSet *set)
  *
  * Wake up WaitLatch, if we're waiting.
  */
+/*
+ * latch_sigurg_handler - (中文)SIGURG 信号处理器:唤醒正在等待的 WaitLatch
+ *
+ * 【作用】SetLatch 通过发送 SIGURG 唤醒等待者(self-pipe 路径):若本进程
+ * 正在等待(waiting == true),往 self-pipe 写一个字节,使 poll / epoll
+ * 立即返回。
+ *
+ * 【设计思想】只在 waiting 时写管道:没人在等时写入只会灌满管道(写端
+ * 非阻塞,满时的写入会被丢弃,无害)。在信号上下文里只能做 async-signal-
+ * safe 的操作,所以调用 sendSelfPipeByte 而非任何日志 / 报错设施。
+ *
+ * 【参数】SIGNAL_ARGS(标准信号参数,未使用)。
+ * 【返回值】无。
+ */
 static void
 latch_sigurg_handler(SIGNAL_ARGS)
 {
@@ -1902,6 +2317,16 @@ latch_sigurg_handler(SIGNAL_ARGS)
 }
 
 /* Send one byte to the self-pipe, to wake up WaitLatch */
+/*
+ * sendSelfPipeByte - (中文)向 self-pipe 写入一个字节以唤醒等待者
+ *
+ * 【作用】写端是非阻塞的:写成功即说明 poll 侧将有数据可读;EAGAIN 表示
+ * 管道已满(里面已有字节,足够唤醒)直接返回;EINTR 重试;其他错误只能
+ * 静默忽略——本函数可能在信号上下文里被调用,不能 elog。
+ *
+ * 【参数】无。
+ * 【返回值】无。
+ */
 static void
 sendSelfPipeByte(void)
 {
@@ -1942,6 +2367,20 @@ retry:
  * Note: this is only called when waiting = true.  If it fails and doesn't
  * return, it must reset that flag first (though ideally, this will never
  * happen).
+ */
+/*
+ * drain - (中文)排空 self-pipe / signalfd 中所有待读数据
+ *
+ * 【作用】latch 事件被报告后调用:循环读直到 EAGAIN,保证下次等待不会
+ * 因为"残留字节"立刻返回(把"电平"清成"边沿")。
+ *
+ * 【设计思想】仅当 waiting = true 时才会被调用;出错时先复位 waiting
+ * 再 elog(此时已在正常上下文,可以报错)。一次读不满 1024 字节即说明
+ * 管道已空(管道写入是整字节流,单次可读量小于缓冲即意味着没有更多
+ * 数据),无需再读。
+ *
+ * 【参数】无。
+ * 【返回值】无。
  */
 static void
 drain(void)
@@ -1995,6 +2434,8 @@ drain(void)
 
 #endif
 
+/* 资源所有者释放回调:解下 owner 引用并释放集合。清 owner 是为了防止
+ * FreeWaitEventSet 里对"已被释放流程解下"的 owner 二次 Forget。 */
 static void
 ResOwnerReleaseWaitEventSet(Datum res)
 {
@@ -2018,6 +2459,20 @@ ResOwnerReleaseWaitEventSet(Datum res)
  *
  * On Windows, Latch uses SetEvent directly and this is not used.
  */
+/*
+ * WakeupMyProc - (中文)唤醒本进程自己(若正睡在等待循环里)
+ *
+ * 【作用】供临界区 / 信号处理器等"不方便持锁"的路径调用:本进程正在等待
+ * 时,写 self-pipe(或对 kqueue 后端发 SIGURG)打断睡眠。注意原注释
+ * (XXX)指出:未保存 / 恢复 errno,这是一个已知的小缺陷,大多数调用
+ * 场景无影响。
+ *
+ * 【设计思想】与 latch_sigurg_handler 同源:等待时唤醒机制是"信号或管道
+ * 字节";本函数允许普通代码(非信号上下文)主动触发同样的唤醒。
+ *
+ * 【参数】无。
+ * 【返回值】无。
+ */
 void
 WakeupMyProc(void)
 {
@@ -2031,6 +2486,16 @@ WakeupMyProc(void)
 }
 
 /* Similar to WakeupMyProc, but wake up another process */
+/*
+ * WakeupOtherProc - (中文)唤醒另一个进程
+ *
+ * 【作用】向 pid 发 SIGURG,使目标进程的等待循环被打断(目标须已初始化
+ * latch 基础设施)。kqueue 后端由 EVFILT_SIGNAL 上报,self-pipe / 
+ * signalfd 后端由信号处理器写管道。
+ *
+ * 【参数】pid —— 目标进程 PID。
+ * 【返回值】无。
+ */
 void
 WakeupOtherProc(int pid)
 {

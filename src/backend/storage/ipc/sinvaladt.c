@@ -374,7 +374,8 @@ SharedInvalShmemRequest(void *arg)
 		);
 }
 
- *			(中文)初始化 SI 消息缓冲区共享段(init 阶段回调)
+/*
+ * SharedInvalShmemInit - (中文)初始化 SI 消息缓冲区共享段(init 阶段回调)
  *
  * 【作用】共享内存分配完成后由框架调用:把消息计数器清零
  * (minMsgNum / maxMsgNum)、初始化自旋锁 msgnumLock、把全部

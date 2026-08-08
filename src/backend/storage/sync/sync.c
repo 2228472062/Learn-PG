@@ -3,6 +3,46 @@
  * sync.c
  *	  File synchronization management code.
  *
+ * 【模块总览(中文)】
+ * 本文件是 PostgreSQL 文件同步(sync)的基础设施:它让"文件被写脏"
+ * 与"文件真正落盘"解耦,把 fsync 集中到检查点(checkpoint)统一
+ * 执行,避免每个后端每次写盘都做昂贵的同步。
+ *
+ * 两大机制:
+ * 1) 待 fsync 请求表(pendingOps,哈希表):任何后端写完数据文件后
+ *    (md.c、clog、commit_ts、multixact 等),并不直接 fsync,而是
+ *    登记一个 SYNC_REQUEST"这个文件需要 fsync"。哈希表以 FileTag
+ *    为键,同一文件的重复请求自然合并去重,一个检查点内每个文件
+ *    只 fsync 一次。
+ * 2) 延迟删除请求表(pendingUnlinks,链表):DROP 掉的关系的首段
+ *    文件不能立即删除(防止 relfilenumber 在崩溃恢复前被复用,
+ *    详见 md.c 的 mdunlink 注释),mdunlink 把它截断为 0 后登记
+ *    SYNC_UNLINK_REQUEST,由 checkpointer 在下一个检查点完成后
+ *    真正 unlink。
+ *
+ * 两种角色:
+ * - 登记端(普通后端):本地没有请求表(pendingOps == NULL),通过
+ *   RegisterSyncRequest -> ForwardSyncRequest(checkpointer.c)把请求
+ *   放入共享内存队列,由 checkpointer 周期性吸收;
+ * - 执行端(standalone 后端、checkpointer):在 InitSync 里建立本地
+ *   请求表,吸收队列(checkpointer 侧 AbsorbSyncRequests 在
+ *   checkpointer.c 中,会把队列里的请求转成 RememberSyncRequest
+ *   的调用)后在 ProcessSyncRequests/SyncPostCheckpoint 中统一执行。
+ *
+ * 轮次计数与取消:
+ * - sync_cycle_ctr:区分"本轮检查点该处理的 fsync 请求"与"处理开始
+ *   后才到达的新请求"(后者留到下一轮),防止检查点永不完结;
+ * - checkpoint_cycle_ctr:给 unlink 请求打轮次标记,保证在检查点
+ *   REDO 点确定之前到达的删除请求不被过早执行;
+ * - SYNC_FORGET_REQUEST/SYNC_FILTER_REQUEST:把已登记请求标记为
+ *   canceled,让删除文件与待 fsync 记录保持正确、不再对已消失的
+ *   文件做同步。
+ *
+ * 分发机制:请求按 FileTag.handler 字段经 syncsw[] 函数表分派到
+ * 具体的存储模块(md、clog、commit_ts、multixact),每个模块只需
+ * 提供自己的 sync/unlink/match 回调,新增文件类型无需改动本文件
+ * 的队列逻辑。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -54,6 +94,17 @@
  */
 typedef uint16 CycleCtr;		/* can be any convenient integer size */
 
+/* 周期计数器类型(CycleCtr,取足够容纳轮次的最小宽度即可,这里用
+ * uint16):给"fsync/unlink 请求"打上"属于第几轮检查点"的标记,
+ * 用于区分新旧请求。回绕是允许的,最坏后果只是多等一轮,不会出错 */
+
+/* "待 fsync"请求的哈希表条目(哈希键为 tag,即 FileTag,见 sync.h):
+ * - tag       : 标识"由哪个 handler 处理、哪个文件";
+ * - cycle_ctr : 条目里"最老的请求"所属轮次(sync_cycle_ctr 登记时
+ *               的值)。同一文件的重复请求会合并进同一条目,此时
+ *               必须保留最早登记时的轮次,保证该轮不会被跳过;
+ * - canceled  : 是否已被取消(SYNC_FORGET/FILTER 请求标记)。为
+ *                true 时执行阶段跳过,但条目仍会被移除。 */
 typedef struct
 {
 	FileTag		tag;			/* identifies handler and file */
@@ -61,6 +112,12 @@ typedef struct
 	bool		canceled;		/* canceled is true if we canceled "recently" */
 } PendingFsyncEntry;
 
+/* "检查点后删除"请求的链表条目(用链表而非哈希表:预期不会出现
+ * 重复请求):
+ * - tag       : 标识要删除的文件;
+ * - cycle_ctr : 登记时的 checkpoint_cycle_ctr,用来判断该请求是否
+ *               迟于当前检查点开始(迟到的留到下一轮才删);
+ * - canceled  : 请求是否已被取消。 */
 typedef struct
 {
 	FileTag		tag;			/* identifies handler and file */
@@ -68,20 +125,40 @@ typedef struct
 	bool		canceled;		/* true if request has been canceled */
 } PendingUnlinkEntry;
 
+/* 待 fsync 请求的哈希表;待删除请求的链表;二者共用的内存上下文
+ * (挂在 TopMemoryContext 下,并被明确允许在 critical section 中
+ * 分配,见 InitSync 的说明)。只有"本地执行者"(standalone 后端、
+ * checkpointer)会创建它们;普通后端保持 NULL/NIL,仅转发请求。 */
 static HTAB *pendingOps = NULL;
 static List *pendingUnlinks = NIL;
 static MemoryContext pendingOpsCxt; /* context for the above  */
 
+/* sync_cycle_ctr:本轮 fsync 的轮次号。ProcessSyncRequests 开始时
+ * 加 1,此后新登记的请求带上新轮次,与"本轮应处理"的旧请求区分。
+ * checkpoint_cycle_ctr:本轮 unlink 的轮次号。SyncPreCheckpoint 时
+ * 加 1,用于判断删除请求的先后(见 SyncPreCheckpoint/SyncPostCheckpoint) */
 static CycleCtr sync_cycle_ctr = 0;
 static CycleCtr checkpoint_cycle_ctr = 0;
 
 /* Intervals for calling AbsorbSyncRequests */
+/* 处理若干条请求后吸收一次共享队列的间隔:fsync 每处理
+ * FSYNCS_PER_ABSORB 条、unlink 每处理 UNLINKS_PER_ABSORB 条,
+ * 就调用一次 AbsorbSyncRequests(),防止长时间不吸收导致
+ * checkpointer 的共享请求队列溢出 */
 #define FSYNCS_PER_ABSORB		10
 #define UNLINKS_PER_ABSORB		10
 
 /*
  * Function pointers for handling sync and unlink requests.
  */
+/* 某类文件(handler)的同步操作函数表:
+ * - sync_syncfiletag   : 对文件执行 fsync(返回 0 成功,<0 失败,
+ *                        失败原因在 errno,path 输出文件路径);
+ * - sync_unlinkfiletag : 删除文件(语义同上);
+ * - sync_filetagmatches: 判断一个候选 tag 是否与给定 tag 匹配
+ *                        (用于按范围取消请求,如取消整个关系的
+ *                        所有段的 fsync)。
+ * 新增文件类型时在此注册一组回调即可,队列逻辑无需改动。 */
 typedef struct SyncOps
 {
 	int			(*sync_syncfiletag) (const FileTag *ftag, char *path);
@@ -93,6 +170,13 @@ typedef struct SyncOps
 /*
  * These indexes must correspond to the values of the SyncRequestHandler enum.
  */
+/* 所有 handler 的操作函数表。数组下标必须与 sync.h 中
+ * SyncRequestHandler 枚举值严格对应:
+ * - md(magnetic disk)提供完整的三类回调,负责关系数据文件;
+ * - clog(pg_xact)、commit_ts(pg_commit_ts)、multixact 的
+ *   offsets/members 只需 fsync 回调——它们位于固定目录,删除走
+ *   目录级清理,不通过本队列;
+ * - 未提供的字段保持 NULL,调用方保证不会用到。 */
 static const SyncOps syncsw[] = {
 	/* magnetic disk */
 	[SYNC_HANDLER_MD] = {
@@ -120,6 +204,26 @@ static const SyncOps syncsw[] = {
 
 /*
  * Initialize data structures for the file sync tracking.
+ */
+/*
+ * InitSync (中文)初始化文件同步跟踪所需的数据结构
+ *
+ * 【作用】后端进程启动时调用。仅当本进程是"本地执行者"——standalone
+ * 后端(不在 postmaster 管理下)或 checkpointer 辅助进程——才创建
+ * pendingOps 哈希表、pendingUnlinks 链表及它们的内存上下文;普通
+ * 后端保持 pendingOps == NULL,意味着"我不执行同步,只把请求转发
+ * 给 checkpointer"(见 RegisterSyncRequest)。
+ *
+ * 【设计思想】
+ * - 用哈希表(pendingOps)收集待 fsync 请求:同一文件被反复登记时
+ *   自动合并为一条,天然完成去重;
+ * - 内存上下文显式调用 MemoryContextAllowInCriticalSection:
+ *   checkpointer 在吸收请求(AbsorbSyncRequests,可能发生在临界区
+ *   内)时也要向表中插入条目。代价是理论上临界区内可能内存耗尽
+ *   而 PANIC,但该表很小,实际几乎不可能发生。
+ *
+ * 【参数】无。
+ * 【返回值】无。
  */
 void
 InitSync(void)

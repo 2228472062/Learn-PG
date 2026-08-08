@@ -3,6 +3,52 @@
  * fd.c
  *	  Virtual file descriptor code.
  *
+ * 【模块总览(中文)】
+ * 本文件实现 PostgreSQL 后端的"虚拟文件描述符层"(VFD,Virtual File
+ * Descriptor),是数据库文件 I/O 的统一入口:所有内核文件描述符(fd)的
+ * 打开、读写、关闭、同步都经由这里的接口完成,上层(smgr/md.c、buffile.c
+ * 的排序/哈希临时文件、WAL 等)不再直接调用 open(2)/fopen(3) 等系统调用。
+ *
+ * 核心问题:单个进程能打开的内核 fd 数量有限(常见 ulimit -n 为 1024),
+ * 而一个后端同时可能持有大量文件的引用(基表、排序/哈希溢出文件、各类
+ * 临时文件、目录句柄、管道等),若直接使用内核 fd 极易超过上限而 EMFILE。
+ *
+ * 核心设计思想:引入"虚拟文件描述符"(Vfd)。每个 Vfd 是 VfdCache 数组中
+ * 的一个槽位,逻辑上代表"一个打开的文件"(记录文件名、打开标志、模式、
+ * 当前大小等);但内核 fd 只在真正使用时才分配(惰性打开),并按需在
+ * "逻辑打开、物理关闭"之间切换:
+ * - 真正占用内核 fd 的 Vfd 挂在一条双向 LRU 环上(以 VfdCache[0] 为
+ *   锚点);fd 不够用时,按 LRU 策略关闭最久未用的那个(ReleaseLruFile /
+ *   ReleaseLruFiles),需要时再按记录的重开参数自动重新打开(FileAccess /
+ *   LruInsert)。对上层透明,仿佛所有文件始终打开着。
+ * - 可用 fd 总数由 max_safe_fds 控制:postmaster 启动时用 set_max_safe_fds()
+ *   实测(count_usable_fds 反复 dup(2) 直到失败),扣除为 system() 等
+ *   不可控代码预留的 NUM_RESERVED_FDS 个后得到;GUC max_files_per_process
+ *   可进一步收紧,并由子进程 fork 继承。
+ *
+ * 按用途,fd.c 提供四类接口:
+ * 1) VFD 接口(长期持有、自动管理):PathNameOpenFile 打开关系文件
+ *    (md.c 的每段文件都由此打开);OpenTemporaryFile 创建匿名临时文件
+ *    (可选 temp_tablespaces 轮转,关闭时自动删除、计入 temp_file_limit)。
+ *    所有读写走 FileReadV/FileWriteV/FileSync/FileTruncate/FilePrefetch/
+ *    FileFallocate 等,统一由 FileAccess 保证 fd 已打开并处于 LRU 环头。
+ * 2) 事务级临时句柄(短生命周期、出错自动关闭):AllocateFile/AllocateDir/
+ *    OpenPipeStream/OpenTransientFile 分别封装 fopen/opendir/popen/open,
+ *    句柄登记进 allocatedDescs 数组并记录创建时的子事务号,事务 abort
+ *    时由 AtEOSubXact_Files/AtEOXact_Files/CleanupTempFiles 自动关闭,
+ *    防止 ereport 中断造成 fd 泄漏。
+ * 3) 裸 fd 接口(不计入 VFD 缓存):BasicOpenFile 直接调用 open(2),但在
+ *    EMFILE 时先释放一个 LRU fd 再重试;长期持有的"外部 fd"通过
+ *    AcquireExternalFD/ReserveExternalFD 记账,参与 max_safe_fds 预算。
+ * 4) 启动/退出清理:RemovePgTempFiles 清除上次运行残留的临时文件与临时
+ *    关系文件;SyncDataDirectory 在崩溃恢复后递归 fsync 数据目录,确保
+ *    旧会话未落盘的写操作全部持久化。
+ *
+ * 崩溃安全:durable_rename/durable_unlink 通过"先 fsync 旧文件、再
+ * rename/unlink、再 fsync 新文件及父目录"保证操作要么完整、要么完全不
+ * 生效;fsync 失败由 data_sync_elevel() 决定是否 PANIC,防止"数据已离开
+ * 缓冲池但未落盘"的窗口期造成不可恢复的损坏。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -104,6 +150,12 @@
 #include "utils/wait_event.h"
 
 /* Define PG_FLUSH_DATA_WORKS if we have an implementation for pg_flush_data */
+/* (中文)是否具备 pg_flush_data 的实现,三者满足其一即为 1:
+ * 1) HAVE_SYNC_FILE_RANGE(Linux 的 sync_file_range 方案);
+ * 2) 非 Windows 且定义 MS_ASYNC(mmap + msync 方案);
+ * 3) USE_POSIX_FADVISE 且定义 POSIX_FADV_DONTNEED(posix_fadvise 方案)。
+ * 它驱动数据目录的预同步(见 SyncDataDirectory)与 FileWriteback 的
+ * 写回提示。 */
 #if defined(HAVE_SYNC_FILE_RANGE)
 #define PG_FLUSH_DATA_WORKS 1
 #elif !defined(WIN32) && defined(MS_ASYNC)
@@ -127,6 +179,10 @@
  * the number of open files.  (This appears to be true on most if not
  * all platforms as of Feb 2004.)
  */
+/* (中文)必须为 system()、动态加载器以及其他"不经过 fd.c"的代码留出的
+ * 内核 fd 数量:它们偷偷打开文件时,要保证还有富余的 fd 可用。这是固定
+ * 常量,隐含假设此类代码不会长期占用 fd(否则额度不够);尤其是加载共享
+ * 库不应造成已打开文件数永久性上升。 */
 #define NUM_RESERVED_FDS		10
 
 /*
@@ -136,6 +192,9 @@
  * at least 16; as of this writing, the contrib/postgres_fdw regression tests
  * will not pass unless that can grow to at least 14.)
  */
+/* (中文)扣除预留数之后,可用 fd 若低于此值就拒绝启动(选值兼容
+ * "ulimit -n 64" 的情形)。该值同时保证 numExternalFDs 至少能到 16——
+ * 当前 contrib/postgres_fdw 的回归测试依赖此下限,勿随意改动。 */
 #define FD_MINFREE				48
 
 /*
@@ -145,6 +204,11 @@
  * what the postmaster's initial probe suggests will work.
  */
 int			max_files_per_process = 1000;
+
+/* (中文)GUC max_files_per_process:单进程允许打开的文件数上限(DBA 可调,
+ * 默认 1000)。postmaster 实测系统容量后,用它收紧 max_safe_fds
+ * (取系统可用数与它二者较小),防止"很多进程各自开很多文件"叠加击穿
+ * 系统全局限额。 */
 
 /*
  * Maximum number of file descriptors to open for operations that fd.c knows
@@ -159,20 +223,39 @@ int			max_files_per_process = 1000;
  */
 int			max_safe_fds = FD_MINFREE;	/* default if not changed */
 
+/* (中文)fd.c 允许使用的最大 fd 数:VFD、临时句柄(AllocateFile 等)与
+ * "外部 fd"三者的总预算,初始为保守值 FD_MINFREE。bootstrap 与单机
+ * 后端模式下永久保持该值;正常 postmaster 模式下,postmaster 在初始化
+ * 后期调用 set_max_safe_fds() 更新,子进程 fork 时继承。注意
+ * max_files_per_process 的影响已折算其中,调用处无需再单独校验。 */
+
 /* Whether it is safe to continue running after fsync() fails. */
+/* (中文)GUC data_sync_retry:fsync() 失败后是否允许继续运行。关闭时
+ * 一切 fsync 类失败都会被 data_sync_elevel() 提升为 PANIC,参见该函数
+ * 的说明。 */
 bool		data_sync_retry = false;
 
 /* How SyncDataDirectory() should do its job. */
+/* (中文)GUC recovery_init_sync_method:崩溃恢复/启动时 SyncDataDirectory()
+ * 采用哪种同步方式:逐文件 fsync,或(支持时)用 syncfs(2) 同步整个
+ * 文件系统。 */
 int			recovery_init_sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 
 /* How data files should be bulk-extended with zeros. */
+/* (中文)GUC file_extend_method:数据文件按块扩展(填零)时采用的方式
+ * (例如 fallocate 预分配 vs 逐块写零),默认 DEFAULT_FILE_EXTEND_METHOD。 */
 int			file_extend_method = DEFAULT_FILE_EXTEND_METHOD;
 
 /* Which kinds of files should be opened with PG_O_DIRECT. */
+/* (中文)GUC debug_io_direct 解析出的标志位(IO_DIRECT_DATA / IO_DIRECT_WAL
+ * / IO_DIRECT_WAL_INIT 的位或),决定哪些类别的文件用 PG_O_DIRECT 直接
+ * I/O 打开。 */
 int			io_direct_flags;
 
 /* Debugging.... */
 
+/* (中文)调试宏:FDDEBUG 编译时执行语句 A,但先保存、事后恢复 errno
+ * (避免调试日志的副作用改变程序行为);非 FDDEBUG 编译时为空操作。 */
 #ifdef FDDEBUG
 #define DO_DB(A) \
 	do { \
@@ -187,16 +270,55 @@ int			io_direct_flags;
 
 #define VFD_CLOSED (-1)
 
+/* (中文)Vfd.fd 的"物理关闭"哨兵值:-1。fd == VFD_CLOSED 表示该 Vfd
+ * 逻辑上打开、但内核 fd 已被 LRU 淘汰关闭。 */
+
 #define FileIsValid(file) \
 	((file) > 0 && (file) < (int) SizeVfdCache && VfdCache[file].fileName != NULL)
 
+/* (中文)判断 File 下标是否有效:下标在 (0, SizeVfdCache) 区间内且槽位
+ * fileName 非 NULL(该槽已分配在用)。fileName 是"槽位是否属于某个文件"
+ * 的唯一标记。 */
+
 #define FileIsNotOpen(file) (VfdCache[file].fd == VFD_CLOSED)
 
+/* (中文)判断 VFD 当前处于"物理关闭"状态(内核 fd 未分配)。"逻辑打开"
+ * 由 fileName 非 NULL 表示,与物理状态相互独立。 */
+
 /* these are the assigned bits in fdstate below: */
+/* (中文)fdstate 的位标志:
+ * FD_DELETE_AT_CLOSE —— 关闭该 VFD 时删除底层文件(匿名临时文件);
+ * FD_CLOSE_AT_EOXACT —— 事务结束时必须关闭(临时文件的备用清理机制,
+ *                        见 RegisterTemporaryFile 与 CleanupTempFiles);
+ * FD_TEMP_FILE_LIMIT —— 计入 temp_file_limit 限额与临时文件统计。 */
 #define FD_DELETE_AT_CLOSE	(1 << 0)	/* T = delete when closed */
 #define FD_CLOSE_AT_EOXACT	(1 << 1)	/* T = close at eoXact */
 #define FD_TEMP_FILE_LIMIT	(1 << 2)	/* T = respect temp_file_limit */
 
+/* (中文)Vfd —— 虚拟文件描述符,fd.c 的核心数据结构:
+ * 一个 Vfd 槽位"逻辑上"代表一个打开的文件,而内核 fd(fd 字段)只在
+ * 真正使用期间短暂存在,因此进程持有的内核 fd 数量与"逻辑打开文件数"
+ * 完全解耦——这正是 VFD 层能对上层透明管理 fd 配额的基础。
+ *
+ * 字段含义:
+ * - fd            : 当前绑定的内核 fd;VFD_CLOSED(-1) 表示"逻辑打开、
+ *                   物理关闭"状态;
+ * - fdstate       : 状态位,见 FD_DELETE_AT_CLOSE / FD_CLOSE_AT_EOXACT /
+ *                   FD_TEMP_FILE_LIMIT;
+ * - resowner      : 持有本文件的资源所有者(仅临时文件登记);非 NULL
+ *                   时事务结束会回调 ResOwnerReleaseFile 自动关闭;
+ * - nextFree      : 空闲链表(头为 VfdCache[0].nextFree)中下一个空闲槽;
+ *                   槽位在用期间此字段无意义;
+ * - lruMoreRecently / lruLessRecently : LRU 双向环的前后指针(锚点为
+ *                   VfdCache[0],环上只含"物理打开"的槽),方向约定见
+ *                   "Private Routines" 一节的说明;
+ * - fileSize      : 文件当前大小,只对临时文件(FD_TEMP_FILE_LIMIT)维护,
+ *                   用于 temp_file_limit 会计;非临时文件恒为 0;
+ * - fileName      : 文件路径(用 malloc 复制的副本,FreeVfd 时必须
+ *                   free;NULL 表示槽位空闲);
+ * - fileFlags/fileMode : 打开时的参数副本。fileFlags 已剔除
+ *                   O_CREAT|O_TRUNC|O_EXCL,保证被 LRU 关闭后能凭
+ *                   "fileName + fileFlags + fileMode"精确重新打开。 */
 typedef struct vfd
 {
 	int			fd;				/* current FD, or VFD_CLOSED if none */
@@ -217,18 +339,25 @@ typedef struct vfd
  * needed.  'File' values are indexes into this array.
  * Note that VfdCache[0] is not a usable VFD, just a list header.
  */
+/* (中文)VFD 数组指针与其大小:File 就是 VfdCache 的下标。数组按需增长
+ * (见 AllocateVfd)。注意 VfdCache[0] 不是可用槽位,只是 LRU 环与
+ * 空闲链表的头结点。 */
 static Vfd *VfdCache;
 static Size SizeVfdCache = 0;
 
 /*
  * Number of file descriptors known to be in use by VFD entries.
  */
+/* (中文)当前真正打开(绑定内核 fd)的 VFD 数,即 LRU 环上的元素数;
+ * 参与 max_safe_fds 的预算计算(见 ReleaseLruFiles)。 */
 static int	nfile = 0;
 
 /*
  * Flag to tell whether it's worth scanning VfdCache looking for temp files
  * to close
  */
+/* (中文)本事务是否出现过临时文件(置过 FD_CLOSE_AT_EOXACT):为 true 才
+ * 值得在事务结束时扫描 VfdCache 找待关临时文件,避免每事务做全表扫描。 */
 static bool have_xact_temporary_files = false;
 
 /*
@@ -237,9 +366,14 @@ static bool have_xact_temporary_files = false;
  * than INT_MAX kilobytes.  When not enforcing, it could theoretically
  * overflow, but we don't care.
  */
+/* (中文)当前会话所有临时文件的总字节数,用于 temp_file_limit 会计:
+ * 限额被强制时不会溢出(限额上限为 INT_MAX KB);不强制时限理论上有
+ * 溢出可能,但无碍。 */
 static uint64 temporary_files_size = 0;
 
 /* Temporary file access initialized and not yet shut down? */
+/* (中文)(仅 assert 构建)临时文件访问是否已初始化(InitTemporaryFileAccess
+ * 之后、BeforeShmemExit_Files 之前为 true),用于尽早暴露乱序调用。 */
 #ifdef USE_ASSERT_CHECKING
 static bool temporary_files_allowed = false;
 #endif
@@ -248,6 +382,8 @@ static bool temporary_files_allowed = false;
  * List of OS handles opened with AllocateFile, AllocateDir and
  * OpenTransientFile.
  */
+/* (中文)allocatedDescs 条目的句柄类型:FILE*(stdio 文件)、管道、DIR*
+ * (目录)与裸内核 fd。 */
 typedef enum
 {
 	AllocateDescFile,
@@ -268,19 +404,37 @@ typedef struct
 	}			desc;
 } AllocateDesc;
 
+/* (中文)临时句柄的登记项(AllocateFile/AllocateDir/OpenPipeStream/
+ * OpenTransientFile 打开的句柄都在此登记):
+ * - kind         : 句柄类型(见 AllocateDescKind);
+ * - desc         : 联合体,按 kind 存 FILE*/DIR*/裸 fd;
+ * - create_subid : 创建时的子事务号——子事务回滚时,凡 create_subid
+ *                  等于该子事务号的条目会被立即关闭(见 AtEOSubXact_Files)。
+ * 登记的意义:事务/子事务结束与进程退出时能统一关闭,防止 ereport
+ * 中断导致句柄泄漏。 */
+
 static int	numAllocatedDescs = 0;
 static int	maxAllocatedDescs = 0;
 static AllocateDesc *allocatedDescs = NULL;
 
+/* (中文)allocatedDescs 数组及其计数/容量:登记上述四类临时句柄。数组
+ * 按需分配/扩容(见 reserveAllocatedDesc),容量上限 max_safe_fds/3,
+ * 防止临时句柄挤占 VFD 与外部 fd 的预算。 */
+
 /*
  * Number of open "external" FDs reported to Reserve/ReleaseExternalFD.
  */
+/* (中文)当前已登记的外部 fd 数(经 AcquireExternalFD/ReserveExternalFD
+ * 记账、不由 fd.c 管控其生命周期的长期 fd),参与 max_safe_fds 预算
+ * 计算(见 ReleaseLruFiles)。 */
 static int	numExternalFDs = 0;
 
 /*
  * Number of temporary files opened during the current session;
  * this is used in generation of tempfile names.
  */
+/* (中文)本会话已创建的临时文件数,用于生成唯一临时文件名
+ * ("pgsql_tmp<pid>.<计数器>",见 OpenTemporaryFileInTablespace)。 */
 static long tempFileCounter = 0;
 
 /*
@@ -289,6 +443,14 @@ static long tempFileCounter = 0;
  * When numTempTableSpaces is -1, this has not been set in the current
  * transaction.
  */
+/* (中文)本事务的临时表空间 OID 列表及其状态:
+ * - tempTableSpaces : OID 数组(个别元素可为 InvalidOid,表示用当前库的
+ *   默认表空间);数组本身由调用方负责存活期(通常分配在
+ *   TopTransactionContext),fd.c 不拷贝;
+ * - numTempTableSpaces : 列表长度;-1 表示当前事务尚未调用
+ *   SetTempTablespaces;
+ * - nextTempTableSpace : 循环轮转指针(随机起点,见 SetTempTablespaces),
+ *   每建一个临时文件推进一次,把大量临时文件摊到各表空间。 */
 static Oid *tempTableSpaces = NULL;
 static int	numTempTableSpaces = -1;
 static int	nextTempTableSpace = 0;
@@ -326,6 +488,21 @@ static int	nextTempTableSpace = 0;
  *
  *--------------------
  */
+/* (中文)LRU 环的完整说明:
+ * 环是一条以 0 号元素为锚点的双向链表(逻辑上成环)。
+ * - 0 号元素不代表任何文件,其 fd 恒为 VFD_CLOSED,只是遍历的起点/
+ *   终点(环头/环尾的判定都以它为参照);
+ * - 只有"物理打开"(绑定了内核 fd)的 Vfd 才在环上;"逻辑打开"仅由
+ *   fileName 非 NULL 表示,其内核 fd 可随时被 LRU 淘汰关闭、再按需
+ *   重开;
+ * - 方向约定(与直觉相反):从锚点 0 沿 lruMoreRecently 走,到达的是
+ *   "最久未用"(LRU 端,即淘汰首选);从锚点 0 沿 lruLessRecently 走,
+ *   到达的是"最近使用"(MRU 端,新访问文件插入处)。因此:
+ *   - ReleaseLruFile() 淘汰 VfdCache[0].lruMoreRecently 所指元素;
+ *   - Insert() 把文件插在 0 与 VfdCache[0].lruLessRecently 之间。
+ * 上图为示例:0 经两条链与"最久未用""最近使用"接成环。
+ * Delete() 摘链、LruDelete() 摘链并关闭 fd、LruInsert() 打开并挂链、
+ * FileAccess() 负责"用前调取 + 提升 MRU"。 */
 static void Delete(File file);
 static void LruDelete(File file);
 static void Insert(File file);
@@ -359,6 +536,15 @@ static int	fsync_parent_path(const char *fname, int elevel);
 
 
 /* ResourceOwner callbacks to hold virtual file descriptors */
+/* (中文)File 资源的 ResourceOwner 描述符(file_resowner_desc):
+ * - release_phase 取 RESOURCE_RELEASE_AFTER_LOCKS(在锁释放之后)——
+ *   确保关闭文件不会先于仍需要文件的后锁处理逻辑;
+ * - release_priority 取 RELEASE_PRIO_FILES,参与资源所有者统一按优先级
+ *   排序的释放流程;
+ * - ReleaseResource 指向 ResOwnerReleaseFile:释放时关闭该 File;
+ * - DebugPrint 指向 ResOwnerPrintFile:调试时输出 "File <下标>"。
+ * 临时文件通过 RegisterTemporaryFile 按此描述登记,从而获得"事务结束
+ * 自动关闭删除"的能力。 */
 static void ResOwnerReleaseFile(Datum res);
 static char *ResOwnerPrintFile(Datum res);
 
@@ -372,6 +558,10 @@ static const ResourceOwnerDesc file_resowner_desc =
 };
 
 /* Convenience wrappers over ResourceOwnerRemember/Forget */
+/* (中文)便捷包装:通过通用 ResourceOwnerRemember/Forget 接口,以
+ * file_resowner_desc 描述的 "File" 资源类别登记/注销一个 File。
+ * 注意:登记前调用方必须已调用 ResourceOwnerEnlarge,否则可能因资源
+ * 所有者内部数组扩容失败而出错(见各打开函数对它的调用)。 */
 static inline void
 ResourceOwnerRememberFile(ResourceOwner owner, File file)
 {
@@ -385,6 +575,23 @@ ResourceOwnerForgetFile(ResourceOwner owner, File file)
 
 /*
  * pg_fsync --- do fsync with or without writethrough
+ */
+/* (中文)pg_fsync —— 对给定 fd 执行 fsync,按 wal_sync_method 选择是否
+ * 走"写透"(writethrough)方式。
+ *
+ * 【作用】fsync 的公共入口。若平台支持 F_FULLFSYNC 且 GUC
+ * wal_sync_method 为 WAL_SYNC_METHOD_FSYNC_WRITETHROUGH,则调用
+ * pg_fsync_writethrough(对某些 OS 而言强制数据真正落盘);否则退化为
+ * 普通 fsync(pg_fsync_no_writethrough)。
+ *
+ * 【设计思想】在启用 assert 的构建下,先用 fstat + fcntl(F_GETFL) 校验
+ * "交给 fsync 的描述符访问模式"的可移植性:普通文件必须带写权限
+ * (不能是 O_RDONLY),目录则必须只读——不同 OS 对 fsync 的访问模式
+ * 要求不一致,提前断言可避免把不可移植的代码带进系统。fstat 失败则
+ * 忽略检查,交给随后的 fsync 报错。
+ *
+ * 【参数】fd —— 待同步的内核文件描述符。
+ * 【返回值】0 成功;-1 失败(errno 保留系统错误码)。
  */
 int
 pg_fsync(int fd)
@@ -438,6 +645,16 @@ pg_fsync(int fd)
  * pg_fsync_no_writethrough --- same as fsync except does nothing if
  *	enableFsync is off
  */
+/* (中文)pg_fsync_no_writethrough —— 普通 fsync 的封装:唯一区别是
+ * enableFsync 关闭时什么都不做、直接返回 0(假装成功)。
+ *
+ * 【作用】检查 GUC enableFsync:被禁用时整个服务器不再做任何 fsync
+ * (常用于性能测试,此时崩溃可能丢数据,由使用者自负风险)。否则调用
+ * fsync(2),并对 EINTR(被信号打断)自动重试。
+ *
+ * 【参数】fd —— 待同步的内核文件描述符。
+ * 【返回值】fsync(2) 的结果:0 成功;-1 失败(errno 含错误码)。
+ */
 int
 pg_fsync_no_writethrough(int fd)
 {
@@ -458,6 +675,17 @@ retry:
 /*
  * pg_fsync_writethrough
  */
+/* (中文)pg_fsync_writethrough —— 带"写透"(writethrough)语义的 fsync:
+ * 在支持 F_FULLFSYNC 的平台上(macOS)用 fcntl(F_FULLFSYNC) 强制数据
+ * 真正到达物理介质,而非只刷内核缓存(该平台的 fsync 可靠性较弱)。
+ *
+ * 【设计思想】不支持 F_FULLFSYNC 的平台返回 ENOSYS,由调用者决定是否
+ * 回退到普通 fsync(见 pg_fsync 的分派逻辑)。enableFsync 关闭时同样
+ * 直接返回 0。
+ *
+ * 【参数】fd —— 待同步的内核文件描述符。
+ * 【返回值】0 成功;-1 失败(errno 含错误码;不支持时 errno=ENOSYS)。
+ */
 int
 pg_fsync_writethrough(int fd)
 {
@@ -476,6 +704,16 @@ pg_fsync_writethrough(int fd)
 
 /*
  * pg_fdatasync --- same as fdatasync except does nothing if enableFsync is off
+ */
+/* (中文)pg_fdatasync —— fdatasync(2) 的封装:enableFsync 关闭时直接返回
+ * 0,否则调用 fdatasync 并处理 EINTR 重试。
+ *
+ * 【设计思想】fdatasync 只同步文件数据、不强制刷新文件元数据(如修改
+ * 时间),比 fsync 便宜,适合"只要求数据落盘、不关心元数据一致性"的
+ * 场景。
+ *
+ * 【参数】fd —— 待同步的内核文件描述符。
+ * 【返回值】fdatasync(2) 的结果:0 成功;-1 失败(errno 含错误码)。
  */
 int
 pg_fdatasync(int fd)
@@ -500,6 +738,17 @@ retry:
  * This requires an absolute path to the file.  Returns true if the file is
  * not a directory, false otherwise.
  */
+/* (中文)pg_file_exists —— 判断给定绝对路径上的"文件"是否存在(且不是
+ * 目录)。
+ *
+ * 【作用】stat(2) 成功且非目录 → true;因 ENOENT / ENOTDIR / EACCES
+ * 失败 → false(不存在或路径不可访问,均视为"没有");其他 stat 错误
+ * (如 EIO)则报 ERROR。stat 不需要文件读权限,只要路径上各级目录的
+ * 搜索权限即可,因此本函数能正确回答"文件在不在"。
+ *
+ * 【参数】name —— 文件的绝对路径(调用方须保证非空)。
+ * 【返回值】文件存在且不是目录返回 true,否则 false。
+ */
 bool
 pg_file_exists(const char *name)
 {
@@ -521,6 +770,30 @@ pg_file_exists(const char *name)
  * pg_flush_data --- advise OS that the described dirty data should be flushed
  *
  * offset of 0 with nbytes 0 means that the entire file should be flushed
+ */
+/* (中文)pg_flush_data —— 建议操作系统尽快把文件 [offset, offset+nbytes)
+ * 区间的脏数据写回磁盘(异步提示,不等待完成)。offset=0 且 nbytes=0
+ * 表示"整个文件"。
+ *
+ * 【作用】主要用于大规模写盘前"预热"写回(如数据目录预同步、写回
+ * 提示),让后续 fsync/fdatasync 的同步等待更短。这仅是性能优化,
+ * 失败只告警不致命。注意:enableFsync 关闭时直接返回,不做任何事。
+ *
+ * 【设计思想】按平台优先级选择实现,并把全部可用实现编译进可执行
+ * 文件,以便尽早暴露可移植性问题:
+ * 1) sync_file_range(SYNC_FILE_RANGE_WRITE)(Linux):只启动指定区间
+ *    的写回、不等待——最理想,它不冲刷干净缓存页(对比方案 3);内核
+ *    未实现(ENOSYS,如 WSL)时只警告一次并永久放弃该路径;
+ * 2) mmap + msync(MS_ASYNC)(其他 Unix):映射文件区间、异步同步、
+ *    再 munmap。需要按页对齐(部分平台拒绝部分页 mmap;且作为提示
+ *    多刷少刷无所谓);mmap 失败(如 32 位平台地址空间不足)静默转用
+ *    下一种;munmap 失败是 FATAL(映射残留会造成脏数据丢失窗口);
+ * 3) posix_fadvise(POSIX_FADV_DONTNEED):把区间从内核缓存中逐出,
+ *    副作用是既写出脏数据、又丢弃有用的干净缓存,故最不优先。
+ *
+ * 【参数】fd —— 文件描述符;offset —— 起始偏移;nbytes —— 长度
+ * (0 表示整文件)。
+ * 【返回值】无。
  */
 void
 pg_flush_data(int fd, pgoff_t offset, pgoff_t nbytes)
@@ -700,6 +973,11 @@ retry:
 /*
  * Truncate an open file to a given length.
  */
+/* (中文)pg_ftruncate —— ftruncate(2) 的静态封装:处理 EINTR 重试。
+ *
+ * 【参数】fd —— 文件描述符;length —— 截断后的目标大小。
+ * 【返回值】0 成功;-1 失败(errno 含错误码)。
+ */
 static int
 pg_ftruncate(int fd, pgoff_t length)
 {
@@ -716,6 +994,16 @@ retry:
 
 /*
  * Truncate a file to a given length by name.
+ */
+/* (中文)pg_truncate —— 按路径名截断文件(truncate(2) 的封装)。
+ *
+ * 【作用】非 Windows 平台直接调用 truncate(2) 并处理 EINTR;Windows 上
+ * truncate(2) 不存在,改为先用 OpenTransientFile 打开(O_RDWR,顺带获得
+ * fd.c 的 EMFILE 防护),再用 pg_ftruncate 截断,最后 CloseTransientFile
+ * 关闭。无论哪条路径,返回前都把错误码恢复到 errno。
+ *
+ * 【参数】path —— 文件路径;length —— 截断后的目标大小。
+ * 【返回值】0 成功;-1 失败(errno 含错误码)。
  */
 int
 pg_truncate(const char *path, pgoff_t length)
@@ -753,6 +1041,16 @@ retry:
  * Try to fsync a file or directory. When doing the latter, ignore errors that
  * indicate the OS just doesn't allow/require fsyncing directories.
  */
+/* (中文)fsync_fname —— 同步单个文件或目录(fsync_fname_ext 的便捷封装)。
+ *
+ * 【作用】以"不忽略权限错误"、错误级别经 data_sync_elevel(ERROR) 换算
+ * (默认 PANIC,见 data_sync_elevel)调用 fsync_fname_ext;其中"OS 不
+ * 允许/不要求 fsync 目录"一类的无害错误已被内部消化。
+ *
+ * 【参数】fname —— 文件或目录路径;isdir —— true 表示目标是目录
+ * (目录必须用 O_RDONLY 打开,见 fsync_fname_ext)。
+ * 【返回值】无(失败按上述级别报错)。
+ */
 void
 fsync_fname(const char *fname, bool isdir)
 {
@@ -778,6 +1076,31 @@ fsync_fname(const char *fname, bool isdir)
  *
  * Returns 0 if the operation succeeded, -1 otherwise. Note that errno is not
  * valid upon return.
+ */
+/* (中文)durable_rename —— 持久化 rename(2):用多步 fsync 保证重命名
+ * 的效果在崩溃后依然存在。
+ *
+ * 【作用】被 md 层等处用于"把文件搬移到最终位置"。返回后保证:要么
+ * 旧文件原位不动、要么新文件完整在位;绝不可能出现"两个都不在"或
+ * "新文件是截断的半成品"。即使执行过程中崩溃,也只会留下上述两种
+ * 完整状态之一。
+ *
+ * 【设计思想】崩溃安全的关键是操作顺序:
+ * 1) 先 fsync 旧文件——保证其内容已落盘,崩溃后即使旧名字下的数据才
+ *    是权威版本,内容也完整;
+ * 2) 若目标文件已存在,fsync 它——保证"源或目标必有一个完整存在",
+ *    简化崩溃推演;
+ * 3) rename(2) 原子替换;
+ * 4) 对新名字的文件 fsync——新文件的数据落盘;
+ * 5) fsync 新文件的父目录——目录项(文件名→inode 的映射)的修改落盘,
+ *    否则崩溃后目录项可能回退为旧状态。
+ * 限制:rename 不能跨文件系统,故本函数不支持跨目录使用(调用方须自行
+ * 保证同文件系统)。
+ *
+ * 【参数】oldfile —— 旧路径;newfile —— 新路径;elevel —— 出错时的
+ * 报告级别。
+ * 【返回值】0 成功;-1 失败。注意:失败时 errno 可能已被内部清理,
+ * 不再可靠。
  */
 int
 durable_rename(const char *oldfile, const char *newfile, int elevel)
@@ -869,6 +1192,16 @@ durable_rename(const char *oldfile, const char *newfile, int elevel)
  * Returns 0 if the operation succeeded, -1 otherwise. Note that errno is not
  * valid upon return.
  */
+/* (中文)durable_unlink —— 持久化 unlink(2):删除文件后 fsync 其父目录,
+ * 保证删除效果在崩溃后依然生效。
+ *
+ * 【作用】先 unlink 删除文件,再 fsync 父目录——否则"目录项被删除"
+ * 这一元数据变更可能只停留在内存缓存,崩溃后文件会"复活"。执行过程
+ * 中崩溃不会留下混合状态。
+ *
+ * 【参数】fname —— 要删除的文件路径;elevel —— 出错时的报告级别。
+ * 【返回值】0 成功;-1 失败(失败时 errno 不可靠)。
+ */
 int
 durable_unlink(const char *fname, int elevel)
 {
@@ -899,6 +1232,21 @@ durable_unlink(const char *fname, int elevel)
  *
  * Note that this does not initialize temporary file access, that is
  * separately initialized via InitTemporaryFileAccess().
+ */
+/* (中文)InitFileAccess —— 初始化 fd.c 模块(每个后端启动时调用一次,
+ * postmaster 不调用)。
+ *
+ * 【作用】分配并清零 VfdCache 数组的头元素(锚点,下标 0):其 fd 恒为
+ * VFD_CLOSED、fileName 为 NULL,仅作为 LRU 环与空闲链表的头结点使用;
+ * SizeVfdCache 置为 1。真正可用的 Vfd 槽位由 AllocateVfd 按需分配。
+ *
+ * 【设计思想】分配使用 malloc(而非 palloc)——本模块在事务体系之外
+ * 也要可用(后端启动早期、进程退出清理阶段),且 VfdCache 的寿命是
+ * 整个进程。注意:临时文件访问并不在此初始化,须另行调用
+ * InitTemporaryFileAccess。
+ *
+ * 【参数】无。
+ * 【返回值】无。只允许调用一次(assert 校验 SizeVfdCache == 0)。
  */
 void
 InitFileAccess(void)

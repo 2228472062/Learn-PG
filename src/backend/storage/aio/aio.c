@@ -826,11 +826,6 @@ pgaio_io_needs_synchronous_execution(PgAioHandle *ioh)
  * Should be called by IO methods / synchronous IO execution, just before the
  * IO is performed.
  */
- * Handle IO being processed by IO method.
- *
- * Should be called by IO methods / synchronous IO execution, just before the
- * IO is performed.
- */
 /*
  * pgaio_io_prepare_submit - (中文)IO 即将交给方法执行前的统一准备
  *
@@ -1967,6 +1962,22 @@ pgaio_closing_fd(int fd)
 /*
  * Registered as before_shmem_exit() callback in pgaio_init_backend()
  */
+/*
+ * pgaio_shutdown - (中文)后端进程退出前的 AIO 收尾
+ *
+ * 【作用】以 before_shmem_exit() 回调的形式在进程退出时执行:
+ * 1. 先按事务边界语义清理(AtEOXact_Aio,处理可能残留的批模式);
+ * 2. 等待全部 in-flight IO 完成(反复取链表头等待,原因同
+ *    pgaio_closing_fd)。目的有二:
+ *    - 部分内核级 AIO 机制(如 io_uring)对"发起者先于 IO 完成退出"
+ *      的处理不友好,可能丢完成事件;
+ *    - 避免统计视图里残留"半截" IO,便于排查。
+ * 3. 把 pgaio_my_backend 置 NULL,标志本进程 AIO 已退役。
+ *
+ * 【参数】code —— 进程退出码(传给 AtEOXact_Aio 判断是否正常退出);
+ *        arg  —— 未使用。
+ * 【返回值】无。
+ */
 void
 pgaio_shutdown(int code, Datum arg)
 {
@@ -2001,6 +2012,21 @@ pgaio_shutdown(int code, Datum arg)
 	pgaio_my_backend = NULL;
 }
 
+/*
+ * assign_io_method - (中文)io_method GUC 的赋值钩子:切换 AIO 实现
+ *
+ * 【作用】每次给 io_method GUC 赋值(含启动时按默认值装载)都会调用:
+ * 从 pgaio_method_ops_table 按新值选取对应的 IoMethodOps,存入全局
+ * pgaio_method_ops。此后所有方法调用(提交/等待/检查)自动走新实现。
+ *
+ * 【设计思想】用"数据表 + 指针"而非 switch 散落各处,新增实现只需
+ * 在表里加一行。赋值钩子即时生效,便于运行中调试切换(sync 模式也
+ * 被用于验证无 AIO 时的正确性)。
+ *
+ * 【参数】newval —— 新枚举值(IOMETHOD_SYNC/WORKER/IO_URING);
+ *        extra  —— 未使用。
+ * 【返回值】无。
+ */
 void
 assign_io_method(int newval, void *extra)
 {
@@ -2010,6 +2036,17 @@ assign_io_method(int newval, void *extra)
 	pgaio_method_ops = pgaio_method_ops_table[newval];
 }
 
+/*
+ * check_io_max_concurrency - (中文)io_max_concurrency GUC 的校验钩子
+ *
+ * 【作用】GUC 赋值前校验:允许 -1(表示"启动时再按系统环境自动整定",
+ * 因为整定依赖其他 GUC 的最终值)或任意正整数;0 非法(没有并发度
+ * 的 AIO 没有意义),给出明确错误详情。
+ *
+ * 【参数】newval —— 待赋值(可被修改);extra —— 输出 GUC 附加数据;
+ *        source —— 赋值来源(会话/PGC_POSTMASTER 等)。
+ * 【返回值】true = 接受该值;false = 拒绝(附错误详情)。
+ */
 bool
 check_io_max_concurrency(int *newval, void **extra, GucSource source)
 {
