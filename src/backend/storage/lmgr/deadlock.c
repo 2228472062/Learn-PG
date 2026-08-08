@@ -6,6 +6,43 @@
  * See src/backend/storage/lmgr/README for a description of the deadlock
  * detection and resolution algorithms.
  *
+ * 【模块总览(中文)】
+ * 本文件实现 PostgreSQL 的死锁检测与消解算法。
+ *
+ * 【背景】当进程 A 等待 B 持有的锁、B 又在等待 C 持有的锁……形成环时,
+ * 死锁就发生了。PostgreSQL 的策略是:等锁的进程在 deadlock_timeout
+ * 之后会被唤醒执行死锁检测(见 proc.c 的 CheckDeadLock → DeadLockCheck),
+ * 若确认死锁,选择牺牲一个进程回滚其事务,而不是无限等待下去。
+ *
+ * 【核心概念】
+ * - 等待图(waits-for graph):节点是"锁组领导进程",边是"等待关系"。
+ *   - 硬边(hard edge):等待者真的在等某个持锁者持有的锁;
+ *   - 软边(soft edge):等待者排在锁的等待队列中、排在某进程之后,
+ *     后者尚未持有锁、只是先到先等。软边之所以"软",是因为调整等待
+ *     队列顺序就可以消除——这正是本文件消解死锁的手段。
+ * - 检测方法:从给定进程出发做深度优先搜索(FindLockCycleRecurse),
+ *   用"深度优先数 + 已访问标记"发现环;回到起点(i == 0)说明存在
+ *   包含起点的死锁环。
+ * - 消解方法(DeadLockCheckRecurse + TestConfiguration + TopoSort):
+ *   对检测到的每个软环,尝试反转其中一条软边(即把"阻塞者"排到
+ *   "等待者"前面),得到一个"约束";若所有约束能同时满足且不再有环,
+ *   就按 TopoSort 给出的新顺序重排相关锁的等待队列,死锁即被消除
+ *   (返回 DS_SOFT_DEADLOCK);若怎么试都有环,则必须牺牲一个进程
+ *   (DS_HARD_DEADLOCK)。
+ *
+ * 【设计细节】
+ * - 检测在"已持有锁表全部分区锁"的条件下进行(调用者保证),因此
+ *   可以安全地遍历共享锁表;但这也要求本文件的算法工作区(visitedProcs
+ *   等数组)在后端启动时就分配好(InitDeadLockChecking),且检测期间
+ *   不能做任何可能出错/等待的操作。
+ * - 锁组(lock group)支持:并行查询中组内进程的锁互为"同一人",
+ *   检测时一律用组长(leader)代表整组,组内成员的等待也算组长的边。
+ * - deadlockDetails[] 保存环上每一条边的(锁标签、锁模式、PID)信息,
+ *   供 DeadLockReport 在释放分区锁之后打印详细报告。
+ * - 本文件还与 FastPathStrongRelationLocks 配合:fast-path 锁对死锁
+ *   检测不可见,因此强锁(fast-path 冲突锁)获取前必须先调用
+ *   FastPathTransferRelationLocks 把相关 fast-path 锁迁移进主锁表
+ *   (见 lock.c)。
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -53,6 +90,17 @@ typedef struct
 	int			link;			/* workspace for TopoSort */
 } EDGE;
 
+/* (中文)等待图(watts-for graph)的一条边:
+ * - waiter  : 等待方的锁组组长(若进程不属于任何锁组,组长就是它自己);
+ * - blocker : 被等待方的锁组组长;
+ * - lock    : 双方围绕的那把锁;
+ * - pred/link : 是 TopoSort 的临时工作字段:pred 记录"本约束对应的
+ *   等待者在下标数组中的位置",link 把同一把锁的所有"after 约束"
+ *   串成链表(TopoSort 内用完即弃)。
+ * 一条边代表"waiter 因为 lock 排在 blocker(或其组员)之后/被其持有
+ * 而必须等"。若 waiter 的锁组里至少有一个组员在 lock 的等待队列上,
+ * 这条边就成立(哪怕 waiter 自己根本没在等)。 */
+
 /* One potential reordering of a lock's wait queue */
 typedef struct
 {
@@ -60,6 +108,14 @@ typedef struct
 	PGPROC	  **procs;			/* array of PGPROC *'s in new wait order */
 	int			nProcs;
 } WAIT_ORDER;
+
+/* (中文)一把锁的等待队列的"一种候选重排方案":
+ * - lock   : 被重排的那把锁;
+ * - procs  : 按新顺序排列的等待者数组(PGPROC 指针),数组空间取自
+ *   工作区 waitOrderProcs;
+ * - nProcs : 队列长度。
+ * ExpandConstraints + TopoSort 为每条受约束的锁生成一个 WAIT_ORDER,
+ * 死锁消解成功后,DeadLockCheck 按这些方案重建各锁的等待队列。 */
 
 /*
  * Information saved about each edge in a detected deadlock cycle.  This
@@ -75,6 +131,14 @@ typedef struct
 	LOCKMODE	lockmode;		/* type of lock we're waiting for */
 	int			pid;			/* PID of blocked backend */
 } DEADLOCK_INFO;
+
+/* (中文)死锁环中"一条边"的打印用快照:
+ * 检测算法在持全部分区锁时运行,而报告(DeadLockReport)要在放锁之后
+ * 打印,那时 LOCK/PGPROC 指针可能已失效,所以检测阶段就把环上每一条
+ * 等待边的信息提取成纯值:被等的锁标签 locktag、等待的锁模式 lockmode、
+ * 等待方进程的 PID。数组按环的顺序存放(deadlockDetails[i] 被
+ * deadlockDetails[i+1] 阻塞,最后一个被第一个阻塞),长度
+ * nDeadlockDetails 即环的长度。 */
 
 
 static bool DeadLockCheckRecurse(PGPROC *proc);
@@ -102,21 +166,43 @@ static void PrintLockQueue(LOCK *lock, const char *info);
 /* Workspace for FindLockCycle */
 static PGPROC **visitedProcs;	/* Array of visited procs */
 static int	nVisitedProcs;
+/* (中文)FindLockCycle 的工作区:
+ * visitedProcs 是"深度优先搜索已访问进程"的数组(按访问顺序,下标 0
+ * 即搜索起点),nVisitedProcs 是当前已访问个数。DFS 中若再次遇到
+ * visitedProcs[0] 就构成死锁环;数组容量 MaxBackends,在
+ * InitDeadLockChecking 时一次性分配(检测期间持全部分区锁,不能临时
+ * 分配内存)。 */
 
 /* Workspace for TopoSort */
 static PGPROC **topoProcs;		/* Array of not-yet-output procs */
 static int *beforeConstraints;	/* Counts of remaining before-constraints */
 static int *afterConstraints;	/* List head for after-constraints */
+/* (中文)TopoSort 的工作区(复用 visitedProcs 的空间,二者不同时运行):
+ * - topoProcs[]      : 等待队列的当前顺序副本,排序过程中逐个置 NULL
+ *                       表示"已输出";
+ * - beforeConstraints[i] : 下标 i 的进程还差多少个"必须先于别人"的
+ *                       约束未满足(0 表示可以输出;-1 表示与组长合并
+ *                       输出,不单独参与排序);
+ * - afterConstraints[i] : 以 i 为"后置者"的约束链表的表头(链指针存
+ *                       在 EDGE.link 里,表头存的是 i+1,0 表示空)。 */
 
 /* Output area for ExpandConstraints */
 static WAIT_ORDER *waitOrders;	/* Array of proposed queue rearrangements */
 static int	nWaitOrders;
 static PGPROC **waitOrderProcs; /* Space for waitOrders queue contents */
+/* (中文)ExpandConstraints 的输出区:waitOrders[] 记录对若干把锁的
+ * 重排方案(最多 MaxBackends/2 个——形成一条软边至少要两个等待者),
+ * waitOrderProcs[] 是这些方案共用的等待者指针空间(总长 MaxBackends),
+ * nWaitOrders 是当前方案个数。 */
 
 /* Current list of constraints being considered */
 static EDGE *curConstraints;
 static int	nCurConstraints;
 static int	maxCurConstraints;
+/* (中文)当前正在尝试的约束集合:curConstraints[] 是递归搜索(死锁消解)
+ * 当前层的约束列表,nCurConstraints 为个数,maxCurConstraints 为容量
+ * (MaxBackends,同时限制 DeadLockCheckRecurse 的最大递归深度,防止
+ * 栈溢出)。每个约束都是"一条需要反转的软边"。 */
 
 /* Storage space for results from FindLockCycle */
 static EDGE *possibleConstraints;
@@ -124,9 +210,17 @@ static int	nPossibleConstraints;
 static int	maxPossibleConstraints;
 static DEADLOCK_INFO *deadlockDetails;
 static int	nDeadlockDetails;
+/* (中文)FindLockCycle 的结果区:
+ * - possibleConstraints[] : 暂存各次检测找到的软边(容量 4*MaxBackends;
+ *   后 MaxBackends 个条目作为 FindLockCycle 的输出工作区);
+ * - deadlockDetails[]     : 环上各边的打印用快照(见 DEADLOCK_INFO);
+ * - nDeadlockDetails      : 环的长度(边数)。 */
 
 /* PGPROC pointer of any blocking autovacuum worker found */
 static PGPROC *blocking_autovacuum_proc = NULL;
+/* (中文)若发现"直接硬阻塞本进程"的是某个 autovacuum 工作进程,记下其
+ * PGPROC(用于向 autovacuum 发取消信号,见 GetBlockingAutoVacuumPgproc;
+ * 间接阻塞者不在此列,由直接阻塞者去处理)。 */
 
 
 /*
@@ -138,6 +232,33 @@ static PGPROC *blocking_autovacuum_proc = NULL;
  * inheritance of workspace from the postmaster.  We allocate the space at
  * startup because the deadlock checker is run with all the partitions of the
  * lock table locked, and we want to keep that section as short as possible.
+ */
+/*
+ * InitDeadLockChecking
+ *      (中文)后端启动时初始化死锁检测器的工作区
+ *
+ * 【作用】一次性为死锁检测分配全部工作内存(见上方各静态全局变量的
+ * 中文注释),并把指针初始化好。
+ *
+ * 【设计思想】为什么要在启动时分配:
+ * - 死锁检测是在"锁表全部分区锁全部被持有"的条件下运行的,那段临界区
+ *   要尽可能短,绝不能在检测过程中做 palloc(可能触发内存上下文锁等
+ *   与锁表无关但会出错的路径);
+ * - 工作区只依赖 MaxBackends 等启动期常量,大小固定,完全可以预分配;
+ * - 每个后端各自分配(而非继承 postmaster 的写时复制拷贝),避免所有
+ *   后端共享同一份工作区的错觉(各后端是独立进程,本来也互不干扰,
+ *   这里只是习惯性避免 COW 内存被改写)。
+ *
+ * 【容量论证】
+ * - FindLockCycle 最多访问 MaxBackends 个进程;
+ * - TopoSort 与 FindLockCycle 不同时运行,可复用同一块 visitedProcs;
+ * - 最多需要重排 MaxBackends/2 个等待队列(一条软边至少两个等待者),
+ *   展开后等待者总数不超过 MaxBackends;
+ * - 约束最多 MaxBackends 条(这也决定了 DeadLockCheckRecurse 的递归
+ *   深度上限);possibleConstraints 预留 4*MaxBackends 条,其中末尾
+ *   MaxBackends 条固定留给 FindLockCycle 作输出。
+ *
+ * 【参数】无。【返回值】无(只设置各静态全局变量)。
  */
 void
 InitDeadLockChecking(void)
@@ -216,6 +337,32 @@ InitDeadLockChecking(void)
  * subsequent printing by DeadLockReport().  That activity is separate
  * because we don't want to do it while holding all those LWLocks.
  */
+/*
+ * DeadLockCheck
+ *      (中文)为给定进程做死锁检测;若能消解,重排等待队列;否则判定硬死锁
+ *
+ * 【作用】这是死锁检测的对外入口(由 proc.c 在等锁超时后调用):
+ * 1. 重置约束集合等状态;
+ * 2. DeadLockCheckRecurse(proc) 递归搜索:为找到的每个软环尝试添加
+ *    "反转软边"约束,直到某组约束完全消除死锁;
+ * 3. 若找到可行方案,把 waitOrders[] 里的重排逐个应用到对应锁的等待
+ *    队列上,并调用 ProcLockWakeup 让可能因此变可授予的等待者醒来;
+ * 4. 若无论如何都有环(硬死锁),最后再跑一次 FindLockCycle,把环的
+ *    细节填进 deadlockDetails[],供 DeadLockReport 使用,返回
+ *    DS_HARD_DEADLOCK 让调用者牺牲本进程的事务。
+ *
+ * 【调用前置条件】调用者必须已持有锁表的全部分区锁(锁管理器的所有
+ * LWLock),因此本函数内部不能再获取任何锁,也不能报错(唯一例外是
+ * elog(FATAL),用于检测结果自相矛盾这种不可能情况)。
+ *
+ * 【返回值】DeadLockState 枚举:
+ * - DS_HARD_DEADLOCK : 死锁无法消解,调用者应中止本事务(注意此时
+ *                      已为 DeadLockReport 准备好细节);
+ * - DS_SOFT_DEADLOCK : 通过重排等待队列消解了死锁(nWaitOrders > 0);
+ * - DS_BLOCKED_BY_AUTOVACUUM : 未死锁,但本进程正被 autovacuum 硬阻塞
+ *                      (调用者可考虑取消该 autovacuum);
+ * - DS_NO_DEADLOCK    : 一切正常,没有死锁。
+ */
 DeadLockState
 DeadLockCheck(PGPROC *proc)
 {
@@ -286,6 +433,23 @@ DeadLockCheck(PGPROC *proc)
  *
  * We reset the saved pointer as soon as we pass it back.
  */
+/*
+ * GetBlockingAutoVacuumPgproc
+ *      (中文)取回"阻塞本进程的 autovacuum"的 PGPROC(一次性)
+ *
+ * 【作用】当 DeadLockCheck 返回 DS_BLOCKED_BY_AUTOVACUUM 时,调用者
+ * 用本函数取回记录的那个 autovacuum 进程,以便决定是否给它发送取消
+ * 信号。取出后内部指针立即清空(一次性读取语义,避免重复取消)。
+ *
+ * 【设计思想】为什么不直接把指针放进返回值:DeadLockCheck 的返回值
+ * 是 DeadLockState 枚举,不便再带出指针;且"是否真的取消 autovacuum"
+ * 由上层(ProcSleep 的调用链,最终是 lock.c 的等待逻辑)权衡决定——
+ * 必须保证 autovacuum 有至少 deadlock_timeout 的宽限期,因此这里只
+ * 负责安全地传递指针。
+ *
+ * 【参数】无。
+ * 【返回值】记录的 autovacuum 的 PGPROC 指针;没有则返回 NULL。
+ */
 PGPROC *
 GetBlockingAutoVacuumPgproc(void)
 {
@@ -307,6 +471,31 @@ GetBlockingAutoVacuumPgproc(void)
  * Returns true if no solution exists.  Returns false if a deadlock-free
  * state is attainable, in which case waitOrders[] shows the required
  * rearrangements of lock wait queues (if any).
+ */
+/*
+ * DeadLockCheckRecurse
+ *      (中文)递归搜索"能消解死锁的约束组合"的尝试过程
+ *
+ * 【作用】在"当前约束集合"基础上继续搜索:
+ * 1. TestConfiguration(proc) 检验当前配置:
+ *    - 返回值 < 0:硬死锁或约束自相矛盾 → 无解,返回 true;
+ *    - 返回值 0:配置合法、无死锁 → 找到解,返回 false;
+ *    - 返回值 > 0:存在软环,返回其中一环的软边列表(写入
+ *      possibleConstraints 尾部)。
+ * 2. 若还有递归空间,依次把每条软边当作"新约束"加入 curConstraints
+ *    后递归;只要任一分支成功就回溯返回成功。
+ * 3. 全部失败则恢复 nPossibleConstraints 并返回 true(无解)。
+ *
+ * 【设计思想】这是典型的"回溯搜索":软环的每条软边都可能通过重排
+ * 消除,而消除一条软边可能又引出新的软环(别的锁上),因此逐层尝试
+ * 直到所有环都被打破。possibleConstraints 满了(savedList = false)时,
+ * 不保存软边列表,而在下一层递归前重新调用 TestConfiguration 现场
+ * 重算(结果必须一致,否则 FATAL——检测期间状态不允许变化)。
+ * 注意递归深度受 maxCurConstraints(= MaxBackends)限制。
+ *
+ * 【参数】proc —— 死锁检测的起点进程(锁组组长)。
+ * 【返回值】true = 无解(硬死锁);false = 找到无死锁配置(此时
+ * waitOrders[] 给出所需的重排方案)。
  */
 static bool
 DeadLockCheckRecurse(PGPROC *proc)
@@ -373,6 +562,22 @@ DeadLockCheckRecurse(PGPROC *proc)
  * possibleConstraints+nPossibleConstraints.  The return value is the
  * number of soft edges.
  *--------------------
+ */
+/*
+ * TestConfiguration
+ *      (中文)检验一组约束配置是否可行,并报告其中的软环
+ *
+ * 【作用】对"当前约束集合(curConstraints)"做两项检验:
+ * 1. ExpandConstraints:把约束展开成各锁等待队列的具体重排;若约束
+ *    互相矛盾(例如要求 A 同时排在 B 前又排在 B 后),返回 -1;
+ * 2. FindLockCycle:分别在每个约束的 waiter/blocker、以及起点进程上
+ *    检查是否还有环(先查约束涉及的进程,最后查起点——因为若起点
+ *    还有软环,应当优先处理它的)。找到软环就把环的软边列表写进
+ *    possibleConstraints 的末尾(由调用者保管),返回软边条数。
+ *
+ * 【返回值】0 = 配置合法无死锁;>0 = 存在软死锁,返回值是所选软环的
+ * 软边条数(列表在 possibleConstraints+nPossibleConstraints 处);
+ * -1 = 硬死锁或配置自相矛盾。
  */
 static int
 TestConfiguration(PGPROC *startProc)
@@ -442,6 +647,27 @@ TestConfiguration(PGPROC *startProc)
  * table of hypothetical queue orders in waitOrders[].  These orders will
  * be believed in preference to the actual ordering seen in the locktable.
  */
+/*
+ * FindLockCycle
+ *      (中文)从给定进程出发,检查等待图中是否存在包含它的死锁环
+ *
+ * 【作用】这是"基本环检测"的包装:重置 visitedProcs / deadlockDetails
+ * 计数后,以 checkProc 为起点做深度优先搜索。找到环返回 true,并把环
+ * 里的软边(若有)填入 softEdges 输出数组、把环的细节填进
+ * deadlockDetails[];无环返回 false。
+ *
+ * 【设计思想】搜索会"相信"waitOrders[] 中假想的重排顺序,而优先于
+ * 锁表里的真实顺序——这样可以在"假设约束被满足"的假设配置下做检测,
+ * 支持死锁消解的试错过程。softEdges 输出区由调用者从
+ * possibleConstraints 中划出,本函数只负责填写。
+ *
+ * 【参数】
+ *   checkProc  —— 检查起点(检测是否有环包含它);
+ *   softEdges  —— 输出参数:环中含的软边数组;
+ *   nSoftEdges —— 输出参数:软边条数。
+ * 【返回值】true = 找到包含起点的环(硬死锁,或含软边的软死锁);
+ * false = 无环。
+ */
 static bool
 FindLockCycle(PGPROC *checkProc,
 			  EDGE *softEdges,	/* output argument */
@@ -453,6 +679,31 @@ FindLockCycle(PGPROC *checkProc,
 	return FindLockCycleRecurse(checkProc, 0, softEdges, nSoftEdges);
 }
 
+/*
+ * FindLockCycleRecurse
+ *      (中文)环检测的深度优先搜索主循环(逐进程推进)
+ *
+ * 【作用】以 checkProc 为当前节点继续 DFS:
+ * - 若它是锁组成员,先提升为组长(整组用同一代表,见文件头注释);
+ * - 查 visitedProcs:若已访问过:
+ *   - 是起点(下标 0):构成包含起点的环!记录环长(nDeadlockDetails =
+ *     depth,之后由外层各层回溯时填充每条边的细节),返回 true;
+ *   - 不是起点:是"回到了环里的其他点",说明这个环不经过起点,对
+ *     本次检测而言不算死锁,返回 false 继续;
+ * - 否则标记已访问,然后找它的出边:
+ *   1) 若 checkProc 自己正在等待锁,遍历它被阻塞的所有对象
+ *      (FindLockCycleRecurseMember);
+ *   2) 即使 checkProc 没在等,若它所属的锁组里有别的组员在等,那些
+ *      等待也算本组的出边——例如组 {A1,A2}、{B1,B2} 中 A1 等 B1、
+ *      B2 等 A2,即便 B1 和 A2 都没在等任何东西,整体仍是死锁。
+ *
+ * 【参数】
+ *   checkProc  —— 当前考察的进程(进入后可能被提升为组长);
+ *   depth      —— 当前在环中的深度(用于写 deadlockDetails 的下标,
+ *                  也用于断言环长不超过 MaxBackends);
+ *   softEdges / nSoftEdges —— 软边输出(透传给递归子调用)。
+ * 【返回值】true = 下游发现包含起点的环;false = 无。
+ */
 static bool
 FindLockCycleRecurse(PGPROC *checkProc,
 					 int depth,
@@ -465,8 +716,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
 	/*
 	 * If this process is a lock group member, check the leader instead. (Note
 	 * that we might be the leader, in which case this is a no-op.)
-	 */
-	if (checkProc->lockGroupLeader != NULL)
+	 */	if (checkProc->lockGroupLeader != NULL)
 		checkProc = checkProc->lockGroupLeader;
 
 	/*
@@ -532,6 +782,39 @@ FindLockCycleRecurse(PGPROC *checkProc,
 	return false;
 }
 
+/*
+ * FindLockCycleRecurseMember
+ *      (中文)展开"一个等待中的进程"的全部出边:硬边与软边
+ *
+ * 【作用】checkProc 正在等待 lock(checkProc->waitLock),本函数找出
+ * 所有阻塞它的进程并逐个递归:
+ * 1. 硬边:遍历该锁的 procLocks 列表,凡是"持有与等待模式冲突的锁"
+ *    且与 checkProcLeader 不同锁组的进程,构成一条硬边(递归下去);
+ * 2. 软边:检查排在 checkProc 之前、请求模式与等待模式冲突的等待者
+ *    (若 waitOrders[] 里有这把锁的假想重排,按假想顺序,否则按真实
+ *    等待队列顺序),构成软边(递归下去,并把这条件记入 softEdges)。
+ * 递归返回 true 时,把"checkProc 等这把锁"这条边的快照填入
+ * deadlockDetails[depth],再向上层返回 true。
+ *
+ * 【设计细节】
+ * - 特殊对象:关系扩展锁(LOCKTAG_RELATION_EXTEND)永远不会参与真正的
+ *   死锁环(持它期间不允许再等别的重锁,见 lock.c 的断言),直接返回
+ *   false,节省一次无谓的搜索;
+ * - 硬边优先于软边:若某进程既硬阻塞又软阻塞本进程,按硬边处理
+ *   (软边可消解,硬边不可);
+ * - 若阻塞者恰好是 autovacuum 且被阻塞者是本进程(MyProc),记录到
+ *   blocking_autovacuum_proc,供上层决定是否取消它(只记直接阻塞者,
+ *   保证 autovacuum 至少得到 deadlock_timeout 的宽限期);
+ * - 锁组处理:检查者恒用组长比较"是否同组";软边按"同组相邻"原则
+ *   提前终止扫描(TopoSort 保证同组成员在假想队列中相邻)。
+ *
+ * 【参数】
+ *   checkProc        —— 正在等待的进程(不是组长);
+ *   checkProcLeader  —— 它所属锁组的组长;
+ *   depth            —— 环深度;
+ *   softEdges / nSoftEdges —— 软边输出。
+ * 【返回值】true = 下游发现包含起点的环;false = 无。
+ */
 static bool
 FindLockCycleRecurseMember(PGPROC *checkProc,
 						   PGPROC *checkProcLeader,
@@ -786,6 +1069,27 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
  * Returns true if able to build an ordering that satisfies all the
  * constraints, false if not (there are contradictory constraints).
  */
+/*
+ * ExpandConstraints
+ *      (中文)把约束列表展开成各受影响等待队列的具体重排方案
+ *
+ * 【作用】输入是"需要反转的软边"列表,输出是 waitOrders[] 中的若干
+ * WAIT_ORDER(每个被约束的锁一个,队列内容的工作区在 waitOrderProcs[])。
+ * 任何一把锁的约束无法同时满足时返回 false(约束矛盾)。
+ *
+ * 【设计思想】
+ * - 倒序遍历约束列表:最后加入的约束最可能失败(前面的组合已经成立),
+ *   先检验它,可尽早发现矛盾;
+ * - 同一把锁的多条约束合并到同一个 WAIT_ORDER,只做一次 TopoSort;
+ *   TopoSort 只需看到本锁及更早的约束(更晚的约束必然属于别的锁),
+ *   因此传 i+1 个约束即可。
+ *
+ * 【参数】
+ *   constraints  —— 约束(软边)数组;
+ *   nConstraints —— 约束条数。
+ * 【返回值】true = 所有约束可同时满足(结果在 waitOrders[]);
+ * false = 存在矛盾约束。
+ */
 static bool
 ExpandConstraints(EDGE *constraints,
 				  int nConstraints)
@@ -857,6 +1161,38 @@ ExpandConstraints(EDGE *constraints,
  *
  * Returns true if able to build an ordering that satisfies all the
  * constraints, false if not (there are contradictory constraints).
+ */
+/*
+ * TopoSort
+ *      (中文)对一把锁的等待队列做拓扑排序,满足"先来后到"约束并尽量少动
+ *
+ * 【作用】把 lock 的等待队列重排成满足给定约束的顺序。约束的语义:
+ * 每条 EDGE 的"waiter 必须排在 blocker 前面"(即反转原来的等待顺序)。
+ * 与约束无关的锁的边会被忽略。输出 ordering[] 数组(长度等于队列长度,
+ * 空间由调用者提供),返回是否可行。
+ *
+ * 【算法与设计思想】
+ * 1. 先把真实队列按原顺序装入 topoProcs[];
+ * 2. 对每条约束,在 topoProcs 里找"等待方组"和"阻塞方组"的代表下标:
+ *    - 每个锁组在队列里取"最后一个成员"作代表,其余成员标记为 -1
+ *      (不单独排序,随组长一起整体输出);
+ *    - 找不到等待方或阻塞方(该约束与这把锁无关)就跳过;
+ *    - 用 beforeConstraints[](还需满足几个"必须先出"约束)和
+ *      afterConstraints[](本进程被谁约束的链表)登记偏序;
+ * 3. 从后往前输出:每轮挑一个 beforeConstraints == 0 的进程,连同其
+ *    锁组的所有成员一起输出(同组成员必须相邻——否则要么同时冲突
+ *    二者、必然无解,要么只冲突其一、与"相邻"等价),然后把它们对
+ *    别人的"先出"贡献从 beforeConstraints 里减去;
+ * 4. 某轮找不到可输出的进程说明约束成环(矛盾),返回 false。
+ * 该算法比 Knuth 的教科书拓扑排序慢,但能最小化对原有顺序的扰动,
+ * 而实际约束数量很少,慢一点无所谓。
+ *
+ * 【参数】
+ *   lock         —— 要重排的锁;
+ *   constraints  —— 约束数组(可能包含别的锁的边,自动忽略);
+ *   nConstraints —— 传入的约束条数(只考察前 nConstraints 条);
+ *   ordering     —— 输出参数:重排后的等待者指针数组。
+ * 【返回值】true = 重排成功;false = 约束矛盾。
  */
 static bool
 TopoSort(LOCK *lock,
@@ -1048,6 +1384,9 @@ TopoSort(LOCK *lock,
 	return true;
 }
 
+/* (中文)调试辅助函数(仅在 DEBUG_DEADLOCK 编译时启用):把锁的等待队列
+ * 中所有进程的 PID 打成一串,前面加上调用者给的标记(如 "DeadLockCheck:"
+ * 与 "rearranged to:"),用于肉眼对比重排前后的队列差异。 */
 #ifdef DEBUG_DEADLOCK
 static void
 PrintLockQueue(LOCK *lock, const char *info)
@@ -1070,6 +1409,27 @@ PrintLockQueue(LOCK *lock, const char *info)
 
 /*
  * Report a detected deadlock, with available details.
+ */
+/*
+ * DeadLockReport
+ *      (中文)报告已检测到的死锁(生成详细错误信息并抛 ERROR)
+ *
+ * 【作用】在死锁已确认、且已释放锁表分区锁之后调用(不能一边持着
+ * 全部分区锁一边 elog)。利用 deadlockDetails[] 生成两套信息:
+ * - 给客户端(clientbuf):逐行列出"进程 X 在 <对象> 上等待 <锁模式>,
+ *   被进程 Y 阻塞",其中环是首尾相接的(最后一个等待第一个);
+ * - 给服务器日志(logbuf):在上述内容之后,再为每个进程附加其当前
+ *   查询语句(pgstat_get_backend_current_activity),帮助 DBA 定位。
+ * 最后调用 pgstat_report_deadlock 计入统计,然后 ereport(ERROR)
+ * 以 ERRCODE_T_R_DEADLOCK_DETECTED 抛出"deadlock detected"。
+ *
+ * 【设计思想】为什么报告用纯值快照而不直接引用 LOCK/PGPROC:检测时
+ * 持有的全部分区锁在检测后立即释放,再打印时共享对象可能已被回收,
+ * 指针失效;故检测阶段就提取出全部所需信息(见 DEADLOCK_INFO)。
+ * 锁对象名称用 DescribeLockTag 打印数值(表 OID 等),不查系统目录——
+ * 报告死锁的场合再去拿系统目录锁可能引发新的问题。
+ *
+ * 【参数】无。【返回值】无(以 ereport(ERROR) 告终,不返回)。
  */
 void
 DeadLockReport(void)
@@ -1142,6 +1502,24 @@ DeadLockReport(void)
  * RememberSimpleDeadLock: set up info for DeadLockReport when ProcSleep
  * detects a trivial (two-way) deadlock.  proc1 wants to block for lockmode
  * on lock, but proc2 is already waiting and would be blocked by proc1.
+ */
+/*
+ * RememberSimpleDeadLock
+ *      (中文)记录 ProcSleep 发现的"两进程直接死锁"细节
+ *
+ * 【作用】有些死锁无需跑完整检测:proc1 想等 lock 上的 lockmode,但
+ * proc2 已经在等这把锁,而 proc2 的等待会被 proc1 阻塞(proc1 已持有
+ * 或即将持有与之冲突的锁)——这是最朴素的两方死锁。此时 ProcSleep
+ * 直接调用本函数,把两条边的快照写进 deadlockDetails[0..1]
+ * (proc1 等 proc2 的锁 / proc2 等 proc1 的锁),nDeadlockDetails = 2,
+ * 之后统一由 DeadLockReport 打印。
+ *
+ * 【参数】
+ *   proc1    —— 想要锁的进程;
+ *   lockmode —— proc1 想要的锁模式;
+ *   lock     —— proc1 想要的锁;
+ *   proc2    —— 已经在该锁上等待、且会被 proc1 阻塞的进程。
+ * 【返回值】无(写全局 deadlockDetails)。
  */
 void
 RememberSimpleDeadLock(PGPROC *proc1,

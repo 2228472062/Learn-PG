@@ -3,6 +3,51 @@
  * bufmgr.c
  *	  buffer manager interface routines
  *
+ * 【模块总览(中文)】
+ * 本文件是 PostgreSQL 共享缓冲池(shared buffer pool)的"缓冲管理器"
+ * (buffer manager),是整个数据库缓存子系统的核心与对外接口层:它负责
+ * 把磁盘页读入共享缓冲区(ReadBuffer 家族)、把脏页写回磁盘
+ * (FlushBuffer/FlushBuffer 系列、BufferSync 检查点写盘)、为页分配/回收
+ * 缓冲区(BufferAlloc、GetVictimBuffer)、并管理 pin(引用计数)与
+ * buffer content lock(缓冲区内容锁)的完整生命周期。
+ *
+ * 核心数据结构:
+ * - BufferDescriptors[]:共享内存中的缓冲区描述符数组(由 buf_init.c 建立),
+ *   每个描述符(BufferDesc)包含页标签 BufferTag、64 位状态字 state
+ *   (其中以位域编码了 refcount 引用计数、usage_count 使用计数以及
+ *   BM_VALID/BM_DIRTY/BM_IO_IN_PROGRESS/BM_PERMANENT 等标志)以及内容锁
+ *   的等待队列(proclist);
+ * - BufferTag:磁盘页的全局唯一标识(RelFileLocator + fork 编号 + 块号),
+ *   定义见 buf_internals.h;
+ * - PrivateRefCountEntry:每个后端进程私有的 pin 计数(本文件实现),
+ *   使同一后端多次 pin 同一缓冲区时共享 refcount 只需增减一次,并用于
+ *   记录本后端对该缓冲区持有的内容锁;
+ * - CkptBufferIds / CkptSortItem:检查点期间"待写脏页"的清单及其排序,
+ *   支撑 BufferSync 的按表空间均衡写盘。
+ *
+ * 并发协议(细节见 storage/buffer/README):
+ * - "页标签 -> 缓冲区"的映射由 buf_table.c 的哈希表维护,对它的
+ *   查找/插入/删除必须在对应的 BufMappingLock 分区锁(共享/独占)保护下
+ *   进行;
+ * - 缓冲区头 state 字段用原子操作 + CAS 更新,以其中的 BM_LOCKED 位充当
+ *   自旋锁(LockBufHdr/UnlockBufHdr);
+ * - 缓冲区内容(content)的读写由 buffer content lock 保护
+ *   (LockBuffer/UnlockBuffer 家族,支持 SHARE/SHARE_EXCLUSIVE/EXCLUSIVE
+ *   三级,带公平等待队列与唤醒逻辑,本文件实现);
+ * - BM_IO_IN_PROGRESS 位保证同一缓冲区同一时刻只有一个进程执行 I/O,
+ *   其他进程要么同步等待(WaitIO),要么借助 AIO 的 wait reference
+ *   异步等待;
+ * - pin 协议:进程在使用缓冲区前必须先 pin(refcount +1),防止被替换
+ *   算法换走;refcount 归零是缓冲区可被选为牺牲者的必要条件。
+ *
+ * 与其他模块的关系:
+ * - freelist.c:牺牲者选择(全局时钟扫描 + 每后端缓冲环);
+ * - buf_table.c:页标签查找表;localbuf.c:临时表的本地缓冲区
+ *   (本文件大量"本地/共享"二选一的分支就是为它服务的);
+ * - smgr.c/md.c:实际的文件 I/O;xlog:写盘前必须先 flush WAL 到页的 LSN
+ *   (FlushBuffer 中的基本 WAL 规则);
+ * - bgwriter/checkpointer:周期性写脏页(BgBufferSync / BufferSync)。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -32,6 +77,14 @@
  *		freelist.c -- chooses victim for buffer replacement
  *		buf_table.c -- manages the buffer lookup table
  */
+/* (中文)本文件的主要对外入口(上方英文注释是作者对文件职责的经典概括):
+ * - ReadBuffer():找到(或创建)容纳指定页的缓冲区并 pin 它,保证本进程
+ *   使用期间该页不会被换出缓冲池;StartReadBuffer()/StartReadBuffers()/
+ *   WaitReadBuffers() 把"发起读"与"等待读完成"拆成两步,以支持预读
+ *   (read stream)与异步 I/O;
+ * - ReleaseBuffer():解除 pin;MarkBufferDirty():把已 pin 缓冲区的
+ *   内容标记为"脏"(真正的写盘推迟到缓冲区被替换或检查点)。
+ * 配套文件:freelist.c(挑选牺牲缓冲区)、buf_table.c(页标签查找表)。 */
 #include "postgres.h"
 
 #include <sys/file.h>
@@ -73,17 +126,29 @@
 
 
 /* Note: these two macros only work on shared buffers, not local ones! */
+/* 取共享缓冲区的数据块指针:BufHdrGetBlock 由缓冲区描述符直接算出其在
+ * 共享内存缓冲块区(BufferBlocks)内的地址;BufferGetLSN 读出该页头部的
+ * LSN(记录该页最后一次被修改所对应的 WAL 位置,用于 WAL flush 判断)。
+ * 注意:这两个宏只适用于共享缓冲区(本地缓冲区用 LocalBufHdrGetBlock)。 */
 #define BufHdrGetBlock(bufHdr)	((Block) (BufferBlocks + ((Size) (bufHdr)->buf_id) * BLCKSZ))
 #define BufferGetLSN(bufHdr)	(PageGetLSN(BufHdrGetBlock(bufHdr)))
 
 /* Note: this macro only works on local buffers, not shared ones! */
+/* 取本地缓冲区的数据块指针,见 localbuf.c 中同名宏的解释(本地缓冲区
+ * buf_id 为负,经换算得到 LocalBufferBlockPointers 数组下标)。 */
 #define LocalBufHdrGetBlock(bufHdr) \
 	LocalBufferBlockPointers[-((bufHdr)->buf_id + 2)]
 
 /* Bits in SyncOneBuffer's return value */
+/* SyncOneBuffer() 返回值中的标志位:
+ * - BUF_WRITTEN : 本次调用实际把缓冲区写到了内核(含"锁定时已变干净"
+ *   等情形下的误差,见 SyncOneBuffer);
+ * - BUF_REUSABLE: 该缓冲区可被替换(refcount 与 usage_count 都为 0)。 */
 #define BUF_WRITTEN				0x01
 #define BUF_REUSABLE			0x02
 
+/* 关系数量超过该值时,批量清除/冲刷缓冲区的代码改用二分查找(bsearch)
+ * 而非线性扫描来匹配缓冲区所属的关系,以摊薄排序后查找的代价。 */
 #define RELS_BSEARCH_THRESHOLD		20
 
 /*
@@ -92,12 +157,23 @@
  * being dropped. For the relations with size below this threshold, we find
  * the buffers by doing lookups in BufMapping table.
  */
+/* 待删除关系的"总页数"超过该阈值(约 NBuffers/32 块)时,DropRelationBuffers
+ * 放弃按页逐个查 BufMapping 表、改为对整个缓冲池做一次线性扫描来清除该
+ * 关系的缓冲区:页数多时逐个哈希查找的开销反而更大。 */
 #define BUF_DROP_FULL_SCAN_THRESHOLD		(uint64) (NBuffers / 32)
 
 /*
  * This is separated out from PrivateRefCountEntry to allow for copying all
  * the data members via struct assignment.
  */
+/* 后端进程私有 pin 计数的"数据部分"结构,单独抽出来是为了能通过整体
+ * 结构体赋值(而非逐字段拷贝)在"数组槽"与"溢出哈希表条目"之间搬移数据。
+ *
+ * 字段含义:
+ * - refcount : 本后端进程对某个共享缓冲区总共 pin 的次数(可 > 1,
+ *              因为同一次会话可能对同一页多次 ReadBuffer);
+ * - lockmode : 本后端是否持有该缓冲区的内容锁、以什么模式持有
+ *              (BUFFER_LOCK_UNLOCK 表示未持有)。 */
 typedef struct PrivateRefCountData
 {
 	/*
@@ -112,6 +188,15 @@ typedef struct PrivateRefCountData
 	BufferLockMode lockmode;
 } PrivateRefCountData;
 
+/* 后端私有 pin 计数的"条目"结构:包含标识(所属缓冲区编号 buffer)、
+ * 状态位 status 以及上面的数据部分 data。条目要么存放在固定大小的
+ * 数组 PrivateRefCountArray 中(键另行保存在 PrivateRefCountArrayKeys,
+ * 便于快速批量扫描),要么在数组满后"溢出"到哈希表 PrivateRefCountHash
+ * 中(键为 buffer,此时 buffer 字段就是哈希键)。
+ * 设计动机:每个后端可能同时 pin 的缓冲区不多(通常不超过
+ * REFCOUNT_ARRAY_ENTRIES),用一个小数组顺序扫描比在 NBuffers 规模的
+ * 数组/哈希中查找更快;见文件头下"Backend-Private refcount management"
+ * 一段英文注释的详细说明。 */
 typedef struct PrivateRefCountEntry
 {
 	/*
@@ -130,6 +215,9 @@ typedef struct PrivateRefCountEntry
 	PrivateRefCountData data;
 } PrivateRefCountEntry;
 
+/* 用 simplehash 宏模板生成"以 Buffer 为键的私有 refcount 哈希表"类型
+ * refcount_hash 及其 static inline 的插入/查找/遍历函数(refcount_insert、
+ * refcount_lookup、refcount_iterator 等),键就是条目里的 buffer 字段。 */
 #define SH_PREFIX refcount
 #define SH_ELEMENT_TYPE PrivateRefCountEntry
 #define SH_KEY_TYPE Buffer
@@ -142,12 +230,29 @@ typedef struct PrivateRefCountEntry
 #include "lib/simplehash.h"
 
 /* 64 bytes, about the size of a cache line on common systems */
+/* 私有 refcount 数组中槽位的数量(8,约占一条缓存行的大小)。数组满后
+ * 新的 pin 会把数组中的老条目"挤"进溢出哈希表。 */
 #define REFCOUNT_ARRAY_ENTRIES 8
 
 /*
  * Status of buffers to checkpoint for a particular tablespace, used
  * internally in BufferSync.
  */
+/* 检查点期间"单个表空间"的写盘进度状态,仅供 BufferSync() 内部使用:
+ * 为了在各表空间之间均衡地交织发出写盘请求(避免同一时刻只写一个表空间、
+ * 让底层硬件忙闲不均),BufferSync 用一个最小堆按"进度"挑选下一个要
+ * 处理的缓冲区,本结构就是堆元素。
+ *
+ * 字段含义:
+ * - tsId           : 表空间 OID;
+ * - progress       : 该表空间当前的检查点进度(0 ~ 该表空间待写页总数),
+ *                    每处理一页增加 progress_slice,跨表空间可直接比较;
+ * - progress_slice : 处理一页对应的进度增量(= 总页数 / 该表空间页数,
+ *                    见 BufferSync 中的计算);
+ * - num_to_scan    : 该表空间待写(checkpoint 开始时已脏)的页数;
+ * - num_scanned    : 已处理的页数;
+ * - index          : 该表空间在 CkptBufferIds 数组中的起始下标
+ *                    (CkptBufferIds 已按表空间排序,同表空间页连续存放)。 */
 typedef struct CkptTsStatus
 {
 	/* oid of the tablespace */
@@ -179,6 +284,12 @@ typedef struct CkptTsStatus
  * DropRelationsAllBuffers. Pointer to this struct and RelFileLocator must be
  * compatible.
  */
+/* 用于对 SMgrRelation 数组排序的元素类型(配合 rlocator_comparator 做
+ * qsort/bsearch):既保存关系定位符 rlocator(必须作为第一个成员,保证
+ * 本结构与 RelFileLocator 的指针可互换,从而能与仅含 RelFileLocator 的
+ * 数组共用同一个比较函数),又保存对应的 SMgrRelation,供
+ * FlushRelationsAllBuffers 与 DropRelationsAllBuffers 在缓冲池线性扫描
+ * 时用二分查找快速判断某缓冲区属于哪个待处理关系。 */
 typedef struct SMgrSortArray
 {
 	RelFileLocator rlocator;	/* This must be the first member */
@@ -186,6 +297,15 @@ typedef struct SMgrSortArray
 } SMgrSortArray;
 
 /* GUC variables */
+/* GUC 参数变量(在 guc_tables.c 中登记,运行期由配置文件/SET 修改):
+ * - zero_damaged_pages : 读到校验失败/页头损坏的页时,是否将其清零继续
+ *                        运行(生产环境不建议打开);
+ * - bgwriter_lru_maxpages : 后台写进程每轮最多写出的脏页数(0 表示关闭
+ *                          bgwriter 的 LRU 清扫);
+ * - bgwriter_lru_multiplier : 后台写进程按"预测的下一轮分配量"乘以此
+ *                          系数决定清扫多少页;
+ * - track_io_timing : 是否统计 I/O 耗时(用于 pg_stat_database 与
+ *                    pg_stat_io 的 I/O 时间指标)。 */
 bool		zero_damaged_pages = false;
 int			bgwriter_lru_maxpages = 100;
 double		bgwriter_lru_multiplier = 2.0;
@@ -197,6 +317,8 @@ bool		track_io_timing = false;
  * for buffers not belonging to tablespaces that have their
  * effective_io_concurrency parameter set.
  */
+/* GUC:PrefetchBuffer/预读调用方应"超前"其 ReadBuffer 调用多少个缓冲区
+ * (0 表示从不预读)。仅用于未在表空间级单独设置该参数的场景。 */
 int			effective_io_concurrency = DEFAULT_EFFECTIVE_IO_CONCURRENCY;
 
 /*
@@ -204,6 +326,8 @@ int			effective_io_concurrency = DEFAULT_EFFECTIVE_IO_CONCURRENCY;
  * benefit from a higher setting because they work on behalf of many sessions.
  * Overridden by the tablespace setting of the same name.
  */
+/* GUC:同 effective_io_concurrency,但服务于维护类代码路径(VACUUM 等,
+ * 它们替许多会话工作,值得更高设置),同样可被表空间级参数覆盖。 */
 int			maintenance_io_concurrency = DEFAULT_MAINTENANCE_IO_CONCURRENCY;
 
 /*
@@ -212,6 +336,9 @@ int			maintenance_io_concurrency = DEFAULT_MAINTENANCE_IO_CONCURRENCY;
  * that call smgr APIs directly.  It is computed as the minimum of underlying
  * GUCs io_combine_limit_guc and io_max_combine_limit.
  */
+/* 单次 I/O 操作最多可合并处理的块数上限:取两个 GUC(io_combine_limit_guc
+ * 与 io_max_combine_limit)中的较小者。StartReadBuffers() 的调用方以及
+ * 直接调用 smgr 接口的代码都应遵守它。 */
 int			io_combine_limit = DEFAULT_IO_COMBINE_LIMIT;
 int			io_combine_limit_guc = DEFAULT_IO_COMBINE_LIMIT;
 int			io_max_combine_limit = DEFAULT_IO_COMBINE_LIMIT;
@@ -220,11 +347,18 @@ int			io_max_combine_limit = DEFAULT_IO_COMBINE_LIMIT;
  * GUC variables about triggering kernel writeback for buffers written; OS
  * dependent defaults are set via the GUC mechanism.
  */
+/* GUC:触发"内核回写提示"(posix_fadvise/writeback)的页数阈值——
+ * 检查点、后台写进程、普通后端各自累计写入该数量的缓冲区后,就调用
+ * smgrwriteback 提示内核把数据刷向存储(若为 0 则关闭该提示)。 */
 int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
 int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
 
 /* local state for LockBufferForCleanup */
+/* LockBufferForCleanup() 的局部状态:记录本后端正等待"pin 计数降到 1"
+ * 的那个缓冲区描述符(全局只有一个,因为一个后端同时最多只能等待一个
+ * 缓冲区的 cleanup lock;等待期间若出错,UnlockBuffers() 靠它清理
+ * BM_PIN_COUNT_WAITER 标志)。 */
 static BufferDesc *PinCountWaitBuf = NULL;
 
 /*
@@ -260,6 +394,17 @@ static BufferDesc *PinCountWaitBuf = NULL;
  * memory allocations in NewPrivateRefCountEntry() which can be important
  * because in some scenarios it's called with a spinlock held...
  */
+/* 后端私有 pin 计数的全部全局状态(均为本进程私有,不需加锁):
+ * - PrivateRefCountArrayKeys : 数组槽的"键"数组(InvalidBuffer 表示槽空闲);
+ * - PrivateRefCountArray     : 与键数组一一对应的数据条目数组(0~7 槽);
+ * - PrivateRefCountHash      : 数组溢出后的哈希表(simplehash 生成);
+ * - PrivateRefCountOverflowed: 当前溢出到哈希表中的条目数;
+ * - PrivateRefCountClock     : 数组的时钟指针,数组满时用它挑选被挤入
+ *                              哈希表的"牺牲槽"(轮转,保证常用条目不被
+ *                              长期困在哈希表里);
+ * - ReservedRefCountSlot     : 预占的空闲槽下标(-1 表示未预占);
+ * - PrivateRefCountEntryLast : 单条目缓存:最近一次查找命中的槽下标,
+ *                              加快"反复查同一缓冲区"的热路径。 */
 static Buffer PrivateRefCountArrayKeys[REFCOUNT_ARRAY_ENTRIES];
 static struct PrivateRefCountEntry PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES];
 static refcount_hash *PrivateRefCountHash = NULL;
@@ -268,6 +413,10 @@ static uint32 PrivateRefCountClock = 0;
 static int	ReservedRefCountSlot = -1;
 static int	PrivateRefCountEntryLast = -1;
 
+/* 本后端"公平份额"的最大可 pin 缓冲区数上限:InitBufferManagerAccess()
+ * 中按 NBuffers / (MaxBackends + NUM_AUXILIARY_PROCS) 估算,用于防止某个
+ * 后端一次预读/批量操作 pin 掉过多缓冲区而挤占其他后端(GetPinLimit/
+ * GetAdditionalPinLimit/LimitAdditionalPins 都围绕它工作)。 */
 static uint32 MaxProportionalPins;
 
 static void ReservePrivateRefCountEntry(void);
@@ -277,6 +426,12 @@ static inline int32 GetPrivateRefCount(Buffer buffer);
 static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
 
 /* ResourceOwner callbacks to hold in-progress I/Os and buffer pins */
+/* 资源所有者(ResourceOwner)回调函数声明:用于在事务出错回滚时自动释放
+ * "进行中的缓冲区 I/O"与"缓冲区 pin"(以及出错时未释放的内容锁)。
+ * 下方两个描述符(buffer_io_resowner_desc / buffer_resowner_desc)把
+ * 缓冲区的两类资源注册进资源所有者框架,释放阶段均在锁释放之前
+ * (RESOURCE_RELEASE_BEFORE_LOCKS),且 I/O 的释放优先级高于 pin,保证
+ * 先中止进行中的 I/O 再归还 pin。 */
 static void ResOwnerReleaseBufferIO(Datum res);
 static char *ResOwnerPrintBufferIO(Datum res);
 static void ResOwnerReleaseBuffer(Datum res);
@@ -304,6 +459,24 @@ const ResourceOwnerDesc buffer_resowner_desc =
  * Ensure that the PrivateRefCountArray has sufficient space to store one more
  * entry. This has to be called before using NewPrivateRefCountEntry() to fill
  * a new entry - but it's perfectly fine to not use a reserved entry.
+ */
+/*
+ * ReservePrivateRefCountEntry
+ *      (中文)预占一个私有 refcount 槽位(必要时把数组条目挤入哈希表)
+ *
+ * 【作用】在使用 NewPrivateRefCountEntry() 填新条目之前调用,保证存在一个
+ * 空闲数组槽可用。调用者也可以只预占不填(多余预占无害)。
+ *
+ * 【设计思想】"预占"与"填充"分离是为了避免在已持有自旋锁(如
+ * PinBuffer_Locked)时做任何可能失败/分配内存的操作:预占阶段先确保有空槽,
+ * 填充阶段(NewPrivateRefCountEntry)只需纯内存写。实现上先在 8 个数组槽里
+ * 找一个空槽(InvalidBuffer 键);若全满,则按时钟轮转选一个"牺牲槽"
+ * (PrivateRefCountClock++ % 8,保证最常用的条目不会被长期困在哈希表),
+ * 把它的条目搬进溢出哈希表 refcount_hash,从而腾出一个空槽。搬移后
+ * PrivateRefCountOverflowed 计数加一。
+ *
+ * 【参数】无。
+ * 【返回值】无(结果反映在全局 ReservedRefCountSlot 中)。
  */
 static void
 ReservePrivateRefCountEntry(void)
@@ -384,6 +557,22 @@ ReservePrivateRefCountEntry(void)
 /*
  * Fill a previously reserved refcount entry.
  */
+/*
+ * NewPrivateRefCountEntry
+ *      (中文)填充先前预占的 refcount 槽位,建立新条目的初值
+ *
+ * 【作用】把预占的槽位(ReservedRefCountSlot)登记为"缓冲区 buffer 的
+ * 私有 pin 记录":同时写入键数组 PrivateRefCountArrayKeys 与条目自身的
+ * buffer 字段,数据部分清零(refcount=0、lockmode=UNLOCK),并把
+ * PrivateRefCountEntryLast 单条目缓存指向该槽,消费掉预占
+ * (ReservedRefCountSlot 复位为 -1)。
+ *
+ * 【前置条件】必须先调用 ReservePrivateRefCountEntry() 完成预占。
+ *
+ * 【参数】buffer —— 要被登记追踪 pin 的共享缓冲区编号。
+ * 【返回值】填充好的条目指针;调用者通常随后对其 refcount 做 +1
+ * (参见 TrackNewBufferPin)。
+ */
 static PrivateRefCountEntry *
 NewPrivateRefCountEntry(Buffer buffer)
 {
@@ -414,6 +603,24 @@ NewPrivateRefCountEntry(Buffer buffer)
  * inlining. This particularly seems to be true if the compiler is capable of
  * auto-vectorizing the code, as that imposes additional stack-alignment
  * requirements etc.
+ */
+/*
+ * GetPrivateRefCountEntrySlow
+ *      (中文)查询私有 refcount 条目的慢路径(数组扫描 + 哈希)
+ *
+ * 【作用】GetPrivateRefCountEntry() 的单条目缓存未命中时走这里:先在 8 个
+ * 数组槽中顺序扫描(通常立刻命中;循环不提前 return 是为了让编译器
+ * 自动向量化);数组中没有时,若存在过溢出则去哈希表查。
+ *
+ * 【do_move 语义】若条目在哈希表中且 do_move 为 true,则把它搬回数组的
+ * 空槽(先删哈希条目、再 ReservePrivateRefCountEntry 拿空槽填充),使
+ * 频繁访问的条目留在快速路径上;do_move 为 false 则直接返回哈希条目。
+ * 注意搬移本身会修改全局状态,调用者须确保不会与"预占"逻辑冲突。
+ *
+ * 【参数】
+ *   buffer  —— 要查询的共享缓冲区编号;
+ *   do_move —— 是否允许把哈希条目搬回数组。
+ * 【返回值】条目指针;该缓冲区在本后端没有 pin 记录时返回 NULL。
  */
 static pg_noinline PrivateRefCountEntry *
 GetPrivateRefCountEntrySlow(Buffer buffer, bool do_move)
@@ -503,6 +710,26 @@ GetPrivateRefCountEntrySlow(Buffer buffer, bool do_move)
  * do_move is true, and the entry resides in the hashtable the entry is
  * optimized for frequent access by moving it to the array.
  */
+/*
+ * GetPrivateRefCountEntry
+ *      (中文)取缓冲区在本后端的私有 refcount 条目(带单条目缓存)
+ *
+ * 【作用】返回"本后端对缓冲区 buffer 的 pin/内容锁记录"条目;buffer 从未
+ * 被本后端 pin 过时返回 NULL。do_move 语义与慢路径一致:条目在哈希表时
+ * 是否搬回数组。
+ *
+ * 【设计思想】"反复查同一个缓冲区"是常见场景(如顺序扫描),因此用
+ * PrivateRefCountEntryLast 做单条目缓存:命中时直接返回数组槽指针,
+ * 只访问一条缓存行。小函数体适合内联,未命中才调用不可内联的慢路径
+ * (慢路径的数组扫描按"键数组"比较,可自动向量化)。
+ *
+ * 【前置条件】buffer 必须是有效且非本地的共享缓冲区。
+ *
+ * 【参数】
+ *   buffer  —— 要查询的共享缓冲区编号;
+ *   do_move —— 是否允许把哈希条目搬回数组。
+ * 【返回值】条目指针,无记录时为 NULL。
+ */
 static inline PrivateRefCountEntry *
 GetPrivateRefCountEntry(Buffer buffer, bool do_move)
 {
@@ -538,6 +765,20 @@ GetPrivateRefCountEntry(Buffer buffer, bool do_move)
  *
  * Only works for shared memory buffers!
  */
+/*
+ * GetPrivateRefCount
+ *      (中文)返回本后端对给定共享缓冲区的 pin 次数
+ *
+ * 【作用】只统计"本后端进程"对该缓冲区的 pin 数(共享 refcount 只是
+ * 全进程的总数)。BufferIsPinned 宏、CheckBufferIsPinnedOnce、
+ * InvalidateBuffer 的自我保护检查等处都使用它。
+ *
+ * 【设计思想】查找时传 do_move=false 不搬移条目——对只读计数而言
+ * 没必要改变缓存结构。
+ *
+ * 【参数】buffer —— 共享缓冲区编号(不能是本地缓冲区)。
+ * 【返回值】本后端 pin 该缓冲区的次数(0 表示未 pin)。
+ */
 static inline int32
 GetPrivateRefCount(Buffer buffer)
 {
@@ -560,6 +801,24 @@ GetPrivateRefCount(Buffer buffer)
 /*
  * Release resources used to track the reference count of a buffer which we no
  * longer have pinned and don't want to pin again immediately.
+ */
+/*
+ * ForgetPrivateRefCountEntry
+ *      (中文)释放一个私有 refcount 条目(不再追踪该缓冲区的 pin)
+ *
+ * 【作用】当某缓冲区在本后端的 pin 数降为 0 时调用:把该条目从数组
+ * (置 InvalidBuffer)或哈希表(删除)中移除,归还记录空间。
+ *
+ * 【设计思想】若条目在数组中,顺手把它标记为"预占槽"
+ * (ReservedRefCountSlot = 该槽下标)——多数场景下下一次 Reserve 无需再
+ * 扫描数组或操作哈希表,直接复用该槽。条目在哈希表则删除并递减
+ * PrivateRefCountOverflowed。
+ *
+ * 【前置条件】条目的 refcount 必须已为 0、lockmode 必须为 UNLOCK
+ * (函数内断言)。
+ *
+ * 【参数】ref —— 要释放的条目指针。
+ * 【返回值】无。
  */
 static void
 ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
@@ -596,6 +855,10 @@ ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
  *		NOTE: what we check here is that *this* backend holds a pin on
  *		the buffer.  We do not care whether some other backend does.
  */
+/* (中文)判断"本后端"是否 pin 着该缓冲区(同时校验缓冲区编号有效)。
+ * 注意:这里只关心本后端自己是否持有 pin,与其他后端是否 pin 无关。
+ * - 本地缓冲区:查 LocalRefCount;共享缓冲区:查私有 refcount(>0 即
+ *   已 pin)。 */
 #define BufferIsPinned(bufnum) \
 ( \
 	!BufferIsValid(bufnum) ? \
@@ -689,9 +952,40 @@ static void BufferLockWakeup(BufferDesc *buf_hdr, bool wake_exclusive);
 static void BufferLockProcessRelease(BufferDesc *buf_hdr, BufferLockMode mode, uint64 lockstate);
 static inline uint64 BufferLockReleaseSub(BufferLockMode mode);
 
+/* (中文)以上为本文件内部(static)函数的原型声明:上半部分是"读页/扩展/
+ * 分配/写盘"相关(BufferAlloc、GetVictimBuffer、FlushBuffer 等),下半部分
+ * 是 buffer content lock 的实现(BufferLockAcquire/Unlock/Attempt/
+ * QueueSelf/Wakeup 等,详见各函数定义处的中文注释)。 */
+
 
 /*
  * Implementation of PrefetchBuffer() for shared buffers.
+ */
+/*
+ * PrefetchSharedBuffer
+ *      (中文)对共享缓冲的"异步预读"实现(Pre fetchBuffer 的共享版本)
+ *
+ * 【作用】在"页还没进共享缓冲池"的情况下,提前向内核发起该页的异步读
+ * 请求(内核级预取),让后续 ReadBuffer 不必等 I/O。若页已在池中,则把
+ * 它所在的缓冲区编号放在 recent_buffer 返回,调用方可以借此跳过一次
+ * 缓冲表查找(注意该缓冲区并未被 pin,必须重新校验)。
+ *
+ * 【执行流程】组 BufferTag → 取哈希码及分区锁 → 共享持锁查 BufMapping
+ * 表(BufTableLookup):命中则返回 recent_buffer;未命中且未启用直接 I/O
+ * (IO_DIRECT_DATA)时调用 smgrprefetch 发起预读。
+ *
+ * 【设计思想】页已在池中时故意什么都不做(不 bump usage_count):
+ * 预读序列通常随后就会真正访问该页并再次 bump,额外 bump 会造成对
+ * 预读页的过度偏爱,使它们更难被替换;真正解决需要额外的每缓冲区状态,
+ * 目前不值得。
+ *
+ * 【参数】
+ *   smgr_reln —— 关系的存储管理器对象;
+ *   forkNum   —— 分支编号(主分支/VM/FSM);
+ *   blockNum  —— 要预读的块号。
+ * 【返回值】PrefetchBufferResult{recent_buffer, initiated_io}:
+ *   recent_buffer 有效表示该页此刻在缓冲池里;initiated_io 表示本次确实
+ *   发起了一次内核预读。
  */
 PrefetchBufferResult
 PrefetchSharedBuffer(SMgrRelation smgr_reln,
@@ -783,6 +1077,31 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
  * relation file wasn't found and we are in recovery.  (If the relation file
  * wasn't found and we are not in recovery, an error is raised).
  */
+/*
+ * PrefetchBuffer
+ *      (中文)对关系的一个块发起异步预读(不分配缓冲区)
+ *
+ * 【作用】与 ReadBuffer 名称相仿,但并不分配缓冲区:只保证"未来对同一
+ * 块的 ReadBuffer 不必等 I/O"。预读是可选的优化(USE_PREFETCH 未定义时
+ * 静默降级)。
+ *
+ * 【三种可能结果】(与上方英文注释一一对应)
+ * 1. 块已在缓冲池:recent_buffer 返回其缓冲区编号(未 pin,调用方用前
+ *    必须重新校验);
+ * 2. 已请求内核发起 I/O:initiated_io = true(无法得知内核是否实际
+ *    发起了读,也无法得知完成时刻——只能靠同步 ReadBuffer 等待);
+ * 3. 两者皆否:本构建不支持预读、启用直接 I/O、或恢复(recovery)期间
+ *    找不到关系文件(非恢复期间找不到文件则直接报错)。
+ *
+ * 【执行流程】临时表走 localbuf.c 的 PrefetchLocalBuffer;其他会话的临时表
+ * 拒绝访问;其余走本文件的 PrefetchSharedBuffer。
+ *
+ * 【参数】
+ *   reln     —— 关系对象(必须已打开);
+ *   forkNum  —— 分支编号;
+ *   blockNum —— 要预读的块号。
+ * 【返回值】PrefetchBufferResult{recent_buffer, initiated_io}。
+ */
 PrefetchBufferResult
 PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
 {
@@ -813,6 +1132,33 @@ PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
  * Compared to ReadBuffer(), this avoids a buffer mapping lookup when it's
  * successful.  Return true if the buffer is valid and still has the expected
  * tag.  In that case, the buffer is pinned and the usage count is bumped.
+ */
+/*
+ * ReadRecentBuffer
+ *      (中文)尝试 pin "最近观察到的"缓冲区中的目标块(免哈希查找的快速路径)
+ *
+ * 【作用】调用方(read stream 预读代码等)手头有一个"最近观察到"的缓冲区
+ * 编号 recent_buffer,希望其中的块就是目标块:若校验通过(缓冲区仍有效、
+ * 标签仍是目标的页标签),直接 pin 并 bump usage_count,返回 true——
+ * 与 ReadBuffer() 相比省去了一次 BufMapping 表查找。校验不通过则返回
+ * false,调用方退回普通 ReadBuffer 路径。
+ *
+ * 【并发设计】对共享缓冲区,先做一次无锁的标签比较(降低用过期编号
+ * bump 到错误缓冲区的概率),再调用 PinBuffer(skip_if_not_valid=true)
+ * 原子地完成"检查 BM_VALID + pin",pin 成功后再复查一次标签;若第二次
+ * 检查失败,说明缓冲区已被换页,立即 Unpin 并返回 false。对本地缓冲区
+ * 则直接在读取 state 后判断并调用 PinLocalBuffer。
+ *
+ * 【前置条件】recent_buffer 必须是有效缓冲区编号;调用前须已执行
+ * ResourceOwnerEnlarge 与 ReservePrivateRefCountEntry。
+ *
+ * 【参数】
+ *   rlocator      —— 目标块所属关系;
+ *   forkNum       —— 分支编号;
+ *   blockNum      —— 目标块号;
+ *   recent_buffer —— 最近观察到的缓冲区编号。
+ * 【返回值】true = 成功 pin,该缓冲区就是目标块(此时计数器已计入
+ * blks_hit);false = 校验失败,需走常规路径。
  */
 bool
 ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockNum,
@@ -875,6 +1221,19 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
  * ReadBuffer -- a shorthand for ReadBufferExtended, for reading from main
  *		fork with RBM_NORMAL mode and default strategy.
  */
+/*
+ * ReadBuffer
+ *      (中文)读取关系主分支的一个块(ReadBufferExtended 的常用简写)
+ *
+ * 【作用】等价于 ReadBufferExtended(reln, MAIN_FORKNUM, blockNum,
+ * RBM_NORMAL, NULL),即:从主分支、普通模式(页头校验失败即报错)、
+ * 默认缓冲策略下读取块 blockNum,返回已 pin 的缓冲区。
+ *
+ * 【参数】
+ *   reln     —— 已打开的关系对象;
+ *   blockNum —— 要读的块号(P_NEW 表示扩展关系,见 ReadBufferExtended)。
+ * 【返回值】容纳该块内容的缓冲区的编号(已 pin)。
+ */
 Buffer
 ReadBuffer(Relation reln, BlockNumber blockNum)
 {
@@ -922,6 +1281,32 @@ ReadBuffer(Relation reln, BlockNumber blockNum)
  * If strategy is not NULL, a nondefault buffer access strategy is used.
  * See buffer/README for details.
  */
+/*
+ * ReadBufferExtended
+ *      (中文)返回容纳指定关系指定块的缓冲区(已 pin;出错则直接报错)
+ *
+ * 【作用】缓冲管理器最核心的读入口:把 (reln, forkNum, blockNum) 对应的
+ * 页调入(或找出)共享缓冲池并 pin。blockNum 传 P_NEW 时扩展关系文件并
+ * 分配新块(调用方须自行保证同一时刻只有一个后端在扩展同一关系,不过
+ * 更推荐用 ExtendBufferedRel 系列,扩展锁的获取更高效)。
+ *
+ * 【mode 语义】(与上方英文注释对应)
+ * - RBM_NORMAL        : 从磁盘读入并校验页头,无效则报错(全零页视为
+ *                       合法,见 PageIsVerified);
+ * - RBM_ZERO_ON_ERROR : 页头无效时清零替代报错(供不关键数据使用);
+ * - RBM_ZERO_AND_LOCK : 页不在池中时直接以全零填充(不读盘),返回前加
+ *                       独占内容锁,供调用方从头初始化页面后再公开;
+ * - RBM_ZERO_AND_CLEANUP_LOCK : 同 ZERO_AND_LOCK,但加 cleanup 强度锁;
+ * - RBM_NORMAL_NO_LOG : 与 RBM_NORMAL 相同处理。
+ * 注意:不要用 ZERO_AND_LOCK 读超出关系物理 EOF 的页(md.c 写入时会有
+ * 问题),P_NEW 则没问题。
+ *
+ * 【参数】
+ *   reln     —— 关系对象;forkNum —— 分支编号;
+ *   blockNum —— 块号(可为 P_NEW);mode —— 读取模式(见上);
+ *   strategy —— 缓冲环策略对象,或 NULL 用默认策略。
+ * 【返回值】已 pin 的缓冲区编号。
+ */
 inline Buffer
 ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
 				   ReadBufferMode mode, BufferAccessStrategy strategy)
@@ -950,6 +1335,23 @@ ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
  * difficult, unless we only want to read temporary relations for our own
  * ProcNumber).
  */
+/*
+ * ReadBufferWithoutRelcache
+ *      (中文)无 relcache 的 ReadBuffer(直接按 RelFileLocator 读页)
+ *
+ * 【作用】与 ReadBufferExtended 等价,但不需要关系的 relcache 条目:
+ * 调用方直接给出关系定位符 rlocator,函数内部 smgropen 打开存储管理器
+ * 对象后进入 ReadBuffer_common。典型使用场景:崩溃恢复、无需打开系统
+ * 目录即可访问的表文件等。
+ *
+ * 【参数】
+ *   rlocator  —— 要读页的关系文件定位符;forkNum —— 分支编号;
+ *   blockNum  —— 块号;mode —— 读取模式(见 ReadBufferExtended);
+ *   strategy  —— 缓冲环策略(可空);
+ *   permanent —— true 表示 PERMANENT 关系,false 表示 UNLOGGED 关系。
+ * 【返回值】已 pin 的缓冲区编号。
+ * 注意:本函数不能用于临时表(临时表必须由本进程的本地缓冲区服务)。
+ */
 Buffer
 ReadBufferWithoutRelcache(RelFileLocator rlocator, ForkNumber forkNum,
 						  BlockNumber blockNum, ReadBufferMode mode,
@@ -965,6 +1367,20 @@ ReadBufferWithoutRelcache(RelFileLocator rlocator, ForkNumber forkNum,
 
 /*
  * Convenience wrapper around ExtendBufferedRelBy() extending by one block.
+ */
+/*
+ * ExtendBufferedRel
+ *      (中文)扩展关系一个块(ExtendBufferedRelBy 的单块便捷包装)
+ *
+ * 【作用】调用 ExtendBufferedRelBy() 把关系扩展恰好一个块,返回新块对应
+ * 的已 pin 缓冲区。
+ *
+ * 【参数】
+ *   bmr      —— 缓冲管理器关系(BufferManagerRelation,含 rel 或 smgr 之一);
+ *   forkNum  —— 分支编号;strategy —— 缓冲环策略(可空);
+ *   flags    —— EB_* 标志位(见 buf_internals.h,如 EB_LOCK_FIRST、
+ *               EB_CREATE_FORK_IF_NEEDED)。
+ * 【返回值】新块(扩展出的最后一个块)的已 pin 缓冲区编号。
  */
 Buffer
 ExtendBufferedRel(BufferManagerRelation bmr,
@@ -998,6 +1414,31 @@ ExtendBufferedRel(BufferManagerRelation bmr,
  * locked. This is useful for callers that want a buffer that is guaranteed to
  * be empty.
  */
+/*
+ * ExtendBufferedRelBy
+ *      (中文)把关系扩展多个块(返回新块的已 pin 缓冲区数组)
+ *
+ * 【作用】尝试把关系扩展 extend_by 块。取决于资源可用性,实际扩展的页数
+ * 可能少于请求值(除非出错,至少会扩展一页),实际页数经 *extended_by
+ * 返回。buffers 数组至少要有 extend_by 个元素,返回时前 *extended_by 个
+ * 元素都是已 pin 的缓冲区。
+ *
+ * 【设计思想】本函数负责"拿缓冲区 + 扩展文件"两个阶段。扩展锁
+ * (relation extension lock)的获取被刻意推迟并集中,使"写牺牲者/清空
+ * 缓冲区"等昂贵工作可并行于锁外执行;若 flags 含 EB_LOCK_FIRST,则返回
+ * 的第一个缓冲区额外持有独占内容锁(保证调用方看到的是空页)。
+ *
+ * 【参数】
+ *   bmr      —— 关系(bmr.rel 与 bmr.smgr 必须恰有一个非空);
+ *   fork     —— 分支编号;strategy —— 缓冲环策略(可空);
+ *   flags    —— EB_* 标志位(EB_LOCK_FIRST/EB_CREATE_FORK_IF_NEEDED/
+ *               EB_CLEAR_SIZE_CACHE/EB_SKIP_EXTENSION_LOCK/
+ *               EB_PERFORMING_RECOVERY);
+ *   extend_by —— 请求扩展的块数(>0);
+ *   buffers  —— 输出数组(长度 >= extend_by);
+ *   extended_by —— 输出:实际扩展的块数。
+ * 【返回值】扩展后新块区间的起始块号(关系扩展前的旧大小)。
+ */
 BlockNumber
 ExtendBufferedRelBy(BufferManagerRelation bmr,
 					ForkNumber fork,
@@ -1026,6 +1467,32 @@ ExtendBufferedRelBy(BufferManagerRelation bmr,
  * This is useful for callers that want to write a specific page, regardless
  * of the current size of the relation (e.g. useful for visibilitymap and for
  * crash recovery).
+ */
+/*
+ * ExtendBufferedRelTo
+ *      (中文)把关系扩展到至少 extend_to 块,返回 (extend_to-1) 块的缓冲区
+ *
+ * 【作用】确保关系至少长到 extend_to 块,并返回块号 (extend_to-1) 的已
+ * pin 缓冲区。适合"必须写到某个特定页、不管关系当前多大"的调用方,
+ * 例如 visibility map(VM)的页面写入与崩溃恢复。
+ *
+ * 【执行流程】
+ * 1. 若 flags 含 EB_CREATE_FORK_IF_NEEDED 且该 fork 尚不存在:持关系扩展
+ *    锁创建文件(先查缓存再 smgrexists 复查,防止并发重复创建);
+ * 2. 若 flags 含 EB_CLEAR_SIZE_CACHE:作废 smgr 的大小缓存;
+ * 3. smgrnblocks 问内核当前大小,按 64 块一批循环调用
+ *    ExtendBufferedRelCommon 扩展,直到 >= extend_to;除目标块外其余块
+ *    的缓冲区随手 ReleaseBuffer;
+ * 4. 若另一后端抢先完成了扩展(一轮下来没扩到任何页),退回
+ *    ReadBuffer_common 直接读取目标块(RBM_ZERO_AND_LOCK 模式会清零,
+ *    因为此前无人写过它)。
+ *
+ * 【参数】
+ *   bmr      —— 关系;fork —— 分支;strategy —— 缓冲环策略(可空);
+ *   flags    —— EB_* 标志位;extend_to —— 目标总块数;
+ *   mode     —— 返回缓冲区的读取模式(RBM_ZERO_AND_LOCK 或
+ *               RBM_ZERO_AND_CLEANUP_LOCK 会使 flags 附加 EB_LOCK_TARGET)。
+ * 【返回值】块号 (extend_to-1) 的已 pin(且按 mode 加锁)缓冲区。
  */
 Buffer
 ExtendBufferedRelTo(BufferManagerRelation bmr,
@@ -1133,6 +1600,28 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
  * RBM_ZERO_AND_LOCK or RBM_ZERO_AND_CLEANUP_LOCK.  The buffer must be already
  * pinned.  If the buffer is not already valid, it is zeroed and made valid.
  */
+/*
+ * ZeroAndLockBuffer
+ *      (中文)RBM_ZERO_AND_LOCK 系列的收尾:加内容锁,必要时清零页面
+ *
+ * 【作用】配合 PinBufferForBlock 实现 RBM_ZERO_AND_LOCK /
+ * RBM_ZERO_AND_CLEANUP_LOCK:缓冲区必须已 pin。若缓冲区尚无效,把它
+ * 清零并置 BM_VALID,再加内容锁;若已经有效则不加零只加锁
+ * (ZERO_AND_LOCK 加独占锁,CLEANUP 模式加 cleanup 锁)。
+ *
+ * 【设计思想】"清零后再加锁"的顺序是刻意的:先获得独占的 I/O 权
+ * (StartSharedBufferIO 的 BM_IO_IN_PROGRESS 位,而非内容锁——因为读者
+ * 允许在确认元组可见后丢弃内容锁,见 README 的 buffer access rules),
+ * 防止把别人正在 pin 的页清零;然后加独占内容锁,再置 BM_VALID 并终止
+ * I/O,保证其他后端看不到半初始化的全零页。而"无新人能同时看新页"使
+ * 独占锁与 cleanup 锁在这里等价。
+ *
+ * 【参数】
+ *   buffer        —— 已 pin 的缓冲区编号;
+ *   mode          —— RBM_ZERO_AND_LOCK 或 RBM_ZERO_AND_CLEANUP_LOCK;
+ *   already_valid —— 调用方已知缓冲区已有效(可跳过头部操作,只加锁)。
+ * 【返回值】无(返回时缓冲区已按 mode 加锁)。
+ */
 static void
 ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 {
@@ -1219,6 +1708,31 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
  * already present, or false if more work is required to either read it in or
  * zero it.
  */
+/*
+ * PinBufferForBlock
+ *      (中文)为给定块找到并 pin 缓冲区(共享/本地缓冲的统一入口)
+ *
+ * 【作用】读取路径的核心第一步:根据持久性 persistence 决定走
+ * LocalBufferAlloc(临时表)还是 BufferAlloc(共享缓冲池),得到容纳该块的
+ * 缓冲区描述符并完成 pin;同时通过 *foundPtr 告诉调用方该块是否已就绪:
+ * true 表示已存在(BM_VALID),false 表示还需读盘/清零。
+ *
+ * 【附带工作】命中时调用 TrackBufferHit 累计统计计数(blks_hit、IOOP_HIT
+ * 等);relation 非空时 pgstat_count_buffer_read 记入每关系统计
+ * (注意:pgBufferUsage 的 "read" 计数要等 WaitReadBuffers 才算,本函数
+ * 只负责命中与每关系计数)。
+ *
+ * 【前置条件】persistence 必须是三种持久性之一(函数内断言);blockNum
+ * 不能是 P_NEW。
+ *
+ * 【参数】
+ *   rel        —— 关系对象(可为 NULL);smgr —— 存储管理器对象;
+ *   persistence —— RELPERSISTENCE_* 持久性;forkNum/blockNum —— 目标页;
+ *   strategy   —— 缓冲环策略(可空);io_object/io_context —— pgstat 的
+ *                I/O 统计对象/上下文;
+ *   foundPtr   —— 输出:该块是否已在缓冲区中(有效)。
+ * 【返回值】已 pin 的缓冲区编号。
+ */
 static pg_always_inline Buffer
 PinBufferForBlock(Relation rel,
 				  SMgrRelation smgr,
@@ -1271,6 +1785,28 @@ PinBufferForBlock(Relation rel,
  * ReadBuffer_common -- common logic for all ReadBuffer variants
  *
  * smgr is required, rel is optional unless using P_NEW.
+ */
+/*
+ * ReadBuffer_common
+ *      (中文)所有 ReadBuffer 变体的公共实现(smgr 必需,rel 可选)
+ *
+ * 【作用】串联"pin 缓冲区 + 等待/发起 I/O"的完整读页流程:
+ * 1. 拒绝对其他会话临时表的访问(读取它们的本地缓冲会读到错数据);
+ * 2. 向后兼容路径:blockNum == P_NEW 时转交给 ExtendBufferedRel(扩展锁
+ *    由 ExtendBufferedRel 内部管理,扩展调用的扩展性更好;EB_SKIP_EXTENSION_LOCK
+ *    表示扩展锁已由调用方持有);
+ * 3. RBM_ZERO_AND_LOCK / RBM_ZERO_AND_CLEANUP_LOCK 走
+ *    PinBufferForBlock + ZeroAndLockBuffer 的专用路径(不发起 I/O);
+ * 4. 其余模式:组 ReadBuffersOperation 描述符,置 READ_BUFFERS_SYNCHRONOUSLY
+ *    标志(单块读立刻就要用,异步只会增加派发开销),经
+ *    StartReadBuffer() 发起、WaitReadBuffers() 等待完成。
+ *
+ * 【参数】
+ *   rel              —— 关系对象(可为 NULL,但 P_NEW 时必须有);
+ *   smgr             —— 存储管理器对象(必需);
+ *   smgr_persistence —— rel 为 NULL 时使用的持久性;
+ *   forkNum/blockNum —— 目标页;mode —— 读取模式;strategy —— 缓冲环策略。
+ * 【返回值】已 pin 的缓冲区编号(出错不返回,直接报错)。
  */
 static pg_always_inline Buffer
 ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
@@ -1367,6 +1903,27 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 	return buffer;
 }
 
+/*
+ * StartReadBuffersImpl
+ *      (中文)StartReadBuffers 的真实实现:pin 连续块区间并尽力合并 I/O
+ *
+ * 【作用】把从 blockNum 起 *nblocks 个连续块逐一 PinBufferForBlock(pin,
+ * 统计命中),然后把"未就绪(需要读盘)"的块尽量合并成尽量少的
+ * READ_BUFFERS_READ_AHEAD 异步读请求(IOOP_BUFFER_READ_AHEAD,
+ * combining_limit 取自策略:正常/环策略/批处理场景),通过
+ * pg_preadv/StartAsyncReadBuffers 等发起。
+ *
+ * 【参数】
+ *   operation       —— 本次读操作描述符(含 rel/smgr/persistence 等);
+ *   buffers         —— 缓冲区数组(输入输出,见 StartReadBuffers);
+ *   blockNum        —— 起始块号;
+ *   nblocks         —— 输入/输出:请求/实际处理的块数;
+ *   flags           —— READ_BUFFERS_* 标志位;
+ *   allow_forwarding —— 是否允许接收上次拆分操作传回的已 pin 缓冲区
+ *                      (nblocks==1 时不必开启)。
+ * 【返回值】true = 已发起异步 I/O,需配合 WaitReadBuffers 等待;
+ * false = 无需 I/O,缓冲区均已有效。
+ */
 static pg_always_inline bool
 StartReadBuffersImpl(ReadBuffersOperation *operation,
 					 Buffer *buffers,
@@ -1614,6 +2171,27 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
  * forwarded buffers must also be preserved for a continuing call unless
  * they are explicitly released.
  */
+/*
+ * StartReadBuffers
+ *      (中文)发起一段"块区间"的读取(起始阶段,与 WaitReadBuffers 配对)
+ *
+ * 【作用】开始读取从 blockNum 起、长度为 *nblocks 的连续块区间(多块版本
+ * 的 StartReadBuffer)。*nblocks 与 buffers 数组都是"输入/输出"参数:
+ * - 入口:buffers 中 *nblocks 覆盖的元素须为 InvalidBuffer,或上次调用
+ *   因"操作被拆分"而转交(forwarded)回来的已 pin 缓冲区;
+ * - 出口:*nblocks 为本操作实际接收的块数;若小于请求值,说明操作被
+ *   拆分(例如中间某块已被其他后端读入、或到达段边界),此时 buffers
+ *   中超出部分可能含有待续传的 forwarded 缓冲区,调用方必须从"紧随本
+ *   次接受区间之后的块"发起新操作并把它们传回,或显式释放。
+ *
+ * 【返回值语义】
+ * - false:无需 I/O,出口 *nblocks 覆盖的缓冲区均已有效可访问;
+ * - true :已发起 I/O,必须用同一 operation 调用 WaitReadBuffers() 后
+ *         才能访问这些缓冲区;期间 buffers 数组必须保持有效。
+ *
+ * 【实现】所有脏活都在 StartReadBuffersImpl() 中完成,本函数只是允许
+ * "forwarded 缓冲区"并转交(多块操作可能被多次调用续接)。
+ */
 bool
 StartReadBuffers(ReadBuffersOperation *operation,
 				 Buffer *buffers,
@@ -1633,6 +2211,18 @@ StartReadBuffers(ReadBuffersOperation *operation,
  * This version does not support "forwarded" buffers: they cannot be created
  * by reading only one block and *buffer is ignored on entry.
  */
+/*
+ * StartReadBuffer
+ *      (中文)StartReadBuffers 的单块版本(读单个块,提交 I/O 或报告命中)
+ *
+ * 【作用】把 blockNum 一个块加入读操作 operation 并尽量发起 I/O(实现
+ * 委托 StartReadBuffersImpl,nblocks==1)。返回 true 表示已发起 I/O,
+ * 调用方随后必须调用 WaitReadBuffers;false 表示命中缓存,无需等待,
+ * *buffer 已 pin 且有效。
+ *
+ * 【注意】本版本不支持 "forwarded" 缓冲区:单块读不可能产生拆分的
+ * 操作,故入口时忽略 *buffer 的旧值(若传入非无效值,断言版本会报错)。
+ */
 bool
 StartReadBuffer(ReadBuffersOperation *operation,
 				Buffer *buffer,
@@ -1651,6 +2241,15 @@ StartReadBuffer(ReadBuffersOperation *operation,
 
 /*
  * Perform sanity checks on the ReadBuffersOperation.
+ */
+/*
+ * CheckReadBuffersOperation
+ *      (中文)对 ReadBuffersOperation 做完整性自检(仅断言构建)
+ *
+ * 【作用】校验 operation 状态机的一致性:完成的块数不超过总数;若声明
+ * 完成则二者相等;每个缓冲区都对应预期的块号(blocknum+i)且标签有效
+ * (BM_TAG_VALID);已完成的块必须已 BM_VALID。仅 USE_ASSERT_CHECKING
+ * 构建下生效,用于在开发阶段尽早捕获读操作装配错误。
  */
 static void
 CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete)
@@ -1678,6 +2277,24 @@ CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete)
 /*
  * We track various stats related to buffer hits. Because this is done in a
  * few separate places, this helper exists for convenience.
+ */
+/*
+ * TrackBufferHit
+ *      (中文)集中累计"缓冲命中"相关的统计计数
+ *
+ * 【作用】因为缓冲命中统计在好几个地方都要做,抽成这个便捷辅助函数:
+ * 1. 发 tracepoint 供开发者追踪;
+ * 2. pgBufferUsage 的 shared_blks_hit / local_blks_hit +1;
+ * 3. pgstat_count_io_op(IOOP_HIT) 记 I/O 统计;
+ * 4. 若处于 VACUUM 成本计费中,VacuumCostBalance 累加 VacuumCostPageHit;
+ * 5. 若 rel 非空,pgstat_count_buffer_hit 记入每关系命中计数。
+ *
+ * 【参数】
+ *   io_object/io_context —— pgstat I/O 统计对象/上下文;
+ *   rel —— 关系对象(可空);persistence —— 持久性;
+ *   smgr —— 存储管理器(供 tracepoint 取 rlocator 用);
+ *   forknum/blocknum —— 命中的页。
+ * 【返回值】无。
  */
 static pg_always_inline void
 TrackBufferHit(IOObject io_object, IOContext io_context,
@@ -1709,6 +2326,18 @@ TrackBufferHit(IOObject io_object, IOContext io_context,
 /*
  * Helper for WaitReadBuffers() that processes the results of a readv
  * operation, raising an error if necessary.
+ */
+/*
+ * ProcessReadBuffersResult
+ *      (中文)处理一次 readv/异步读的结果(必要时报错)
+ *
+ * 【作用】把已完成 I/O 的结果并入 operation 的进度:SMGR 在返回值中报告
+ * 实际成功读入的块数,据此把 nblocks_done 向前推进。错误/警告转成
+ * ERROR/WARNING 报出;部分读(PGAIO_RS_PARTIAL)只发 DEBUG1 日志,稍后
+ * 由重试逻辑处理。
+ *
+ * 【参数】operation —— 读操作描述符(其 io_return 须已拿到结果)。
+ * 【返回值】无(副作用:nblocks_done 增加;出错则抛异常)。
  */
 static void
 ProcessReadBuffersResult(ReadBuffersOperation *operation)
@@ -1754,6 +2383,21 @@ ProcessReadBuffersResult(ReadBuffersOperation *operation)
  * complete.
  *
  * Returns true if we needed to wait for the IO operation, false otherwise.
+ */
+/*
+ * WaitReadBuffers
+ *      (中文)等待 StartReadBuffers 发起的读操作完成(同步/异步共用收尾)
+ *
+ * 【作用】把 operation 对应的读 I/O 收尾到"所有块都已就绪(BM_VALID)":
+ * - 同步路径(IOMETHOD_SYNC):I/O 在这里才真正发起(pg_preadv),处理
+ *   部分读与重试,写回缓冲内容、SetBufferIO 完成标记;
+ * - 异步路径:等待提交的异步读完成并收集结果,把新读入的块做页头校验
+ *   (无效页按 mode 报错或清零,临时关系跳过校验)并统计 I/O;
+ * - 所有路径:把 pgBufferUsage 的读计数、pgstat I/O 计数、IOOP_READ
+ *   记上,若该块是新读入且属于 VACUUM 场景还会扣减 VacuumCostBalance。
+ *
+ * 【返回值】true = 确实等待了 I/O 完成;false = 无需等待(例如后来发现
+ * 块已被别的后端读入)。调用约定:仅在 StartReadBuffers 返回 true 时调用。
  */
 bool
 WaitReadBuffers(ReadBuffersOperation *operation)
@@ -1934,6 +2578,33 @@ WaitReadBuffers(ReadBuffersOperation *operation)
  *
  * Returns true if IO was initiated or is already in progress (foreign IO),
  * false if the buffer was already valid.
+ */
+/*
+ * AsyncReadBuffers
+ *      (中文)为 ReadBuffersOperation 发起一次异步(或同步)块读
+ *
+ * 【作用】每次调用最多发起一个 I/O 请求,其长度可能因某些块已被并发
+ * 读入而小于待读块数;若首个待读块已有效则不发 I/O。为支持部分读后的
+ * 重试,前 nblocks_done 个块总是被跳过(它们已就绪)。
+ *
+ * 【过程要点】
+ * 1. 把本进程的 zero_damaged_pages / ignore_checksum_failure 转成
+ *    READ_BUFFERS_* 标志传入(pg_aio 完成回调可能运行在 I/O worker
+ *    等其他进程,不能依赖对方的 GUC);
+ * 2. 先获取 AIO 句柄再 StartBufferIO(取句柄可能阻塞,不能等置了
+ *    BM_IO_IN_PROGRESS 之后再阻塞;取不到句柄时先提交已就绪的 I/O);
+ * 3. 从首个待读块起把连续可读的块合并进同一个 readv/异步读(块与块
+ *    之间如果有别的后端已读入的块,会中断合并——这就是拆分重试的原因);
+ * 4. 发起的 I/O 落在 operation->io_wref 上,其余由 WaitReadBuffers /
+ *    完成回调接管;统计(I/O 时长、pgBufferUsage、IOOP_READ)也在
+ *    发起点就绪。
+ *
+ * 【参数】
+ *   operation      —— 读操作描述符;
+ *   nblocks_progress —— 输出:本次调用影响的块数(若首个块已有效则
+ *                      记为 1 并推进 nblocks_done)。
+ * 【返回值】true = I/O 已发起或正在进行(含 foreign I/O);
+ * false = 首个缓冲区已有效,无需 I/O。
  */
 static bool
 AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
@@ -2193,6 +2864,30 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
  *
  * No locks are held either at entry or exit.
  */
+/*
+ * BufferAlloc
+ *      (中文)PinBufferForBlock 的子例程:查找共享缓冲区,必要时选牺牲者换页
+ *
+ * 【作用】在共享缓冲池中查找 (smgr, forkNum, blockNum) 对应的块:命中则
+ * pin 并返回;未命中则从替换队列中选一个牺牲缓冲区,把旧页换出
+ * (换页后的缓冲区标记为"新页已就位",但不读入新页内容——读入由
+ * 调用方在拿到返回的缓冲区后完成)。
+ *
+ * 【并发设计】以 BufferTag 的哈希分片锁 BufMappingPartitionLock 保护
+ * 查找与插入:先以共享模式查 BufTable;未命中则升级为独占、重查
+ * (防止别人抢先插入),再选牺牲者。牺牲者选定后按状态位谨慎处理:
+ * 有 IoInProgress 的跳过(不能让读一半的页换出)、脏页先清空写回
+ * (FlushUnlockedBuffer)、本地缓冲与共享缓冲分别处理,最后原子地把
+ * 牺牲缓冲区的状态改成新页的标签状态并重新插入 BufTable。入口/出口
+ * 都不持锁。
+ *
+ * 【参数】
+ *   smgr/smgr->smgr_rlocator —— 目标关系;relpersistence —— 持久性;
+ *   forkNum/blockNum —— 目标页;strategy —— 替换策略(可空);
+ *   foundPtr —— 输出:块原本是否已在池中;
+ *   io_context —— 输出(命中时避免调用 IOContextForStrategy 的优化)。
+ * 【返回值】已 pin、标签已置为目标页的缓冲区描述符。
+ */
 static pg_always_inline BufferDesc *
 BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			BlockNumber blockNum,
@@ -2366,6 +3061,22 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
  * The buffer could get reclaimed by someone else while we are waiting
  * to acquire the necessary locks; if so, don't mess it up.
  */
+/*
+ * InvalidateBuffer
+ *      (中文)把共享缓冲区标记为无效(丢弃其页内容与映射)
+ *
+ * 【作用】丢弃缓冲区中缓存的页:把 BufferTag 清空、状态位清零并从
+ * BufTable 哈希表删除。仅用于"丢弃关系页"这类场景(如 DROP TABLE、
+ * 关系重建),此时可假定没有其他后端对这块页感兴趣;它仍被 pin 的
+ * 唯一原因可能是有人在把它写盘,因此必须等其 I/O 完成才能回收。
+ *
+ * 【过程】入口须持缓冲区头自旋锁(由调用方保证,返回前释放);保存旧
+ * 标签后,取该标签的映射分区锁(独占),重新加回自旋锁复查标签没变
+ * (等待锁期间缓冲区可能已被别的后端换页重用,此时直接放弃);若引用
+ * 计数非零,释放锁后 WaitIO 等 I/O 结束再重试(retry 循环);最后清
+ * 标签、清状态位(确保线性扫描缓冲区数组时不再认为它有效),并从
+ * BufTable 删除映射。
+ */
 static void
 InvalidateBuffer(BufferDesc *buf)
 {
@@ -2467,6 +3178,19 @@ retry:
  * Returns true if the buffer can be reused, in which case the buffer is only
  * pinned by this backend and marked as invalid, false otherwise.
  */
+/*
+ * InvalidateVictimBuffer
+ *      (中文)GetVictimBuffer 的辅助:把"刚选出的牺牲者"改为可复用状态
+ *
+ * 【作用】牺牲缓冲区已由本后端唯一 pin(调用前提:标签有效、未被本后端
+ * 之外的引用、不持缓冲区头自旋锁)。本函数持其映射分区独占锁复查后,
+ * 清空标签/标志/usage_count,从 BufTable 删除映射,使该缓冲区可被
+ * 当作空缓冲复用。返回 true 表示可以复用。
+ *
+ * 【并发防护】用分区锁保护"改标签 + 删哈希项"两步;并复查引用计数
+ * 恰为 1 且未脏(有人同时又 pin 了它、甚至弄脏了它,就放弃,返回
+ * false——这正是 GetVictimBuffer 中"选完又被抢走"竞态的兜底)。
+ */
 static bool
 InvalidateVictimBuffer(BufferDesc *buf_hdr)
 {
@@ -2544,6 +3268,27 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	return true;
 }
 
+/*
+ * GetVictimBuffer
+ *      (中文)为未命中的读(或新页)挑选一个牺牲缓冲区并清理旧内容
+ *
+ * 【作用】从替换策略(StrategyGetBuffer,时钟扫描或策略环)拿一个
+ * "不被 pin、可替换"的缓冲区,把旧页处理干净(必要时写盘),使其成为
+ * 可容纳新页的空缓冲。旧页若脏,先尝试拿 SHARE_EXCLUSIVE 内容锁后
+ * FlushUnlockedBuffer 写回(条件加锁避免死锁:选到它之后可能有人又
+ * 拿锁——无条件等锁会与对方互相等待);若环策略认为该牺牲者不可取
+ * (StrategyRejectBuffer),则放回环里重选。
+ *
+ * 【竞态防护】"StrategyGetBuffer 判定空闲"与"这里换掉它"之间存在
+ * 竞态:可能又有人 pin 了它甚至弄脏它。因此:(1) 内容锁用条件获取,
+ * 失败则放弃重选;(2) 写盘前加 SHARE_EXCLUSIVE 锁,否则可能写出
+ * 半成品数据(例如别人正在压缩页内容);(3) 最后的标签清理交给
+ * InvalidateVictimBuffer 复查"引用数==1 且未脏",不满足就重选。
+ *
+ * 【参数】
+ *   strategy  —— 替换策略对象(可空 = 默认);io_context —— I/O 统计上下文。
+ * 【返回值】已 pin 的牺牲缓冲区编号(旧页已被清出,可立即填入新页)。
+ */
 static Buffer
 GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 {
@@ -2691,6 +3436,16 @@ again:
  * GetAdditionalPinLimit() could ever return.  Note that it may be zero on a
  * system with a very small buffer pool relative to max_connections.
  */
+/*
+ * GetPinLimit
+ *      (中文)返回本后端应尝试 pin 的缓冲区数量上限(公平份额)
+ *
+ * 【作用】为避免单个后端过度占满缓冲池导致其他后端无缓冲可用,后端
+ * 一次(批操作中)尝试 pin 的缓冲区数不得超过 MaxProportionalPins
+ * (基于 shared_buffers 与 max_connections 算出的"公平份额")。本函数
+ * 即返回这个上限值,也是 GetAdditionalPinLimit() 可能返回的最大值。
+ * 注意:缓冲池相对于 max_connections 很小时,该值可能为 0。
+ */
 uint32
 GetPinLimit(void)
 {
@@ -2702,6 +3457,16 @@ GetPinLimit(void)
  * pin if it wants to stay under the per-backend limit, considering the number
  * of buffers it has already pinned.  Unlike LimitAdditionalPins(), the limit
  * return by this function can be zero.
+ */
+/*
+ * GetAdditionalPinLimit
+ *      (中文)返回本后端还能再 pin 的缓冲区数(考虑已持有的 pin)
+ *
+ * 【作用】在不超过单后端公平份额 MaxProportionalPins 的前提下,返回
+ * 本后端还能额外 pin 的缓冲区数。已持有的 pin 数按
+ * PrivateRefCountOverflowed(溢出条目数)+ REFCOUNT_ARRAY_ENTRIES
+ * (数组条目数取最坏假设)估算——精确计算数组占用成本不值得。
+ * 已超份额时返回 0(与 LimitAdditionalPins 不同,本函数允许返回 0)。
  */
 uint32
 GetAdditionalPinLimit(void)
@@ -2729,6 +3494,18 @@ GetAdditionalPinLimit(void)
  * One additional pin is always allowed, on the assumption that the operation
  * requires at least one to make progress.
  */
+/*
+ * LimitAdditionalPins
+ *      (中文)限制批量操作可额外获取的 pin 数,避免耗尽可 pin 缓冲
+ *
+ * 【作用】把批量操作(如扩展多块)准备获取的 pin 数上限收窄到
+ * GetAdditionalPinLimit(),防止单个操作把整个后端配额占光。
+ * 始终允许至少 1 个 pin(假设操作至少需要一个 pin 才能推进)。
+ *
+ * 【参数】additional_pins —— 输入/输出:原计划的额外 pin 数,可能被
+ * 调小(当它 <= 1 时原样返回)。
+ * 【返回值】无。
+ */
 void
 LimitAdditionalPins(uint32 *additional_pins)
 {
@@ -2746,6 +3523,24 @@ LimitAdditionalPins(uint32 *additional_pins)
 /*
  * Logic shared between ExtendBufferedRelBy(), ExtendBufferedRelTo(). Just to
  * avoid duplicating the tracing and relpersistence related logic.
+ */
+/*
+ * ExtendBufferedRelCommon
+ *      (中文)ExtendBufferedRelBy/To 共享的逻辑:按持久性分发扩展
+ *
+ * 【作用】把"扩展多少块(extend_by)/扩展到至少 extend_upto 块"统一
+ * 包装:临时关系交给 localbuf.c 的 ExtendBufferedRelLocal,其余交给
+ * ExtendBufferedRelShared;前后发 TRACE_BUFFER_EXTEND tracepoint。
+ * 复用的目的只是避免在 ExtendBufferedRelBy/To 里重复这些 tracing 与
+ * 持久性判断逻辑。
+ *
+ * 【参数】
+ *   bmr       —— 关系;fork —— 分支;strategy —— 缓冲环策略(可空);
+ *   flags     —— EB_* 标志;extend_by —— 请求扩展块数;
+ *   extend_upto —— ExtendTo 场景的目标大小(按需扩展场景可不用);
+ *   buffers   —— 输出:已 pin 的新块缓冲区;extended_by —— 输出:
+ *                实际扩展块数。
+ * 【返回值】扩展区间的起始块号(扩展前关系大小)。
  */
 static BlockNumber
 ExtendBufferedRelCommon(BufferManagerRelation bmr,
@@ -2804,6 +3599,29 @@ ExtendBufferedRelCommon(BufferManagerRelation bmr,
 /*
  * Implementation of ExtendBufferedRelBy() and ExtendBufferedRelTo() for
  * shared buffers.
+ */
+/*
+ * ExtendBufferedRelShared
+ *      (中文)共享缓冲版本的关系扩展实现(拿牺牲者 + 扩展文件)
+ *
+ * 【作用】为共享关系扩展 extend_by 个块(或达到 extend_upto,视调用
+ * 方给定),把新块的缓冲区(已 pin、内容清零)填入 buffers。
+ *
+ * 【设计思想】把昂贵的步骤放在扩展锁之外:
+ * 1. LimitAdditionalPins 控制单次 pin 数配额;
+ * 2. 不持扩展锁先为每个新块 GetVictimBuffer(写脏页、清零很贵,清零
+ *    在这里做);这些缓冲由我们 pin 着且无效,别的后端不会选为牺牲者;
+ * 3. 持扩展锁后 smgrextend 追加文件块(循环每批扩展到目标),按
+ *    EB_CREATE_FORK_IF_NEEDED 先建 fork、EB_CLEAR_SIZE_CACHE 作废
+ *    smgr 大小缓存;
+ * 4. 若发现另一后端已把关系扩得更大(extend_by 变 0),说明本后端
+ *    白抢了锁:放弃本次扩展;否则把缓冲区的标签置为新块并
+ *    TerminateBufferIO 置 BM_VALID,在 *extended_by 中汇报实际扩展数。
+ *    EB_LOCK_FIRST 时首个缓冲区额外加独占内容锁(读"空页"语义)。
+ *
+ * 【参数】(同 ExtendBufferedRelCommon;extend_upto 供 ExtendTo 使用,
+ * 正常扩展时传 InvalidBlockNumber 表示不限制)
+ * 【返回值】扩展区间的起始块号。
  */
 static BlockNumber
 ExtendBufferedRelShared(BufferManagerRelation bmr,
@@ -3080,6 +3898,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
  *
  * Buffer must be pinned.
  */
+/*
+ * BufferIsLockedByMe
+ *      (中文)检查本后端是否以任意模式持有该缓冲区的锁
+ *
+ * 【作用】对共享缓冲区,查询本后端是否持有其内容锁(任意模式);
+ * 本地缓冲区不维护内容锁,直接认为已锁定。调用前缓冲区必须已 pin。
+ */
 bool
 BufferIsLockedByMe(Buffer buffer)
 {
@@ -3105,6 +3930,14 @@ BufferIsLockedByMe(Buffer buffer)
  *      Checks if this backend has the buffer locked in the specified mode.
  *
  * Buffer must be pinned.
+ */
+/*
+ * BufferIsLockedByMeInMode
+ *      (中文)检查本后端是否以指定模式持有该缓冲区的锁
+ *
+ * 【作用】同 BufferIsLockedByMe,但限定模式 mode(独占/共享/清理等,
+ * 见 BufferLockMode)。共享缓冲区查本后端的锁状态表;本地缓冲区认为
+ * 总是已按任意模式锁定。调用前缓冲区必须已 pin。
  */
 bool
 BufferIsLockedByMeInMode(Buffer buffer, BufferLockMode mode)
@@ -3132,6 +3965,14 @@ BufferIsLockedByMeInMode(Buffer buffer, BufferLockMode mode)
  *
  * Buffer must be pinned and [share-]exclusive-locked.  (Without such a lock,
  * the result may be stale before it's returned.)
+ */
+/*
+ * BufferIsDirty
+ *      (中文)检查缓冲区是否已脏(内容与磁盘不一致)
+ *
+ * 【作用】读缓冲区状态位 BM_DIRTY:置位表示缓冲区内容已被修改、尚需
+ * 写回磁盘。调用前缓冲区必须已 pin 且持 [SHARE-]EXCLUSIVE 内容锁
+ * (否则返回的结果可能在拿到时就已过期)。
  */
 bool
 BufferIsDirty(Buffer buffer)
@@ -3165,6 +4006,19 @@ BufferIsDirty(Buffer buffer)
  * Buffer must be pinned and exclusive-locked.  (If caller does not hold
  * exclusive lock, then somebody could be in process of writing the buffer,
  * leading to risk of bad data written to disk.)
+ */
+/*
+ * MarkBufferDirty
+ *      (中文)把缓冲区标记为脏(实际写盘稍后进行)
+ *
+ * 【作用】置位缓冲区的 BM_DIRTY:内容已被修改,写盘将推迟到检查点、
+ * bgwriter 或必要时(写盘本身发生在别处)。本地缓冲交给
+ * MarkLocalBufferDirty。
+ *
+ * 【前置条件】缓冲区必须已 pin 且持有 EXCLUSIVE 内容锁(否则可能有人
+ * 正在写这块缓冲,导致坏数据落盘)。等待缓冲区头自旋锁释放后,用
+ * CAS 循环把 BM_DIRTY 置位;若原本不脏,做 VACUUM 成本记账
+ * (VacuumCostPageDirty)与 shared_blks_dirtied 统计。
  */
 void
 MarkBufferDirty(Buffer buffer)
@@ -3231,6 +4085,16 @@ MarkBufferDirty(Buffer buffer)
  * buffer actually needs to be released.  This case is the same as ReadBuffer,
  * but can save some tests in the caller.
  */
+/*
+ * ReleaseAndReadBuffer
+ *      (中文)组合 ReleaseBuffer() 与 ReadBuffer() 的便捷函数
+ *
+ * 【作用】一次性完成"释放旧缓冲区 + 读入目标块"。历史上相比分开调用
+ * 能省一次 BufMgrLock 的获取/释放,现在主要只是便捷;但如果传入的旧
+ * 缓冲区仍然有效且正是目标块,直接原样返回,比"完整释放再重取"
+ * 省不少工作量。buffer 传 InvalidBuffer 表示无旧缓冲可释放,等价于
+ * ReadBuffer(但可为调用方省去若干判断)。
+ */
 Buffer
 ReleaseAndReadBuffer(Buffer buffer,
 					 Relation relation,
@@ -3290,6 +4154,28 @@ ReleaseAndReadBuffer(Buffer buffer,
  * some callers to avoid an extra spinlock cycle.  If skip_if_not_valid is
  * true, then a false return value also indicates that the buffer was
  * (recently) invalid and has not been pinned.
+ */
+/*
+ * PinBuffer
+ *      (中文)pin 缓冲区,使其不可被替换(仅用于共享缓冲区)
+ *
+ * 【作用】增加缓冲区的引用计数(refcount):只要引用计数 > 0,替换算法
+ * 就不会把该缓冲区当作牺牲者换出。同时按策略调整 usage_count:
+ * - 默认策略:首次 pin 时递增 usage_count(上限 BM_MAX_USAGE_COUNT),
+ *   让"常用"缓冲在时钟扫描里存活更久;
+ * - 环策略:只保证 usage_count 非 0(不夸大——同步堆扫描等批量场景
+ *   不希望虚增计数,但非 0 可阻止其他后端从我们的环里偷缓冲;只要
+ *   环周转快于全局时钟扫描,环内缓冲就不会被别人选走)。
+ *
+ * 【性能设计】pin/unpin 极其频繁,故不持缓冲区头自旋锁,而是用 CAS
+ * 循环直接改状态字(通常一次就成功)。前置条件:必须已执行
+ * ResourceOwnerEnlarge() 与 ReservePrivateRefCountEntry()。
+ *
+ * 【参数】
+ *   buf             —— 缓冲区描述符;strategy —— 替换策略(可空);
+ *   skip_if_not_valid —— true 时若缓冲无效直接返回 false(不 pin)。
+ * 【返回值】缓冲是否 BM_VALID;若 skip_if_not_valid 且缓冲区(近期)
+ * 无效,返回 false 且未 pin。
  */
 static bool
 PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
@@ -3407,6 +4293,20 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
  * to save a spin lock/unlock cycle, because we need to pin a buffer before
  * its state can change under us.
  */
+/*
+ * PinBuffer_Locked
+ *      (中文)与 PinBuffer 等价,但调用方已持有缓冲区头自旋锁
+ *
+ * 【作用】在自旋锁已持有的前提下增加引用计数(返回前释放自旋锁)。
+ * 由于不修改 usage_count,无需 strategy 参数;也不做 BM_VALID 检查
+ * (调用方可自行检查)。
+ *
+ * 【说明】所有调用方都保证本后端此前没有 pin 过这块缓冲,因此可以
+ * 跳过私有引用计数数组/哈希的查找(自旋锁还握着,少干活很重要)。
+ * 该路径常常是必须的而不只是省一次锁的优化:必须在状态被改掉之前
+ * pin 住缓冲区。前置条件:调用方须已执行 ReservePrivateRefCountEntry()
+ * 与 ResourceOwnerEnlarge(CurrentResourceOwner)。
+ */
 static void
 PinBuffer_Locked(BufferDesc *buf)
 {
@@ -3438,6 +4338,17 @@ PinBuffer_Locked(BufferDesc *buf)
  *
  * Expected to be called just after releasing a buffer pin (in a BufferDesc,
  * not just reducing the backend-local pincount for the buffer).
+ */
+/*
+ * WakePinCountWaiter
+ *      (中文)释放 pin 后唤醒等待 cleanup 锁的后端(见 LockBufferForCleanup)
+ *
+ * 【作用】LockBufferForCleanup 的等待者会把 BM_PIN_COUNT_WAITER 位和
+ * 自己的 procno 记在缓冲区上,等引用计数降到 1(只剩等待者自己的 pin)
+ * 时醒来。本函数在"真正减少缓冲区引用计数后"调用:重新持自旋锁复查
+ * 确实有待者、且引用计数==1(别的后端可能已先 unpin 并唤醒了它;等待
+ * 者若非被唤醒也会自行清除该位),然后清掉 BM_PIN_COUNT_WAITER 并
+ * ProcSendSignal 唤醒它。缓冲不会被替换,因为等待者仍 pin 着它。
  */
 static void
 WakePinCountWaiter(BufferDesc *buf)
@@ -3475,6 +4386,14 @@ WakePinCountWaiter(BufferDesc *buf)
  * This should be applied only to shared buffers, never local ones.  This
  * always adjusts CurrentResourceOwner.
  */
+/*
+ * UnpinBuffer
+ *      (中文)释放缓冲区 pin,使其恢复可替换(仅用于共享缓冲区)
+ *
+ * 【作用】pin 的逆操作:先从当前 ResourceOwner 注销该缓冲(资源拥有者
+ * 追踪),再 UnpinBufferNoOwner 递减私有引用计数,归零时递减共享
+ * 引用计数(BUF_REFCOUNT_ONE)并清理本后端计数条目。
+ */
 static void
 UnpinBuffer(BufferDesc *buf)
 {
@@ -3484,6 +4403,19 @@ UnpinBuffer(BufferDesc *buf)
 	UnpinBufferNoOwner(buf);
 }
 
+/*
+ * UnpinBufferNoOwner
+ *      (中文)UnpinBuffer 的后半部分:递减计数,不触碰 ResourceOwner
+ *
+ * 【作用】假设调用方已处理完 ResourceOwner(Forget),这里只做计数:
+ * 递减本后端私有引用计数;归零时:
+ * - 把缓冲区内存标为 Valgrind 不可访问;
+ * - 断言本后端不再持有其内容锁(可以看状态,不能断言 pin);
+ * - 原子递减共享引用计数(pg_atomic_fetch_sub);
+ * - 若有人等着 cleanup 锁(BM_PIN_COUNT_WAITER),调用
+ *   WakePinCountWaiter 唤醒;
+ * - 删除本后端的计数条目(ForgetPrivateRefCountEntry)。
+ */
 static void
 UnpinBufferNoOwner(BufferDesc *buf)
 {
@@ -3531,6 +4463,14 @@ UnpinBufferNoOwner(BufferDesc *buf)
  * Set up backend-local tracking of a buffer pinned the first time by this
  * backend.
  */
+/*
+ * TrackNewBufferPin
+ *      (中文)登记本后端对缓冲区的新 pin(首次 pin 时的本端追踪)
+ *
+ * 【作用】当某缓冲区首次被本后端 pin 时,建立本端引用计数条目
+ * (NewPrivateRefCountEntry:放快速数组或溢出哈希),供 GetPrivateRefCount
+ * 等查询"本后端对该缓冲持有多少 pin"。
+ */
 inline void
 TrackNewBufferPin(Buffer buf)
 {
@@ -3570,6 +4510,33 @@ TrackNewBufferPin(Buffer buf)
  * CHECKPOINT_END_OF_RECOVERY or CHECKPOINT_FLUSH_UNLOGGED is set, we write
  * even unlogged buffers, which are otherwise skipped.  The remaining flags
  * currently have no effect here.
+ */
+/*
+ * BufferSync
+ *      (中文)把缓冲池中所有脏缓冲写盘(检查点时刻调用)
+ *
+ * 【作用】检查点主流程之一:把满足条件(mask)的脏共享缓冲区全部写回
+ * 磁盘。默认只写"永久关系且脏"的缓冲;关闭检查点 / 恢复结束 /
+ * 显式要求时也写 unlogged 缓冲(其余标志当前不生效)。CHECKPOINT_FAST
+ * 时取消写之间的延时。
+ *
+ * 【两阶段设计】
+ * 1. 第一遍全池扫描:给检查点开始时就脏的缓冲打上 BM_CHECKPOINT_NEEDED
+ *    ("检查点快照"),并收集进 CkptBufferIds 数组、按
+ *    (tablespace, relNumber, fork, block) 排序——既减少随机 I/O,
+ *    也支撑后续"各表空间轮流写"的平衡(避免一个表空间写到过载);
+ *    检查点进行中才变脏的页不带该标志,不会混入本次写盘;
+ * 2. 第二遍按排序顺序逐缓冲处理(每表空间至多连写 num_written 个就
+ *    切到下个表空间,公平交替):跳过被 pin 的,持有 EXCLUSIVE 内容锁
+ *    写回(期间出现并发访问则直接跳过,让 bgwriter 稍后补写),由
+ *    FlushBuffer 完成真正的写盘与统计;每写一批把 BufferTag 登记到
+ *    wb_context,由 IssuePendingWritebacks 在达到
+ *    checkpoint_flush_after 阈值时异步下发,并用 SyncOneBuffer 的
+ *    结果推进表空间进度(ts_heap 堆每次弹出进度最慢的表空间来均衡)。
+ *
+ * 【参数】flags —— 检查点标志(CHECKPOINT_FAST/IS_SHUTDOWN/
+ * END_OF_RECOVERY/FLUSH_UNLOGGED)。
+ * 【返回值】无。
  */
 static void
 BufferSync(int flags)
@@ -3849,6 +4816,31 @@ BufferSync(int flags)
  * has been "lapped" and no buffer allocations have occurred recently,
  * or if the bgwriter has been effectively disabled by setting
  * bgwriter_lru_maxpages to 0.)
+ */
+/*
+ * BgBufferSync
+ *      (中文)后台写进程(bgwriter)周期性调用的"清扫部分脏缓冲"
+ *
+ * 【作用】bgwriter 的每次唤醒做一次前瞻式清扫:跟随时钟扫描指针
+ * (StrategySyncStart 给出当前位置与自上次以来新分配的缓冲数),在
+ * 它前面一段距离内找干净缓冲写盘,目标是把"可复用缓冲的密度"维持
+ * 在健康水平,减少后端分配缓冲时的写盘停顿。
+ *
+ * 【自适应算法】用滑动平均(16 个样本)估计两个量:
+ * - 分配速率:每个扫描周期新分配了多少缓冲;
+ * - 干净缓冲密度:每扫多少个缓冲能找到一个可复用(干净)缓冲。
+ * 由此推出下次要扫的缓冲数:预计的分配量需要多少干净缓冲,加上缓冲
+ * 池里"不干净(脏/被 pin)"缓冲的补偿,并保证扫过一段最短距离
+ * (min_scan_buffers);扫描量还受 bgwriter_lru_maxpages 封顶。
+ * 清扫推进位置(bgwriter 游标)始终走在时钟扫描前面最多 NBuffers
+ * (即最多领先一圈),落后了就直接跳到时钟扫描当前位置,绝不与
+ * 分配竞争同一批缓冲。被 pin 的缓冲跳过,写出的缓冲记录到
+ * wb_context 供调用方批量下发;num_written 达到 bgwriter_lru_maxpages
+ * 即停止本轮。
+ *
+ * 【返回语义】true = bgwriter 可以进入低功耗休眠(时钟扫描已"套圈"
+ * 且最近无新分配,或 bgwriter_lru_maxpages=0 被禁用);false = 继续
+ * 工作。
  */
 bool
 BgBufferSync(WritebackContext *wb_context)
@@ -4148,6 +5140,27 @@ BgBufferSync(WritebackContext *wb_context)
  * (BUF_WRITTEN could be set in error if FlushBuffer finds the buffer clean
  * after locking it, but we don't care all that much.)
  */
+/*
+ * SyncOneBuffer
+ *      (中文)同步过程中处理单个缓冲(pin + 加锁 + 写回)
+ *
+ * 【作用】检查单个缓冲是否需要写盘,需要则 pin 之、加 SHARE_EXCLUSIVE
+ * 内容锁、由 FlushBuffer 写回,并把要回写的 BufferTag 交给
+ * wb_context(供调用方合并成批量回写)。
+ *
+ * 【跳过规则】skip_recently_used 为 true 时,当前被 pin 的、以及
+ * usage_count 非 0(近期被使用)的缓冲都跳过——它们不是替换候选;
+ * 不脏或无效(空)的缓冲也直接返回。写盘前不持内容锁做脏检查是
+ * 安全的:访问方法在记录 WAL 之前先标记脏,检查点起点在日志记录
+ * 之前,所以漏掉的脏页不违反一致性。
+ *
+ * 【参数】
+ *   buf_id     —— 缓冲区数组下标;skip_recently_used —— 是否跳过
+ *                近期使用过的;wb_context —— 回写上下文。
+ * 【返回值】位掩码:BUF_WRITTEN(已写盘,注意 FlushBuffer 可能发现
+ * 锁上之后已经不脏,此时误置该位也无妨);BUF_REUSABLE(pin 计数与
+ * usage count 都是 0,可直接替换)。
+ */
 static int
 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 {
@@ -4218,6 +5231,14 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
  *		ResourceOwner mechanism.  This routine is just a debugging
  *		cross-check that no pins remain.
  */
+/*
+ * AtEOXact_Buffers
+ *      (中文)事务结束时的缓冲区清理
+ *
+ * 【作用】自 PostgreSQL 8.0 起,缓冲 pin 应由 ResourceOwner 机制自动
+ * 释放,本函数只是调试性交叉检查:CheckForBufferLeaks 确认本后端没有
+ * 遗留 pin;AtEOXact_LocalBuffers 处理本地缓冲;断言溢出 pin 计数为 0。
+ */
 void
 AtEOXact_Buffers(bool isCommit)
 {
@@ -4234,6 +5255,19 @@ AtEOXact_Buffers(bool isCommit)
  * This is called during backend startup (whether standalone or under the
  * postmaster).  It sets up for this backend's access to the already-existing
  * buffer pool.
+ */
+/*
+ * InitBufferManagerAccess
+ *      (中文)后端启动时初始化对本进程共享缓冲池的访问
+ *
+ * 【作用】每个后端(独立模式或 postmaster 派生的)启动时调用:
+ * 1. 计算本后端的 pin 配额 MaxProportionalPins = NBuffers /
+ *    (MaxBackends + 辅助进程数)——非常悲观的估计,但除玩具级的
+ *    shared_buffers 外都足够宽松;
+ * 2. 清零私有引用计数快速数组与键数组,创建溢出计数哈希
+ *    PrivateRefCountHash;
+ * 3. 注册进程退出回调 AtProcExit_Buffers(它需要 LWLock 访问,因此
+ *    必须注册在退出阶段对应处)。
  */
 void
 InitBufferManagerAccess(void)
@@ -4264,6 +5298,14 @@ InitBufferManagerAccess(void)
  * During backend exit, ensure that we released all shared-buffer locks and
  * assert that we have no remaining pins.
  */
+/*
+ * AtProcExit_Buffers
+ *      (中文)后端进程退出回调:释放所有缓冲锁并检查 pin 泄漏
+ *
+ * 【作用】进程退出时(on_shmem_exit 回调)释放本后端持有的全部共享
+ * 缓冲内容锁(UnlockBuffers),交叉检查无 pin 泄漏,并给 localbuf.c
+ * 一个收尾机会(AtProcExit_LocalBuffers)。
+ */
 static void
 AtProcExit_Buffers(int code, Datum arg)
 {
@@ -4281,6 +5323,14 @@ AtProcExit_Buffers(int code, Datum arg)
  *		As of PostgreSQL 8.0, buffer pins should get released by the
  *		ResourceOwner mechanism.  This routine is just a debugging
  *		cross-check that no pins remain.
+ */
+/*
+ * CheckForBufferLeaks
+ *      (中文)检查本后端是否遗留 buffer pin(纯调试交叉检查)
+ *
+ * 【作用】遍历私有引用计数数组与溢出哈希,对每个仍登记的 pin 打印
+ * 详细告警(buffer refcount leak)。仅 USE_ASSERT_CHECKING 构建下
+ * 真正遍历并断言无泄漏;生产构建为空操作。
  */
 static void
 CheckForBufferLeaks(void)
@@ -4343,6 +5393,21 @@ CheckForBufferLeaks(void)
  * dependency graph: modifying table A may cause an opclass to read table B,
  * but it must not cause a read of table A.
  */
+/*
+ * AssertBufferLocksPermitCatalogRead
+ *      (中文)检查"持锁状态下读目录是否安全"(断言构建,AssertCouldGetRelation 核心)
+ *
+ * 【作用】遍历本后端持有的所有缓冲锁,断言其中没有"目录表的独占锁"。
+ * 若目录扫描要读的正好是被本后端独占锁住的目录缓冲,会在内容锁上
+ * 自死锁。主要威胁是 relcache 用到的目录缓冲被独占锁住:对任何目录的
+ * catcache 搜索都可能构建该目录的 relcache 条目。我们没有 relcache
+ * 依赖目录的清单,就尽量检查多数目录的缓冲。
+ *
+ * 【缺陷】持独占缓冲锁时等待越少越好,理想应放宽为非目录限定,但
+ * bttextcmp() 会访问 pg_collation,非核心操作符类也可能读表;只要
+ * 依赖图无环(改表 A 会让操作符类读表 B,但不会导致回读表 A)就是
+ * 无死锁的。
+ */
 void
 AssertBufferLocksPermitCatalogRead(void)
 {
@@ -4374,7 +5439,17 @@ AssertBufferLocksPermitCatalogRead(void)
 		}
 	}
 }
-
+/*
+ * AssertNotCatalogBufferLock
+ *      (中文)断言单块缓冲没有被本后端以独占模式锁住且属于目录
+ *
+ * 【作用】AssertBufferLocksPermitCatalogRead 的逐缓冲检查:非独占锁
+ * 直接放行;独占锁则用 relNumber 当 relid(该假设在目录经历 VACUUM
+ * FULL 之类重建前成立——重建后 relNumber 落到普通范围,会失去对该
+ * 目录危险访问的检测力;用 RelidByRelfilenumber() 能补上,但它可能
+ * 与已持有的锁互相死锁)。文本唯一索引(IsCatalogTextUniqueIndexOid)
+ * 是已知的合法例外。
+ */
 static void
 AssertNotCatalogBufferLock(Buffer buffer, BufferLockMode mode)
 {
@@ -4407,6 +5482,17 @@ AssertNotCatalogBufferLock(Buffer buffer, BufferLockMode mode)
 
 /*
  * Helper routine to issue warnings when a buffer is unexpectedly pinned
+ */
+/*
+ * DebugPrintBufferRefcount
+ *      (中文)生成缓冲区 pin 情况的描述字符串(用于泄漏告警)
+ *
+ * 【作用】把缓冲区编号、所属文件路径(relpathbackend)、块号、状态位、
+ * 共享引用计数与本后端私有计数格式化成一个易读字符串,供
+ * CheckForBufferLeaks 打 "buffer refcount leak" 告警用。
+ *
+ * 【参数】buffer —— 要描述的缓冲区编号。
+ * 【返回值】调用方须 pfree 的字符串(psprintf)。
  */
 char *
 DebugPrintBufferRefcount(Buffer buffer)
@@ -4451,6 +5537,13 @@ DebugPrintBufferRefcount(Buffer buffer)
  * Note: temporary relations do not participate in checkpoints, so they don't
  * need to be flushed.
  */
+/*
+ * CheckPointBuffers
+ *      (中文)检查点时刻把缓冲池全部脏块写盘
+ *
+ * 【作用】检查点流程的入口包装:调用 BufferSync(flags) 完成写盘。
+ * 注意:临时关系不参与检查点,无需冲刷(其数据随会话结束消亡)。
+ */
 void
 CheckPointBuffers(int flags)
 {
@@ -4464,6 +5557,13 @@ CheckPointBuffers(int flags)
  * Note:
  *		Assumes that the buffer is valid and pinned, else the
  *		value may be obsolete immediately...
+ */
+/*
+ * BufferGetBlockNumber
+ *      (中文)返回缓冲区对应的块号
+ *
+ * 【作用】直接读缓冲描述符标签的 blockNum 字段(已 pin,无需自旋锁)。
+ * 注意:假设缓冲区有效且已 pin,否则返回值可能立即过期。
  */
 BlockNumber
 BufferGetBlockNumber(Buffer buffer)
@@ -4485,6 +5585,14 @@ BufferGetBlockNumber(Buffer buffer)
  * BufferGetTag
  *		Returns the relfilelocator, fork number and block number associated with
  *		a buffer.
+ */
+/*
+ * BufferGetTag
+ *      (中文)返回缓冲区对应的关系定位符、分支号与块号
+ *
+ * 【作用】把缓冲描述符标签的三个部分(RelFileLocator、forkNum、
+ * blockNum)拷出到调用方提供的输出参数中。与 BufferGetBlockNumber
+ * 相同的前提:缓冲区须已 pin。
  */
 void
 BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
@@ -4521,6 +5629,31 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
  *
  * If the caller has an smgr reference for the buffer's relation, pass it
  * as the second parameter.  If not, pass NULL.
+ */
+/*
+ * FlushBuffer
+ *      (中文)物理写出一个共享缓冲区(写盘核心)
+ *
+ * 【作用】把缓冲区内容真正写到磁盘(通过 smgrwrite):
+ * 1. StartSharedBufferIO 独占 I/O 权(BM_IO_IN_PROGRESS);若返回
+ *    ALREADY_DONE,说明别人已先写,直接返回;
+ * 2. 安装错误上下文回调(shared_buffer_write_error_callback),写盘
+ *    出错时报告具体文件/块;
+ * 3. 取缓冲的 LSN(持 [SHARE-]EXCLUSIVE 内容锁,写盘期间 LSN 不会变),
+ *    对永久关系的缓冲 XLogFlush 到该 LSN——"日志先落盘"的 WAL 基本
+ *    规则。unlogged 关系的页大多没有真实 LSN,但某些索引 AM 内部用
+ *    "伪 LSN"(XLogGetFakeLSN)检测并发修改;若伪 LSN 计数意外超过
+ *    WAL 插入点,强制刷 WAL 会灾难性失败,故非永久缓冲跳过;
+ * 4. 重算页校验和、smgrwrite 交给内核(真正的落盘要等内核乐意;这
+ *    对我们没关系——可以靠 WAL 重做,但检查点 WAL 前必须 fsync);
+ *    统计 I/O(IOOP_WRITE,含策略环场景的分类)与 shared_blks_written;
+ * 5. TerminateBufferIO 清 BM_DIRTY 并结束 I/O 状态。
+ *
+ * 【前置条件】调用方须已 pin 缓冲区且持有 [SHARE-]EXCLUSIVE 内容锁。
+ * 【参数】
+ *   buf —— 缓冲区描述符;reln —— 其关系的 smgr(可空,空则内部 open);
+ *   io_object/io_context —— pgstat I/O 统计对象/上下文。
+ * 【返回值】无。
  */
 static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
@@ -4645,6 +5778,14 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
  * Convenience wrapper around FlushBuffer() that locks/unlocks the buffer
  * before/after calling FlushBuffer().
  */
+/*
+ * FlushUnlockedBuffer
+ *      (中文)FlushBuffer 的便捷包装:前后负责加锁/解锁
+ *
+ * 【作用】对尚未持内容锁的缓冲区:先取 SHARE_EXCLUSIVE 内容锁,再
+ * FlushBuffer 写盘,最后解锁。适合"拿到 pin 但还没锁"的调用场景
+ * (如 SyncOneBuffer、GetVictimBuffer 的换页写)。
+ */
 static void
 FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 					IOObject io_object, IOContext io_context)
@@ -4663,6 +5804,15 @@ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
  * Note that the accuracy of the result will depend on the details of the
  * relation's storage. For builtin AMs it'll be accurate, but for external AMs
  * it might not be.
+ */
+/*
+ * RelationGetNumberOfBlocksInFork
+ *      (中文)获取关系指定分支当前的页数
+ *
+ * 【作用】返回关系 fork 的物理页数:表 AM(可能不用 BLCKSZ 定长页)按
+ * 字节大小除以 BLCKSZ 向上取整;其余有存储的关系(索引、heap 等)
+ * 直接问 smgrnblocks。结果的精确度取决于存储细节:内置 AM 精确,
+ * 外部 AM 可能不精确。
  */
 BlockNumber
 RelationGetNumberOfBlocksInFork(Relation relation, ForkNumber forkNum)
@@ -4695,6 +5845,15 @@ RelationGetNumberOfBlocksInFork(Relation relation, ForkNumber forkNum)
  * BufferIsPermanent
  *		Determines whether a buffer will potentially still be around after
  *		a crash.  Caller must hold a buffer pin.
+ */
+/*
+ * BufferIsPermanent
+ *      (中文)判断缓冲区内容在崩溃后是否仍然存在
+ *
+ * 【作用】返回缓冲的 BM_PERMANENT 状态(永久关系的缓冲必须在每个
+ * 检查点写盘;unlogged 缓冲只在关闭检查点写)。本地缓冲只服务临时
+ * 关系,直接返回 false。持 pin 期间 BM_PERMANENT 不会变化,且状态
+ * 字是原子读,因此无需自旋锁。调用方须持有 pin。
  */
 bool
 BufferIsPermanent(Buffer buffer)
@@ -4731,6 +5890,18 @@ BufferIsPermanent(Buffer buffer)
  * On platforms with 8 byte atomic reads/writes, we don't need to do any
  * additional locking. On platforms not supporting such 8 byte atomic
  * reads/writes, we need to actually take the header lock.
+ */
+/*
+ * BufferGetLSNAtomic
+ *      (中文)原子地获取缓冲区页面的 LSN
+ *
+ * 【作用】供某些只持共享内容锁的调用方使用:共享锁允许并发后端
+ * 设置 hint bit,而设置 hint bit 可能要求写 WAL 记录、改变 LSN。
+ * 支持 8 字节原子读写的平台上直接原子读即可,无需额外加锁;
+ * 不支持的平台上要拿缓冲头锁才能读出一致的 LSN。
+ *
+ * 【参数】buffer —— 已 pin 的共享/本地缓冲区编号。
+ * 【返回值】缓冲页当前的 LSN。
  */
 XLogRecPtr
 BufferGetLSNAtomic(Buffer buffer)
@@ -4783,6 +5954,28 @@ BufferGetLSNAtomic(Buffer buffer)
  *		that no other process could be trying to load more pages of the
  *		relation into buffers.
  * --------------------------------------------------------------------
+ */
+/*
+ * DropRelationBuffers
+ *      (中文)从缓冲池移除关系指定分支 >= firstDelBlock 的所有页
+ *
+ * 【作用】丢弃(作废)关系缓冲:把块号 >= firstDelBlock 的页从缓冲池
+ * 清出(firstDelBlock = 0 表示全部移除)。脏页直接丢弃不写回——
+ * 因此不可回滚,必须极其谨慎使用!目前只由 smgr.c 在底层文件即将被
+ * 删除/截断时调用(截断时需要 firstDelBlock),受影响页的数据反正
+ * 马上消失,写回毫无意义。保证数据安全、且没有其他进程正在把该关系
+ * 的新页装入缓冲池,是上层代码的责任。
+ *
+ * 【两条路径】
+ * - 优化路径:恢复(或备机)期间可按各 fork 的缓存大小
+ *   (smgrnblocks_cached)精确算出要作废的块数;总块数低于
+ *   BUF_DROP_FULL_SCAN_THRESHOLD 时,直接从 BufTable 逐个定位删除
+ *   (FindAndDropRelationBuffers),不用全池扫描。注意:第一个
+ *   lseek(SEEK_END) 缓存的值可能小于实际块数(某些内核未计入最近
+ *   的写),但这没关系——该文件大小之后不会再有缓冲;
+ * - 全池扫描:其余情况逐个检查缓冲区标签(先无锁预检 rlocator 节省
+ *   锁开销;调用方持 AccessExclusiveLock 保证没有新页装入,所以标签
+ *   只会从目标值"变走"不会"变来",不会漏删),命中则 InvalidateBuffer。
  */
 void
 DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
@@ -4903,6 +6096,15 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
  *		forks of the specified relations.  It's equivalent to calling
  *		DropRelationBuffers once per fork per relation with firstDelBlock = 0.
  *		--------------------------------------------------------------------
+ */
+/*
+ * DropRelationsAllBuffers
+ *      (中文)从缓冲池移除多个关系所有分支的全部页
+ *
+ * 【作用】等价于对每个关系每个分支调用一次 firstDelBlock=0 的
+ * DropRelationBuffers。批量版本:先收集需要作废的块范围,量小走
+ * BufTable 精准删除,量大走全池扫描。临时关系交给 localbuf 处理;
+ * 多个关系按 rlocator 排序后还可复用"排序 + 游标扫描"避免重复定位。
  */
 void
 DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
@@ -5074,6 +6276,18 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
  *		pages are removed.)
  * --------------------------------------------------------------------
  */
+/*
+ * FindAndDropRelationBuffers
+ *      (中文)按 BufTable 精准定位删除关系分支的缓冲页(免全池扫描)
+ *
+ * 【作用】对块号 [firstDelBlock, nForkBlock) 区间逐块在 BufMapping
+ * 表查找并作废对应缓冲(要求已知该 fork 的精确块数 nForkBlock)。
+ * 供 DropRelationBuffers 的小批量路径使用。
+ *
+ * 【并发注意】按哈希取分区共享锁查表、放锁后再取缓冲头锁复查标签:
+ * 两次取锁之间缓冲可能已被别的后端换页给别的块/关系,必须重查
+ * (匹配才 InvalidateBuffer,否则解锁跳过)。
+ */
 static void
 FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum,
 						   BlockNumber nForkBlock,
@@ -5134,6 +6348,15 @@ FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum,
  *		DropRelationBuffers() which is for destroying just one relation.
  * --------------------------------------------------------------------
  */
+/*
+ * DropDatabaseBuffers
+ *      (中文)丢弃某个数据库在缓冲池中的所有页
+ *
+ * 【作用】作废指定数据库的全部缓冲页,脏页直接丢弃不写回。用于销毁
+ * 数据库时——目录树已不存在,写盘毫无意义且会失败。实现与
+ * DropRelationBuffers 类似(全池扫描,无锁预检 dbOid 省锁开销)。
+ * 不需要考虑本地缓冲:被销毁的数据库不可能属于本后端。
+ */
 void
 DropDatabaseBuffers(Oid dbid)
 {
@@ -5180,6 +6403,18 @@ DropDatabaseBuffers(Oid dbid)
  *		used in any performance-critical code paths, so it's not worth
  *		adding additional overhead to normal paths to make it go faster.
  * --------------------------------------------------------------------
+ */
+/*
+ * FlushRelationBuffers
+ *      (中文)把关系的所有脏页写盘(确保内核看到最新内容)
+ *
+ * 【作用】全池扫描(或本地缓冲扫描)找出指定关系的脏页并写回内核
+ * (写盘真正落盘要等内核乐意)。调用方通常应持目标关系的
+ * AccessExclusiveLock,确保没有别的后端正在弄脏更多块;效果在锁
+ * 释放后无法保证。
+ *
+ * 【注】当前是顺序扫描缓冲池,理论上可改得更巧妙;本例程不在任何
+ * 性能关键路径上,不值得为加快它给常规路径增加开销。
  */
 void
 FlushRelationBuffers(Relation rel)
@@ -5268,6 +6503,16 @@ FlushRelationBuffers(Relation rel)
  *		FlushRelationBuffers once per relation.  The relations are assumed not
  *		to use local buffers.
  * --------------------------------------------------------------------
+ */
+/*
+ * FlushRelationsAllBuffers
+ *      (中文)把多个 smgr 关系的所有脏页写盘(批量版 FlushRelationBuffers)
+ *
+ * 【作用】等价于对每个关系调用一次 FlushRelationBuffers(假定这些
+ * 关系都不用本地缓冲)。为减少锁开销,把 rlocator 排序后做"无锁预检
+ * + bsearch":关系数少(<= RELS_BSEARCH_THRESHOLD)时直接线性匹配,
+ * 省去排序与二分开销。命中且 (BM_VALID|BM_DIRTY) 的缓冲 pin 后
+ * FlushUnlockedBuffer 写回。
  */
 void
 FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
@@ -5366,6 +6611,21 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
  *		Refer comments atop CreateAndCopyRelationData() for details about
  *		'permanent' parameter.
  * --------------------------------------------------------------------
+ */
+/*
+ * RelationCopyStorageUsingBuffer
+ *      (中文)用缓冲管理器逐块复制分支数据(替代 smgrread/smgrextend 版)
+ *
+ * 【作用】把源关系一个分支的数据逐块复制到目标关系。与旧版
+ * RelationCopyStorage(直接 smgrread/smgrextend)不同,这里走 bufmgr
+ * API:源端用批量读流(read_stream, BAS_BULKREAD + batching——回调
+ * 不持锁,安全),目标端 RBM_ZERO_AND_LOCK 取新块,拷贝页内容、
+ * MarkBufferDirty 并在需要时 WAL 记日志(log_newpage_buffer),临界
+ * 区(START/END_CRIT_SECTION)包裹拷贝与标记。
+ *
+ * 【WAL 策略】一般 wal_level > minimal 时都记 WAL;unlogged 关系
+ * 除 init fork 外跳过。复制前先把目标文件一次性 smgrextend 到源
+ * 大小(用零页占位),随后逐块覆盖。
  */
 static void
 RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
@@ -5481,6 +6741,18 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
  *		temporary relations.
  * --------------------------------------------------------------------
  */
+/*
+ * CreateAndCopyRelationData
+ *      (中文)创建目标关系的存储并把源关系的所有分支复制过去
+ *
+ * 【作用】供 CREATE DATABASE 建库复制等场景:为目标关系建存储
+ * (RelationCreateStorage),复制主分支与所有存在(fork)的分支。
+ * permanent = true 表示永久关系,false 表示 unlogged 关系(两者
+ * 决定 WAL 记录策略);当前不支持临时关系。
+ *
+ * 【注意】建库期间有独立的清理机制会删除整个数据库目录,因此单个
+ * 关系无需注册清理回调(RelationCreateStorage 传 false)。
+ */
 void
 CreateAndCopyRelationData(RelFileLocator src_rlocator,
 						  RelFileLocator dst_rlocator, bool permanent)
@@ -5545,6 +6817,15 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
  *		It's assumed these wouldn't be interesting.
  * --------------------------------------------------------------------
  */
+/*
+ * FlushDatabaseBuffers
+ *      (中文)把某数据库的全部脏页写盘(确保内核视图最新)
+ *
+ * 【作用】全池扫描找 dbOid 匹配且 (BM_VALID|BM_DIRTY) 的缓冲,pin
+ * 后 FlushUnlockedBuffer 写回。调用方通常应持有合适锁,保证没有
+ * 别的后端在目标数据库活跃(否则会继续弄脏页面);临时关系页无需
+ * 关心(它们没有意义)。
+ */
 void
 FlushDatabaseBuffers(Oid dbid)
 {
@@ -5585,6 +6866,14 @@ FlushDatabaseBuffers(Oid dbid)
  * Flush a previously, share-exclusively or exclusively, locked and pinned
  * buffer to the OS.
  */
+/*
+ * FlushOneBuffer
+ *      (中文)把已加锁并已 pin 的缓冲区冲刷到内核
+ *
+ * 【作用】单个缓冲的强制写回:要求调用方已 pin 且已持
+ * [SHARE-]EXCLUSIVE 内容锁(断言检查),然后直接 FlushBuffer 写盘。
+ * 目前仅支持共享缓冲(本地缓冲断言拒绝,但没有原理性障碍)。
+ */
 void
 FlushOneBuffer(Buffer buffer)
 {
@@ -5605,6 +6894,14 @@ FlushOneBuffer(Buffer buffer)
 /*
  * ReleaseBuffer -- release the pin on a buffer
  */
+/*
+ * ReleaseBuffer
+ *      (中文)释放缓冲区的 pin
+ *
+ * 【作用】pin 的逆操作:本地缓冲走 UnpinLocalBuffer,共享缓冲走
+ * UnpinBuffer(递减本后端私有计数,归零则递减共享引用计数)。pin
+ * 释放后该缓冲就恢复"可被替换"资格。无效编号直接报错。
+ */
 void
 ReleaseBuffer(Buffer buffer)
 {
@@ -5621,6 +6918,16 @@ ReleaseBuffer(Buffer buffer)
  * UnlockReleaseBuffer -- release the content lock and pin on a buffer
  *
  * This is just a, more efficient, shorthand for a common combination.
+ */
+/*
+ * UnlockReleaseBuffer
+ *      (中文)同时释放缓冲的内容锁与 pin(常见组合的高效简写)
+ *
+ * 【作用】"解锁 + 释放 pin"一次做完:把锁释放的状态修改(BufferLockReleaseSub)
+ * 与 pin 释放(共享引用计数减 1)合并成单次原子减操作
+ * (pg_atomic_sub_fetch_u64),比分开调用更快。本地缓冲只需
+ * UnpinLocalBuffer(本地缓冲不维护内容锁)。释放锁后若有等待者可
+ * 唤醒时顺带处理(BufferLockProcessRelease)。
  */
 void
 UnlockReleaseBuffer(Buffer buffer)
@@ -5689,6 +6996,14 @@ UnlockReleaseBuffer(Buffer buffer)
  *		This function cannot be used on a buffer we do not have pinned,
  *		because it doesn't change the shared buffer state.
  */
+/*
+ * IncrBufferRefCount
+ *      (中文)对"已 pin 过"的缓冲区再增加一次 pin 计数
+ *
+ * 【作用】在本后端已有的私有引用计数上 +1(本地缓冲则是
+ * LocalRefCount +1),并记入 ResourceOwner。注意:不能用于尚未 pin
+ * 的缓冲——本函数不修改共享缓冲区状态,只动本端计数。
+ */
 void
 IncrBufferRefCount(Buffer buffer)
 {
@@ -5714,6 +7029,28 @@ IncrBufferRefCount(Buffer buffer)
  * This is separated out because it turns out that the repeated checks for
  * local buffers, repeated GetBufferDescriptor() and repeated reading of the
  * buffer's state sufficiently hurts the performance of BufferSetHintBits16().
+ */
+/*
+ * MarkSharedBufferDirtyHint
+ *      (中文)共享缓冲专用的"设 hint 位并标记脏"辅助(MarkBufferDirtyHint 等使用)
+ *
+ * 【作用】BufferSetHintBits16 / MarkBufferDirtyHint 的共享部分:在已持
+ * [SHARE-]EXCLUSIVE 内容锁的缓冲上完成"按需 WAL + 置脏":
+ * 1. 若已脏则快速返回(同一页可能被频繁调用,先查状态省事);
+ * 2. 需要保护 hint 位防撕裂写(XLogHintBitIsNeeded)且缓冲永久时,
+ *    WAL 记录整页镜像——仅当这是本页自上次检查点以来的首次修改才
+ *    必要;恢复中或该关系被跳过 WAL(RelFileLocatorSkippingWAL)时,
+ *    只设 hint 不置脏(页被换出/停机时该 hint 会丢失,可接受);
+ * 3. 先置 BM_DIRTY 再写 WAL 记录(常规规则:即使 WAL 还没写,也要让
+ *    BufferSync/SyncOneBuffer 尝试冲刷;反序会让检查点有隙可乘);
+ * 4. 用 log_newpage_buffer 记整页(首个 hint 位)、后续共用
+ *    log_newpage_range 积累优化。
+ *
+ * 【参数】
+ *   buffer —— 缓冲区编号;bufHdr —— 其描述符;
+ *   lockstate —— 调用方在持锁时已读到的状态字(避免重读);
+ *   buffer_std —— 页是否为"标准布局"(决定 PageSetChecksum 时机)。
+ * 【返回值】无。
  */
 static inline void
 MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
@@ -5840,6 +7177,20 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
  *	  (it e.g. can't always on a hot standby), so it cannot be used for
  *	  important changes.
  */
+/*
+ * MarkBufferDirtyHint
+ *      (中文)为非关键修改(hint 位)标记缓冲脏
+ *
+ * 【作用】与 MarkBufferDirty 本质相同,但针对非关键修改(如 hint 位),
+ * 区别在于:
+ * 1. 调用方不写 WAL;因此若启用校验和,可能需要记 XLOG_FPI_FOR_HINT
+ *    记录防撕裂页;
+ * 2. 调用方可能只持 SHARE-EXCLUSIVE 内容锁(不必独占);
+ * 3. 不保证缓冲总会被标记脏(例如热备上有时做不到),因此不能用于
+ *    重要修改。
+ * 本地缓冲交给 MarkLocalBufferDirty,共享缓冲交给
+ * MarkSharedBufferDirtyHint。
+ */
 inline void
 MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 {
@@ -5870,6 +7221,16 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
  * ResOwnerReleaseBuffer(), took care of releasing buffer content locks per
  * se; the only thing we need to deal with here is clearing any PIN_COUNT
  * request that was in progress.
+ */
+/*
+ * UnlockBuffers
+ *      (中文)释放共享缓冲区的内容锁(用于错误后的清理)
+ *
+ * 【作用】错误清理路径调用。目前内容锁本身已由 ResourceOwner 清理
+ * (ResOwnerReleaseBuffer)逐个处理,这里只需处理"正在等待 cleanup 锁
+ * (BM_PIN_COUNT_WAITER)且等待者是自己"的半途状态:清掉该标志位并
+ * 复位 PinCountWaitBuf。若标志位已不在(收到 cancel/die 中断时已被
+ * 重置)也不必抱怨。
  */
 void
 UnlockBuffers(void)
@@ -5916,6 +7277,27 @@ UnlockBuffers(void)
  *
  * Callers should provide a constant for mode, for more efficient code
  * generation.
+ */
+/*
+ * BufferLockAcquire
+ *      (中文)按指定模式获取缓冲内容锁(拿不到就睡)
+ *
+ * 【作用】缓冲内容锁的获取入口:拿不到锁则休眠等待。持有内容锁期间
+ * 屏蔽 cancel/die 中断(HOLD_INTERRUPTS,防止中断干扰共享内存结构
+ * 的操作),直到锁释放才恢复(RESUME_INTERRUPTS 在解锁处)。
+ *
+ * 【锁协议】与 lwlock.c 的 LWLockAcquire 几乎同思路(详见 lwlock.c
+ * 顶部文档):先尝试性获取(BufferLockAttempt,含公平性计数
+ * extraWaits);失败则把自己排进缓冲的等待队列(BufferLockQueueSelf)
+ * 再尝试,仍不行就睡;被唤醒或超时后重试。等待状态记录在缓冲描述符
+ * 的 wait_lockmode/等待队列与等待者链表里;若在队列中等待太久
+ * (deadlock_timeout),参与死锁检测(CheckDeadLock)。
+ *
+ * 【参数】
+ *   buffer —— 缓冲区编号;buf_hdr —— 其描述符(两者一起传是为了
+ *   避免相互查找,这在 profile 里很明显);mode —— 锁模式(应为
+ *   编译期常量以获得更好代码生成)。
+ * 【返回值】无(返回时已持有锁)。
  */
 static inline void
 BufferLockAcquire(Buffer buffer, BufferDesc *buf_hdr, BufferLockMode mode)
@@ -6033,6 +7415,15 @@ BufferLockAcquire(Buffer buffer, BufferDesc *buf_hdr, BufferLockMode mode)
 /*
  * Release a previously acquired buffer content lock.
  */
+/*
+ * BufferLockUnlock
+ *      (中文)释放先前获取的缓冲内容锁
+ *
+ * 【作用】解锁的核心路径:BufferLockDisownInternal 把锁模式从本后端
+ * 锁状态表摘除(返回模式),BufferLockReleaseSub 计算状态字的减量,
+ * 用单次原子减释放锁(减完别人立刻可获取,即便我们还要唤醒等待者),
+ * 再 BufferLockProcessRelease 处理唤醒队列,最后恢复中断。
+ */
 static void
 BufferLockUnlock(Buffer buffer, BufferDesc *buf_hdr)
 {
@@ -6068,6 +7459,18 @@ BufferLockUnlock(Buffer buffer, BufferDesc *buf_hdr)
  * (e.g. two share locks). This is because we currently do not have space to
  * track multiple lock ownerships of the same buffer within one backend.  That
  * is ok for the current uses of BufferLockConditional().
+ */
+/*
+ * BufferLockConditional
+ *      (中文)尝试获取缓冲内容锁,需要等待则立即失败
+ *
+ * 【作用】不阻塞的加锁尝试:一次 BufferLockAttempt 失败就返回 false
+ * (不排队)。允许对"本后端已锁定"的缓冲做条件尝试,但总是失败——
+ * 即使新锁与已持有的不冲突(如两个共享锁):本后端目前没有空间记录
+ * 同一缓冲的多重持锁。这对当前所有调用方都够用。
+ *
+ * 【参数】buffer —— 缓冲区;buf_hdr —— 描述符;mode —— 锁模式。
+ * 【返回值】true = 已持有;false = 未拿到(且未持锁)。
  */
 static bool
 BufferLockConditional(Buffer buffer, BufferDesc *buf_hdr, BufferLockMode mode)
@@ -6114,6 +7517,18 @@ BufferLockConditional(Buffer buffer, BufferDesc *buf_hdr, BufferLockMode mode)
  * caller's job.
  *
  * Similar to LWLockAttemptLock().
+ */
+/*
+ * BufferLockAttempt
+ *      (中文)尝试原子地获取指定模式的内容锁(不阻塞)
+ *
+ * 【作用】模仿 LWLockAttemptLock:用 CAS 循环尝试把锁状态原子并入
+ * 缓冲状态字(EXCLUSIVE / SHARE_EXCLUSIVE / SHARED 对应状态字不同
+ * 的计数值)。阻塞等待是调用方的职责。锁被别的后端持有时,本函数
+ * 不排队、直接报告"需要等待"。
+ *
+ * 【参数】buf_hdr —— 缓冲描述符;mode —— 锁模式。
+ * 【返回值】true = 锁被占用需等待;false = 已成功获取。
  */
 static inline bool
 BufferLockAttempt(BufferDesc *buf_hdr, BufferLockMode mode)
@@ -6182,6 +7597,15 @@ BufferLockAttempt(BufferDesc *buf_hdr, BufferLockMode mode)
 /*
  * Add ourselves to the end of the content lock's wait queue.
  */
+/*
+ * BufferLockQueueSelf
+ *      (中文)把自己排到内容锁等待队列末尾
+ *
+ * 【作用】加锁失败需要睡眠时,把自己(MyProc)挂到 buf_hdr 的
+ * lock_waiters 队列尾部(proclist),并设置等待模式;等锁期间
+ * 由持锁者(或其继任者)负责唤醒,与 LWLock 的唤醒传播一致。
+ * MyProc 为 NULL(共享内存初始化阶段)时不可能等待,直接 PANIC。
+ */
 static void
 BufferLockQueueSelf(BufferDesc *buf_hdr, BufferLockMode mode)
 {
@@ -6221,6 +7645,14 @@ BufferLockQueueSelf(BufferDesc *buf_hdr, BufferLockMode mode)
  * This is used if we queued ourselves because we thought we needed to sleep
  * but, after further checking, we discovered that we don't actually need to
  * do so.
+ */
+/*
+ * BufferLockDequeueSelf
+ *      (中文)把自己从内容锁等待队列中移除
+ *
+ * 【作用】先前以为要睡眠而入了等待队列,进一步检查后发现其实
+ * 不需要等(如拿到锁或锁已可获取),就把自己从队列摘下并恢复
+ * 可中断状态,避免留下僵尸等待者。
  */
 static void
 BufferLockDequeueSelf(BufferDesc *buf_hdr)
@@ -6290,6 +7722,15 @@ BufferLockDequeueSelf(BufferDesc *buf_hdr)
  * the lock is going to be released in a different process than the process
  * that acquired it.
  */
+/*
+ * BufferLockDisown
+ *      (中文)让本后端"放弃持有"内容锁(锁交给别的进程释放)
+ *
+ * 【作用】调用后当前后端不再把该锁记为自己的持有,保证出错时
+ * 不会因错误处理提前释放它;代价是调用方须保证锁最终一定被释放
+ * (哪怕是出错路径)。仅在"锁要交给获取它的那个进程之外的进程
+ * 释放"时才是合理的——例如把写锁转交给 AIO 子系统,由它来释放。
+ */
 static inline void
 BufferLockDisown(Buffer buffer, BufferDesc *buf_hdr)
 {
@@ -6303,6 +7744,17 @@ BufferLockDisown(Buffer buffer, BufferDesc *buf_hdr)
  * This is the code that can be shared between actually releasing a lock
  * (BufferLockUnlock()) and just not tracking ownership of the lock anymore
  * without releasing the lock (BufferLockDisown()).
+ */
+/*
+ * BufferLockDisownInternal
+ *      (中文)停止把锁当作"本后端持有"(释放与弃管共用的内部代码)
+ *
+ * 【作用】真正释放锁(BufferLockUnlock)与"不再登记所有权但保留锁"
+ * (BufferLockDisown)共用:把锁模式从本后端锁状态表中取出并清零。
+ * 未持有该锁时报错("lock %d is not held")。
+ *
+ * 【参数】buffer —— 缓冲区;buf_hdr —— 描述符。
+ * 【返回值】原来持有的锁模式(供调用方决定状态字修改)。
  */
 static inline int
 BufferLockDisownInternal(Buffer buffer, BufferDesc *buf_hdr)
@@ -6323,6 +7775,21 @@ BufferLockDisownInternal(Buffer buffer, BufferDesc *buf_hdr)
  * Wakeup all the lockers that currently have a chance to acquire the lock.
  *
  * wake_exclusive indicates whether exclusive lock waiters should be woken up.
+ */
+/*
+ * BufferLockWakeup
+ *      (中文)唤醒当前有机会获取锁的所有等待者
+ *
+ * 【作用】锁被释放后,唤醒等待队列里"按锁兼容性当前能拿到锁"的一批
+ * 后端:持锁遍历等待队列,兼容的等待者移入唤醒链表并置
+ * LW_WS_PENDING_WAKEUP;一旦唤醒过冲突性更强的等待者(共享锁后不再
+ * 唤醒独占者;share-exclusive 后两者都不再唤醒;独占者直接终止),再
+ * 用单次 CAS 清 BM_LOCK_WAKE_IN_PROGRESS/BM_LOCK_HAS_WAITERS 并
+ * 释放头锁,随后批量 PGSemaphoreUnlock 唤醒。
+ *
+ * 【参数】buf_hdr —— 缓冲描述符;wake_exclusive —— 是否唤醒独占锁
+ * 等待者。
+ * 【返回值】无。
  */
 static void
 BufferLockWakeup(BufferDesc *buf_hdr, bool wake_exclusive)
@@ -6460,6 +7927,16 @@ BufferLockWakeup(BufferDesc *buf_hdr, bool wake_exclusive)
  * release being done in multiple places, each needing to compute what to
  * subtract from the lock state.
  */
+/*
+ * BufferLockReleaseSub
+ *      (中文)计算"释放某模式锁"对应状态字应减去的量
+ *
+ * 【作用】把锁模式映射为状态字减量(EXCLUSIVE/SHARE_EXCLUSIVE/SHARED
+ * 各有对应计数值)。独立成函数是因为希望把"锁释放"与其他原子操作
+ * 合并,释放会发生在多处,各处都要算减量。
+ * 【注】用 if-else 而非 switch:测试显示 switch 会让 gcc 生成明显更差
+ * 的代码,在本函数出现在 profile 中。
+ */
 static inline uint64
 BufferLockReleaseSub(BufferLockMode mode)
 {
@@ -6488,6 +7965,23 @@ BufferLockReleaseSub(BufferLockMode mode)
  * This is separated from BufferLockUnlock() as we want to combine the lock
  * release with other atomic operations when possible, leading to the lock
  * release being done in multiple places.
+ */
+/*
+ * BufferLockProcessRelease
+ *      (中文)释放锁之后需要做的收尾(唤醒等待者等)
+ *
+ * 【作用】在原子状态修改之后处理:若还有等待者且没有"唤醒进行中"
+ * (BM_LOCK_WAKE_IN_PROGRESS),根据释放后锁的剩余状态决定是否唤醒:
+ * - 锁完全空闲:可唤醒任意类型等待者;
+ * - 释放的是 share-exclusive 且还有别人持锁:只唤醒共享/排他类型
+ *   中不冲突的(share-exclusive 等待者可被唤醒);
+ * - 释放共享锁且仍有其他持锁者:无需唤醒(必有其他共享持锁者,
+ *   新等待者无法获锁)。
+ * 需要唤醒时才取自旋锁(唤醒需要自旋锁,尽量省)。
+ *
+ * 【参数】buf_hdr —— 描述符;mode —— 释放的锁模式;
+ * lockstate —— 原子操作返回的新状态。
+ * 【返回值】无。
  */
 static void
 BufferLockProcessRelease(BufferDesc *buf_hdr, BufferLockMode mode, uint64 lockstate)
@@ -6544,6 +8038,13 @@ BufferLockProcessRelease(BufferDesc *buf_hdr, BufferLockMode mode, uint64 lockst
  *
  * This is meant as debug support only.
  */
+/*
+ * BufferLockHeldByMeInMode
+ *      (中文)测试本进程是否按指定模式持有内容锁(仅调试用途)
+ *
+ * 【作用】查本后端锁状态表中该缓冲登记的锁模式是否恰为 mode。
+ * 仅供断言/调试使用。
+ */
 static bool
 BufferLockHeldByMeInMode(BufferDesc *buf_hdr, BufferLockMode mode)
 {
@@ -6562,6 +8063,13 @@ BufferLockHeldByMeInMode(BufferDesc *buf_hdr, BufferLockMode mode)
  *
  * This is meant as debug support only.
  */
+/*
+ * BufferLockHeldByMe
+ *      (中文)测试本进程是否以任意模式持有内容锁(仅调试用途)
+ *
+ * 【作用】查本后端锁状态表:该缓冲登记的模式非 BUFFER_LOCK_UNLOCK
+ * 即为持有。仅供断言/调试使用。
+ */
 static bool
 BufferLockHeldByMe(BufferDesc *buf_hdr)
 {
@@ -6576,6 +8084,13 @@ BufferLockHeldByMe(BufferDesc *buf_hdr)
 
 /*
  * Release the content lock for the buffer.
+ */
+/*
+ * UnlockBuffer
+ *      (中文)释放缓冲区的内容锁
+ *
+ * 【作用】对共享缓冲调用 BufferLockUnlock(从锁状态表摘除并原子释放,
+ * 顺带唤醒等待者);本地缓冲不需要内容锁,直接返回。调用前须已 pin。
  */
 void
 UnlockBuffer(Buffer buffer)
@@ -6592,6 +8107,18 @@ UnlockBuffer(Buffer buffer)
 
 /*
  * Acquire the content_lock for the buffer.
+ */
+/*
+ * LockBufferInternal
+ *      (中文)获取缓冲区的内容锁(内部实现)
+ *
+ * 【作用】按 mode 阻塞式获取内容锁(拿不到就睡)。bootstrap/共享内存
+ * 初始化期间没有 PGPROC 时不能等待(断言);mode 不能是 UNLOCK
+ * (由 LockBuffer 包装处理);本地缓冲无需锁,直接返回。
+ *
+ * 【性能注】最频繁的模式最先测;switch 会让 gcc 生成差得多的代码,
+ * 故用 if-else,且以常量 mode 调用 BufferLockAcquire 以获得更好的
+ * 代码生成。
  */
 void
 LockBufferInternal(Buffer buffer, BufferLockMode mode)
@@ -6636,6 +8163,13 @@ LockBufferInternal(Buffer buffer, BufferLockMode mode)
  *
  * This assumes the caller wants BUFFER_LOCK_EXCLUSIVE mode.
  */
+/*
+ * ConditionalLockBuffer
+ *      (中文)条件获取内容锁(假设调用方要独占模式)
+ *
+ * 【作用】不等待的独占加锁尝试:本地缓冲视同已获得,共享缓冲走
+ * BufferLockConditional(EXCLUSIVE)。拿不到返回 false,不排队。
+ */
 bool
 ConditionalLockBuffer(Buffer buffer)
 {
@@ -6655,6 +8189,15 @@ ConditionalLockBuffer(Buffer buffer)
  *
  * NOTE: Like in BufferIsPinned(), what we check here is that *this* backend
  * holds a pin on the buffer.  We do not care whether some other backend does.
+ */
+/*
+ * CheckBufferIsPinnedOnce
+ *      (中文)验证本后端对该缓冲恰好 pin 了一次
+ *
+ * 【作用】断言/运行时校验:本后端私有计数恰为 1(本地缓冲查
+ * LocalRefCount,共享缓冲查 GetPrivateRefCount)。如 BufferIsPinned
+ * 一样,只关心本后端,不关心别的后端是否也 pin。不满足则报错
+ * "incorrect local pin count"。
  */
 void
 CheckBufferIsPinnedOnce(Buffer buffer)
@@ -6688,6 +8231,22 @@ CheckBufferIsPinnedOnce(Buffer buffer)
  * then call LockBufferForCleanup().  LockBufferForCleanup() is similar to
  * LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE), except that it loops until
  * it has successfully observed pin count = 1.
+ */
+/*
+ * LockBufferForCleanup
+ *      (中文)以"清理锁"锁定缓冲区(为删除页内条目做准备)
+ *
+ * 【作用】只有同时满足"持有独占锁"且"观察到没有别的后端 pin 这块
+ * 缓冲"时,才允许从磁盘页中删除条目(有 pin 意味着对方可能持有指向
+ * 页内条目的指针,如堆扫描的 item 引用,见 README)。语义上相当于
+ * LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE),但会循环等待,直到成功
+ * 观察到共享引用计数 == 1(仅剩自己)。
+ *
+ * 【等待协议】把 BM_PIN_COUNT_WAITER 位与自己的 procno 登记在缓冲上
+ * 睡觉;持锁期间如果别人释放最后一个额外 pin,会走 WakePinCountWaiter
+ * 唤醒我们;等待时若参与恢复冲突检测(可能报告 recovery conflict,
+ * 如热备上的 buffer pin 阻塞),并有死锁/超时保护,出错时清除等待
+ * 登记(UnlockBuffers 兜底)。获取到"pin 数 == 1"的时刻之后才返回。
  */
 void
 LockBufferForCleanup(Buffer buffer)
@@ -6862,6 +8421,17 @@ cleanup_lock_acquired:
  * Check called from ProcessRecoveryConflictInterrupts() when Startup process
  * requests cancellation of all pin holders that are blocking it.
  */
+/*
+ * HoldingBufferPinThatDelaysRecovery
+ *      (中文)检查本后端是否持有阻塞恢复的缓冲 pin(热备冲突响应)
+ *
+ * 【作用】启动进程(Startup)请求取消所有阻塞它的 pin 持有者时,由
+ * ProcessRecoveryConflictInterrupts 调用来检查本后端。若本后端确实
+ * 持有 Startup 正等待的缓冲(通过共享变量 GetStartupBufferPinWaitBufId
+ * 公布的 bufid)的 pin,返回 true,使后端被取消/回滚以解除阻塞。
+ * 醒来慢时可能 Startup 已被别人唤醒、或收到多余中断,故 bufid 未
+ * 设置时直接返回 false。
+ */
 bool
 HoldingBufferPinThatDelaysRecovery(void)
 {
@@ -6887,6 +8457,13 @@ HoldingBufferPinThatDelaysRecovery(void)
  *
  * We won't loop, but just check once to see if the pin count is OK.  If
  * not, return false with no lock held.
+ */
+/*
+ * ConditionalLockBufferForCleanup
+ *      (中文)LockBufferForCleanup 的条件版本(不等待)
+ *
+ * 【作用】只检查一次"pin 数是否 == 1"且独占锁能否立即拿到;不行则
+ * 返回 false 且不持任何锁。本地缓冲只检查 LocalRefCount == 1。
  */
 bool
 ConditionalLockBufferForCleanup(Buffer buffer)
@@ -6946,6 +8523,14 @@ ConditionalLockBufferForCleanup(Buffer buffer)
  * happens to be a cleanup lock, and we can proceed with anything that
  * would have been allowable had we sought a cleanup lock originally.
  */
+/*
+ * IsBufferCleanupOK
+ *      (中文)检查已持锁的缓冲是否满足清理条件(锁已持有的变体)
+ *
+ * 【作用】对"已经加过锁"的缓冲检查清理是否可行:观察到共享引用
+ * 计数 == 1,说明当前的独占锁恰好就是 cleanup 锁,可以做原本需要
+ * cleanup 锁才能做的一切。本地缓冲只需检查本端计数 == 1。
+ */
 bool
 IsBufferCleanupOK(Buffer buffer)
 {
@@ -6995,6 +8580,18 @@ IsBufferCleanupOK(Buffer buffer)
  * being set and, if not, whether the current lock can be upgraded.
  *
  * Updates *lockstate when returning true.
+ */
+/*
+ * SharedBufferBeginSetHintBits
+ *      (中文)BufferBeginSetHintBits/BufferSetHintBits16 的共享缓冲辅助
+ *
+ * 【作用】检查当前锁模式是否已足够设 hint 位;不够则尝试把持有的
+ * 共享锁升级为 SHARE_EXCLUSIVE:
+ * - 已持 EXCLUSIVE/SHARE_EXCLUSIVE:直接用(顺带读状态字给调用方);
+ * - 只持 SHARE:若状态字里没有别人持有 EXCLUSIVE/SHARE_EXCLUSIVE,
+ *   用 CAS 把"减 SHARED 计数 + 加 SHARE_EXCLUSIVE 计数"原子完成;
+ *   否则升级失败返回 false(调用方会放弃这次 hint 设置)。
+ * 成功时 *lockstate 更新为最新状态字。
  */
 static inline bool
 SharedBufferBeginSetHintBits(Buffer buffer, BufferDesc *buf_hdr, uint64 *lockstate)
@@ -7087,6 +8684,22 @@ SharedBufferBeginSetHintBits(Buffer buffer, BufferDesc *buf_hdr, uint64 *locksta
  * hint bits and that the cost of occasionally not setting hint bits in hotly
  * accessed pages is fairly low, this seems like an acceptable tradeoff.
  */
+/*
+ * BufferBeginSetHintBits
+ *      (中文)尝试获取"设置 hint 位"的权利(锁检查/升级)
+ *
+ * 【作用】设置 hint 位需要持有 SHARE_EXCLUSIVE 或 EXCLUSIVE 内容锁:
+ * 若本后端只有共享锁,则尝试升级为 SHARE_EXCLUSIVE(见
+ * SharedBufferBeginSetHintBits)。返回 true 才允许设置 hint 位;此后
+ * 直到解锁都无需再调用本函数。本地缓冲总是放行。
+ *
+ * 【为什么需要 SHARE_EXCLUSIVE】防止对正在写盘的缓冲设 hint 位——
+ * 那会破坏页校验和(冲刷缓冲同样要求 SHARE_EXCLUSIVE 锁)。由此同一
+ * 时刻只有一个后端能设 hint 位;允许多个并发会需要更复杂的锁结构
+ * (记录"正在设 hint 位的后端数",再为 I/O 增加一个冲突锁级)。鉴于
+ * 该锁持有时间短、后端经常设置相同 hint 位、且热页偶发设不上代价
+ * 很低,这是可接受的取舍。
+ */
 bool
 BufferBeginSetHintBits(Buffer buffer)
 {
@@ -7115,6 +8728,14 @@ BufferBeginSetHintBits(Buffer buffer)
  * MarkBufferDirtyHint() if so desired), but allows us to perform some sanity
  * checks.
  */
+/*
+ * BufferFinishSetHintBits
+ *      (中文)结束一个设置 hint 位的阶段(BufferBeginSetHintBits 的配对)
+ *
+ * 【作用】严格说并非必需(调用方大可自行 MarkBufferDirtyHint),但
+ * 借此可做健全性检查:共享缓冲必须仍持 SHARE_EXCLUSIVE/EXCLUSIVE
+ * 锁(断言);需要置脏时按参数调用 MarkBufferDirtyHint。
+ */
 void
 BufferFinishSetHintBits(Buffer buffer, bool mark_dirty, bool buffer_std)
 {
@@ -7137,6 +8758,16 @@ BufferFinishSetHintBits(Buffer buffer, bool mark_dirty, bool buffer_std)
  * This is a bit faster than BufferBeginSetHintBits() /
  * BufferFinishSetHintBits() when setting hints once in a buffer, but slower
  * than the former when setting hint bits multiple times in the same buffer.
+ */
+/*
+ * BufferSetHintBits16
+ *      (中文)尝试设置缓冲内一个 16 位字段的 hint 位
+ *
+ * 【作用】允许时执行 *ptr = val,并尝试把缓冲标脏,返回 true;否则
+ * 返回 false。*ptr 必须是缓冲页内的地址(断言)。比"Begin/Finish 成
+ * 对调用"在"单次设 hint"场景更快,但在同一缓冲多次设 hint 时较慢。
+ * 内部复用 SharedBufferBeginSetHintBits + MarkSharedBufferDirtyHint;
+ * 本地缓冲直接赋值并 MarkLocalBufferDirty。
  */
 bool
 BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
@@ -7183,6 +8814,19 @@ BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
 
 /*
  * WaitIO -- Block until the IO_IN_PROGRESS flag on 'buf' is cleared.
+ */
+/*
+ * WaitIO
+ *      (中文)阻塞等待 'buf' 的 IO_IN_PROGRESS 标志被清除
+ *
+ * 【作用】缓冲正在进行 I/O(读或写)时,别的后端必须等它完成:本
+ * 函数先断言没有未提交的异步 I/O(批量模式不允许 AIO 无关代码出现
+ * 在这里),再通过缓冲区附带的条件变量等待 I/O 完成——I/O 完成方
+ * (TerminateBufferIO)会广播唤醒。等待前会先检查是否有别人已开始
+ * 异步读(pgaio_wref 有效),有则等待其完成。
+ *
+ * 【注意】仅用于共享缓冲区;判断标志位必须持自旋锁以保证正确性
+ * (这个测试事关正确性,宁可保险)。
  */
 static void
 WaitIO(BufferDesc *buf)
@@ -7286,6 +8930,29 @@ WaitIO(BufferDesc *buf)
  * If we successfully marked the buffer as BM_IO_IN_PROGRESS,
  * BUFFER_IO_READY_FOR_IO is returned.
  */
+/*
+ * StartSharedBufferIO
+ *      (中文)开始对共享缓冲区的 I/O(获取独占 I/O 权)
+ *
+ * 【作用】把缓冲置 BM_IO_IN_PROGRESS,取得"唯一进行 I/O"的权利。
+ * 若缓冲已有 I/O 在进行,按参数决定:同步等待、借助 io_wref 异步
+ * 加入(拿到对方的 wait ref,返回 BUFFER_IO_IN_PROGRESS 即可等)、
+ * 或不等待直接返回。等待时先提交本后端已暂存的异步 I/O 避免死锁。
+ *
+ * 【状态语义】
+ * - 读操作只针对非 BM_VALID 的缓冲,写操作只针对 (BM_VALID|BM_DIRTY)
+ *   的缓冲,因此总能判断活是否已干完:已完成返回
+ *   BUFFER_IO_ALREADY_DONE;
+ * - 成功置位 BM_IO_IN_PROGRESS 返回 BUFFER_IO_READY_FOR_IO;
+ * - 正有 I/O 在跑(且选择不等待/异步加入)返回 BUFFER_IO_IN_PROGRESS。
+ * 注:若缓冲曾被标记 I/O 进行中但因出错未完成,我们重新自己做 I/O。
+ *
+ * 【参数】
+ *   buf —— 描述符(须已 pin);forInput —— 读(true)/写(false);
+ *   wait —— 是否同步等待完成;io_wref —— 输出/输入:异步等待引用
+ *   (见函数头英文详述)。
+ * 【返回值】StartBufferIOResult 之一。
+ */
 StartBufferIOResult
 StartSharedBufferIO(BufferDesc *buf, bool forInput, bool wait, PgAioWaitRef *io_wref)
 {
@@ -7366,6 +9033,14 @@ StartSharedBufferIO(BufferDesc *buf, bool forInput, bool wait, PgAioWaitRef *io_
  * when the caller doesn't otherwise need to care about local vs shared. See
  * StartSharedBufferIO() for details.
  */
+/*
+ * StartBufferIO
+ *      (中文)StartSharedBufferIO / StartLocalBufferIO 的包装
+ *
+ * 【作用】供"不必区分共享/本地缓冲"的调用方使用:本地缓冲交给
+ * StartLocalBufferIO,共享缓冲交给 StartSharedBufferIO(语义与参数
+ * 详见后者注释)。
+ */
 StartBufferIOResult
 StartBufferIO(Buffer buffer, bool forInput, bool wait, PgAioWaitRef *io_wref)
 {
@@ -7402,6 +9077,22 @@ StartBufferIO(Buffer buffer, bool forInput, bool wait, PgAioWaitRef *io_wref)
  * If forget_owner is true, we release the buffer I/O from the current
  * resource owner. (forget_owner=false is used when the resource owner itself
  * is being released)
+ */
+/*
+ * TerminateBufferIO
+ *      (中文)结束我们正在进行的缓冲区 I/O(清标志、唤醒等待者)
+ *
+ * 【作用】StartBufferIO 的配对:清除 BM_IO_IN_PROGRESS(与上次遗留的
+ * BM_IO_ERROR),成功写时按 clear_dirty 清 BM_DIRTY/BM_CHECKPOINT_NEEDED,
+ * 读完成时经 set_flag_bits 置 BM_VALID;可选地把缓冲区 I/O 从当前
+ * ResourceOwner 注销(forget_owner=false 用于"资源拥有者本身正在被
+ * 释放"的场景);release_aio 时释放 AIO 子系统的持有权(清 io_wref、
+ * 引用计数 -1)。随后广播 I/O 条件变量唤醒 WaitIO 中的等待者;若
+ * 释放的恰是等待者之外最后一个 pin(release_aio 时),还要唤醒
+ * cleanup 锁等待者。
+ *
+ * 【前置条件】本进程正在为该缓冲做 I/O;BM_IO_IN_PROGRESS 已置位;
+ * 缓冲已 pin。
  */
 void
 TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
@@ -7465,6 +9156,19 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
  *  That's correct when we're releasing the whole resource owner, but
  *  beware if you use this in other contexts.
  */
+/*
+ * AbortBufferIO
+ *      (中文)出错后清理活动的缓冲区 I/O
+ *
+ * 【作用】I/O 出错时(所有 LWLock 与内容锁都已释放,但 pin 还没放)
+ * 收尾:若 I/O 在进行中,总是置 BM_IO_ERROR(即使错误与本次 I/O
+ * 无关);若缓冲无效,直接结束;否则(有效即写 I/O 失败)先发一次
+ * WARNING,且若是再次失败则提示"多次失败,写错误可能永久"。最后
+ * TerminateBufferIO(clear_dirty=false, 置 BM_IO_ERROR)结束 I/O。
+ *
+ * 【注意】本函数不从 ResourceOwner 移除缓冲 I/O 记录——整块释放
+ * resource owner 时这是正确的;其他场景使用须谨慎。
+ */
 static void
 AbortBufferIO(Buffer buffer)
 {
@@ -7504,6 +9208,14 @@ AbortBufferIO(Buffer buffer)
 /*
  * Error context callback for errors occurring during shared buffer writes.
  */
+/*
+ * shared_buffer_write_error_callback
+ *      (中文)共享缓冲写盘出错时的错误上下文回调
+ *
+ * 【作用】FlushBuffer 写盘报错时,向错误信息追加 "writing block %u of
+ * relation ..." 上下文,方便定位哪个文件哪一块写失败了。缓冲已 pin,
+ * 读标签无需自旋锁。
+ */
 static void
 shared_buffer_write_error_callback(void *arg)
 {
@@ -7520,6 +9232,13 @@ shared_buffer_write_error_callback(void *arg)
 /*
  * Error context callback for errors occurring during local buffer writes.
  */
+/*
+ * local_buffer_write_error_callback
+ *      (中文)本地缓冲写盘出错时的错误上下文回调
+ *
+ * 【作用】与 shared_buffer_write_error_callback 相同,但路径用
+ * relpathbackend(含后端编号,可定位临时表文件)。
+ */
 static void
 local_buffer_write_error_callback(void *arg)
 {
@@ -7535,6 +9254,14 @@ local_buffer_write_error_callback(void *arg)
 
 /*
  * RelFileLocator qsort/bsearch comparator; see RelFileLocatorEquals.
+ */
+/*
+ * rlocator_comparator
+ *      (中文)RelFileLocator 的 qsort/bsearch 比较器(见 RelFileLocatorEquals)
+ *
+ * 【作用】按 (relNumber, dbOid, spcOid) 字典序比较两个关系文件定位
+ * 符,供 DropRelationsAllBuffers / FlushRelationsAllBuffers 对列表
+ * 排序后用 bsearch 快速匹配。
  */
 static int
 rlocator_comparator(const void *p1, const void *p2)
@@ -7562,6 +9289,15 @@ rlocator_comparator(const void *p1, const void *p2)
 
 /*
  * Lock buffer header - set BM_LOCKED in buffer state.
+ */
+/*
+ * LockBufHdr
+ *      (中文)锁定缓冲区头:在缓冲状态字置 BM_LOCKED
+ *
+ * 【作用】缓冲头自旋锁的实现:用原子 fetch_or 置 BM_LOCKED,第一次
+ * 就直接成功(自旋延迟基础设施的搭建在 profile 里很明显,通常用
+ * 不上);失败则用自旋延迟循环等 BM_LOCKED 被清除后重试。返回时
+ * 状态字含 BM_LOCKED。本地缓冲不得调用(断言)。
  */
 uint64
 LockBufHdr(BufferDesc *desc)
@@ -7611,6 +9347,14 @@ LockBufHdr(BufferDesc *desc)
  * Obviously the buffer could be locked by the time the value is returned, so
  * this is primarily useful in CAS style loops.
  */
+/*
+ * WaitBufHdrUnlocked
+ *      (中文)等 BM_LOCKED 清除后返回当时的缓冲状态字
+ *
+ * 【作用】自旋等待缓冲头锁释放,返回锁释放瞬间读到的状态字。显然
+ * 返回值拿到时锁可能又被别人抢走,因此主要用于 CAS 风格循环
+ * (读 → 计算 → compare_exchange)。
+ */
 pg_noinline uint64
 WaitBufHdrUnlocked(BufferDesc *buf)
 {
@@ -7634,6 +9378,14 @@ WaitBufHdrUnlocked(BufferDesc *buf)
 
 /*
  * BufferTag comparator.
+ */
+/*
+ * buffertag_comparator
+ *      (中文)BufferTag 比较器
+ *
+ * 【作用】按 (RelFileLocator, forkNum, blockNum) 字典序比较两个页
+ * 标签(rlocator 内部再按 relNumber/dbOid/spcOid)。用于按 BufferTag
+ * 排序的场景。
  */
 static inline int
 buffertag_comparator(const BufferTag *ba, const BufferTag *bb)
@@ -7669,6 +9421,14 @@ buffertag_comparator(const BufferTag *ba, const BufferTag *bb)
  * It is important that tablespaces are compared first, the logic balancing
  * writes between tablespaces relies on it.
  */
+/*
+ * ckpt_buforder_comparator
+ *      (中文)检查点写盘顺序的比较器
+ *
+ * 【作用】按 (tablespace, relNumber, forkNum, blockNum) 排序检查点
+ * 要写的缓冲。表空间必须排最前:BufferSync 的"表空间间轮流写"平衡
+ * 逻辑依赖这个顺序。相同页 ID 几乎不可能,但仍兼容返回 0。
+ */
 static inline int
 ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b)
 {
@@ -7700,6 +9460,15 @@ ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b)
  * Comparator for a Min-Heap over the per-tablespace checkpoint completion
  * progress.
  */
+/*
+ * ts_ckpt_progress_comparator
+ *      (中文)按各表空间 checkpoint 完成进度比较的堆比较器
+ *
+ * 【作用】作为最小堆(Min-Heap)的比较器,进度小的排在堆顶
+ * (表空间层并行 checkpoint 时优先让进度落后的先分配工作)。
+ * 与 ckpt_buforder_comparator(按文件位置排序)不同,这里按进度值
+ * 反直觉地返回:sa 进度更小返回 1,使其沉底,形成最小堆。
+ */
 static int
 ts_ckpt_progress_comparator(Datum a, Datum b, void *arg)
 {
@@ -7723,6 +9492,15 @@ ts_ckpt_progress_comparator(Datum a, Datum b, void *arg)
  * not have to check the current configuration. A value of 0 means that no
  * writeback control will be performed.
  */
+/*
+ * WritebackContextInit
+ *      (中文)初始化回写上下文(丢弃旧状态)
+ *
+ * 【作用】重置 WritebackContext:登记"合并上限指针"并把待回写计数清零。
+ * max_pending 用指针而非立即值,是为了让 GUC 机制(如
+ * bgwriter_flush_after / checkpoint_flush_after)可以随时调整合并
+ * 上限,调用代码无需自行读取当前配置;值为 0 表示不做回写控制。
+ */
 void
 WritebackContextInit(WritebackContext *context, int *max_pending)
 {
@@ -7734,6 +9512,15 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
 
 /*
  * Add buffer to list of pending writeback requests.
+ */
+/*
+ * ScheduleBufferTagForWriteback
+ *      (中文)把缓冲区加入待回写请求列表
+ *
+ * 【作用】登记一次"写回请求"(不直接下发):把 BufferTag 追加进
+ * 待回写数组(若回写控制开启);累计数量达到上限(*max_pending)时,
+ * 立即 IssuePendingWritebacks 下发一批。fsync 被禁用或使用直接 I/O
+ * 时,pg_flush_data 不会做任何事,没必要登记,直接返回。
  */
 void
 ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context,
@@ -7784,6 +9571,16 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
  *
  * Because this is only used to improve the OSs IO scheduling we try to never
  * error out - it's just a hint.
+ */
+/*
+ * IssuePendingWritebacks
+ *      (中文)把待回写请求批量下发给内核(smgrmarkwriteback)
+ *
+ * 【作用】把 ScheduleBufferTagForWriteback 累积的请求按 BufferTag
+ * 排序后逐批通过 smgrwriteback 通知内核(异步刷出,提升 OS 的 I/O
+ * 调度质量)。相邻(或重复)块合并成更长的连续回写。因为这只是给
+ * OS 的提示,尽量不出错。统计记 IOOP_WRITEBACK,最后清空待回写
+ * 计数。注意:回写请求只针对永久关系的块。
  */
 void
 IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
@@ -7867,7 +9664,13 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 }
 
 /* ResourceOwner callbacks */
-
+/*
+ * ResOwnerReleaseBufferIO
+ *      (中文)ResourceOwner 回调:释放缓冲 I/O(AbortBufferIO 的包装)
+ *
+ * 【作用】当"进行中的缓冲 I/O"随 resource owner 一起释放时调用,
+ * 转交 AbortBufferIO 收尾(例如错误路径)。
+ */
 static void
 ResOwnerReleaseBufferIO(Datum res)
 {
@@ -7885,10 +9688,29 @@ ResOwnerPrintBufferIO(Datum res)
 }
 
 /*
+ * ResOwnerPrintBufferIO
+ *      (中文)ResourceOwner 回调:打印丢失的缓冲 I/O 描述(用于报错)
+ *
+ * 【作用】调试辅助:当缓冲 I/O 从 resource owner 丢失跟踪时,生成
+ * 描述消息 "lost track of buffer IO on buffer %d"。
+ */
+
+/*
  * Release buffer as part of resource owner cleanup. This will only be called
  * if the buffer is pinned. If this backend held the content lock at the time
  * of the error we also need to release that (note that it is not possible to
  * hold a content lock without a pin).
+ */
+/*
+ * ResOwnerReleaseBuffer
+ *      (中文)ResourceOwner 清理回调:释放缓冲 pin(必要时释放内容锁)
+ *
+ * 【作用】resource owner 清理时释放缓冲:只在缓冲被 pin 时才会回调。
+ * 出错时本后端可能还持有内容锁,也需要一并释放(pin 都没有就不可能
+ * 持有内容锁)。与 ReleaseBuffer 类似,但不调用 ResourceOwnerForgetBuffer
+ * (回调本身就是 forget 流程)。本地缓冲走 UnpinLocalBufferNoOwner;
+ * 共享缓冲若锁模式非 UNLOCK 先解锁(仅应发生在错误后),再
+ * UnpinBufferNoOwner。
  */
 static void
 ResOwnerReleaseBuffer(Datum res)
@@ -7926,6 +9748,13 @@ ResOwnerReleaseBuffer(Datum res)
 	}
 }
 
+/*
+ * ResOwnerPrintBuffer
+ *      (中文)ResourceOwner 回调:打印丢失跟踪的缓冲描述(用于报错)
+ *
+ * 【作用】当缓冲 pin 从 resource owner 丢失跟踪时,生成描述字符串
+ * (转交 DebugPrintBufferRefcount)。
+ */
 static char *
 ResOwnerPrintBuffer(Datum res)
 {
@@ -7935,6 +9764,19 @@ ResOwnerPrintBuffer(Datum res)
 /*
  * Helper function to evict unpinned buffer whose buffer header lock is
  * already acquired.
+ */
+/*
+ * EvictUnpinnedBufferInternal
+ *      (中文)驱逐未 pin 缓冲区的辅助(前提:已持缓冲头锁)
+ *
+ * 【作用】在已持缓冲头锁(BM_LOCKED)的前提下尝试把缓冲逐出:
+ * 无效(无 BM_VALID)或被 pin 的缓冲放弃;否则 PinBuffer_Locked
+ * (释放自旋锁)后,若脏先 FlushUnlockedBuffer 写回(*buffer_flushed
+ * 置 true),再 InvalidateVictimBuffer 把缓冲改成无效可复用(若其间
+ * 又变脏或被别人 pin,返回 false),最后 UnpinBuffer。
+ *
+ * 【返回值】true = 缓冲原本有效、现已无效(可复用);false = 原本
+ * 无效 / 被 pin 无法逐出 / 写盘期间又变脏。
  */
 static bool
 EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
@@ -7998,6 +9840,20 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
  * Returns false if it wasn't valid, if it couldn't be evicted due to a pin,
  * or if the buffer becomes dirty again while we're trying to write it out.
  */
+/*
+ * EvictUnpinnedBuffer
+ *      (中文)尝试驱逐共享缓冲中的当前块(仅测试/开发用途!)
+ *
+ * 【作用】把指定共享缓冲的当前内容逐出(无效化)。入口时缓冲必须
+ * 未被 pin——因此调用方脑海里的"某个块"可能早已被别的块替换;
+ * 返回时也未 pin,可能又被占用(甚至又被同一块占回)。这种固有的
+ * 竞态使它只适合测试/开发,不适合生产代码。
+ *
+ * 【参数】buf —— 共享缓冲区编号;buffer_flushed —— 输出:缓冲原本
+ * 脏且已冲刷(注意:不一定是本调用冲刷的,可能是别人)。
+ * 【返回值】true = 缓冲原本有效、现已无效;false = 原本无效 / 被
+ * pin 无法逐出 / 写盘期间又变脏。
+ */
 bool
 EvictUnpinnedBuffer(Buffer buf, bool *buffer_flushed)
 {
@@ -8026,6 +9882,14 @@ EvictUnpinnedBuffer(Buffer buf, bool *buffer_flushed)
  * - buffers_evicted - were evicted
  * - buffers_flushed - were flushed
  * - buffers_skipped - could not be evicted
+ */
+/*
+ * EvictAllUnpinnedBuffers
+ *      (中文)尝试驱逐所有共享缓冲(仅测试/开发用途,见 EvictUnpinnedBuffer)
+ *
+ * 【作用】遍历全部共享缓冲,对每个有效缓冲尝试逐出。三个输出参数
+ * 必填,累计:逐出数(buffers_evicted)、冲刷数(buffers_flushed)、
+ * 未能逐出数(buffers_skipped)。
  */
 void
 EvictAllUnpinnedBuffers(int32 *buffers_evicted, int32 *buffers_flushed,
@@ -8077,6 +9941,14 @@ EvictAllUnpinnedBuffers(int32 *buffers_evicted, int32 *buffers_flushed,
  * - buffers_flushed - were flushed
  * - buffers_skipped - could not be evicted
  */
+/*
+ * EvictRelUnpinnedBuffers
+ *      (中文)尝试驱逐指定关系在共享缓冲中的所有页(仅测试/开发用途)
+ *
+ * 【作用】遍历全池,对"有效且属于给定关系"的缓冲尝试逐出。调用方
+ * 须对关系持有至少 AccessShareLock 防止关系被删除。统计语义同
+ * EvictAllUnpinnedBuffers。无锁预检 + 持锁复查两遍确认归属。
+ */
 void
 EvictRelUnpinnedBuffers(Relation rel, int32 *buffers_evicted,
 						int32 *buffers_flushed, int32 *buffers_skipped)
@@ -8127,6 +9999,14 @@ EvictRelUnpinnedBuffers(Relation rel, int32 *buffers_evicted,
 /*
  * Helper function to mark unpinned buffer dirty whose buffer header lock is
  * already acquired.
+ */
+/*
+ * MarkDirtyUnpinnedBufferInternal
+ *      (中文)把未 pin 缓冲区标记脏的辅助(前提:已持缓冲头锁)
+ *
+ * 【作用】无效或被 pin 的缓冲放弃;否则 pin 后:若不脏,加 EXCLUSIVE
+ * 内容锁调用 MarkBufferDirty 置脏并返回 true;原本就脏则
+ * *buffer_already_dirty = true。最后 UnpinBuffer。
  */
 static bool
 MarkDirtyUnpinnedBufferInternal(Buffer buf, BufferDesc *desc,
@@ -8184,6 +10064,14 @@ MarkDirtyUnpinnedBufferInternal(Buffer buf, BufferDesc *desc,
  *
  * Returns true if the buffer has successfully been marked as dirty.
  */
+/*
+ * MarkDirtyUnpinnedBuffer
+ *      (中文)尝试把指定共享缓冲标记为脏(仅测试/开发用途!)
+ *
+ * 【作用】EvictUnpinnedBuffer 的"置脏"版本(内部是 MarkBufferDirty):
+ * 对未被 pin 的共享缓冲尝试置脏。buffer_already_dirty 必填:若失败
+ * 是因为它本来就脏,置为 true。返回 true 表示成功置脏。
+ */
 bool
 MarkDirtyUnpinnedBuffer(Buffer buf, bool *buffer_already_dirty)
 {
@@ -8219,6 +10107,14 @@ MarkDirtyUnpinnedBuffer(Buffer buf, bool *buffer_already_dirty)
  * - buffers_already_dirty - were already dirty
  * - buffers_skipped - could not be dirtied because of a reason different
  * than a buffer being already dirty.
+ */
+/*
+ * MarkDirtyRelUnpinnedBuffers
+ *      (中文)尝试把指定关系的所有共享缓冲标脏(仅测试/开发用途)
+ *
+ * 【作用】遍历全池,对"有效且属于给定关系、未被 pin"的缓冲尝试
+ * 置脏(内部走 MarkDirtyUnpinnedBufferInternal)。三个输出参数必填:
+ * 本次成功置脏数、原本已脏数、其他原因跳过数。持锁复查归属后操作。
  */
 void
 MarkDirtyRelUnpinnedBuffers(Relation rel,
@@ -8277,6 +10173,13 @@ MarkDirtyRelUnpinnedBuffers(Relation rel,
  * See MarkDirtyRelUnpinnedBuffers() above for details about the buffers_*
  * parameters.
  */
+/*
+ * MarkDirtyAllUnpinnedBuffers
+ *      (中文)尝试把所有共享缓冲标脏(仅测试/开发用途,见 MarkDirtyUnpinnedBuffer)
+ *
+ * 【作用】遍历全部共享缓冲,对"有效且未被 pin"的逐个尝试置脏。
+ * 统计语义同 MarkDirtyRelUnpinnedBuffers。
+ */
 void
 MarkDirtyAllUnpinnedBuffers(int32 *buffers_dirtied,
 							int32 *buffers_already_dirty,
@@ -8325,6 +10228,18 @@ MarkDirtyAllUnpinnedBuffers(int32 *buffers_dirtied,
  * in this backend could lead to this backend's buffer pin being released as
  * part of error handling, which in turn could lead to the buffer being
  * replaced while IO is ongoing.
+ */
+/*
+ * buffer_stage_common
+ *      (中文)readv/writev 类 AIO 句柄"暂存(stage)"回调的通用实现
+ *
+ * 【作用】每次 readv/writev 可能命中多个缓冲(已登记在 IO 句柄的
+ * handle data 里)。让 I/O 就绪(stage)前,须确保目标缓冲在 I/O
+ * 进行期间处于合适状态:AIO 子系统要持有自己的缓冲 pin——否则本
+ * 后端出错时,本端 pin 会随错误处理被释放,缓冲可能在 I/O 期间被
+ * 换页替换。逐个缓冲:取 AIO 专用 pin、检查连续性与标签(最后一道
+ * 缓冲感知代码,超常多疑地校验)、把 I/O 等待引用登记到缓冲
+ * (io_wref,供别人异步加入)。
  */
 static pg_always_inline void
 buffer_stage_common(PgAioHandle *ioh, bool is_write, bool is_temp)
@@ -8433,6 +10348,15 @@ buffer_stage_common(PgAioHandle *ioh, bool is_write, bool is_temp)
 /*
  * Decode readv errors as encoded by buffer_readv_encode_error().
  */
+/*
+ * buffer_readv_decode_error
+ *      (中文)解码 buffer_readv_encode_error 编码的 readv 错误数据
+ *
+ * 【作用】把打包在 result->error_data 里的错误信息逐位解出:是否有页
+ * 被清零(zeroed_any)、是否有校验失败被忽略(ignored_any)、清零或
+ * 出错页数、校验失败页数、以及首个出错/清零(或首个被忽略校验)页
+ * 的偏移。与 buffer_readv_encode_error 成对,位布局见其注释。
+ */
 static inline void
 buffer_readv_decode_error(PgAioResult result,
 						  bool *zeroed_any,
@@ -8474,6 +10398,16 @@ buffer_readv_decode_error(PgAioResult result,
  * - next READV_COUNT_BITS bits indicate the first offset of the first page
  *   that was errored or zeroed or, if no errors/zeroes, the first ignored
  *   checksum
+ */
+/*
+ * buffer_readv_encode_error
+ *      (中文)为 buffer_readv_complete 编码错误信息(打包进 error_data)
+ *
+ * 【作用】把 readv 结果里的错误情况压缩进 PgAioResult.error_data
+ * (位布局见上方英文注释:bit0 清零、bit1 忽略校验、随后三段 7 位
+ * 计数、最后是首个相关页的偏移)。只留空间编码一个偏移——恰好够用:
+ * 有错时错误页最有价值,其次清零页,最后才是被忽略校验的页。
+ * 由静态断言保证位宽足够(PG_IOV_MAX 与 PGAIO_RESULT_ERROR_BITS)。
  */
 static inline void
 buffer_readv_encode_error(PgAioResult *result,
@@ -8569,6 +10503,18 @@ buffer_readv_encode_error(PgAioResult *result,
 /*
  * Helper for AIO readv completion callbacks, supporting both shared and temp
  * buffers. Gets called once for each buffer in a multi-page read.
+ */
+/*
+ * buffer_readv_complete_one
+ *      (中文)多页 read 完成回调中逐缓冲处理的辅助(共享/临时通用)
+ *
+ * 【作用】对一次多页读中的单个缓冲做收尾:页校验(PageIsVerified,
+ * 只写 server log——完成回调可能在任意后端/IO worker 里执行,错误
+ * 报告统一在 buffer_readv_report 里发);校验失败时按 flags 清零
+ * (zeroed)或把缓冲作废(failed);最后 TerminateLocalBufferIO /
+ * TerminateBufferIO 结束 I/O 并置 BM_VALID(或 BM_IO_ERROR),并打
+ * BUFFER_READ_DONE tracepoint。注意完成回调不一定在发起读的后端
+ * 执行,缓冲可能已被本端标记为不可访问(校验前 VALGRIND 恢复可读)。
  */
 static pg_always_inline void
 buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
@@ -8721,6 +10667,17 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
  *
  * Shared between shared and local buffers, to reduce code duplication.
  */
+/*
+ * buffer_readv_complete
+ *      (中文)完成处理单个 AIO 读(可能覆盖多块/多缓冲,共享/临时通用)
+ *
+ * 【作用】遍历本次 I/O 涉及的所有缓冲,逐个调用 buffer_readv_complete_one
+ * 收尾。底层 I/O 整体失败时每块都标记失败;部分读取则只有前几块
+ * 完好。累计各类错误计数并记录首个出错/清零/被忽略校验的偏移,
+ * 若 smgr 读本身成功但页校验失败,把情况编码进结果并上报
+ * (DEBUG1);临时表再按库汇总上报校验失败数(共享表在
+ * shared_buffer_readv_complete_local 里报)。
+ */
 static pg_always_inline PgAioResult
 buffer_readv_complete(PgAioHandle *ioh, PgAioResult prior_result,
 					  uint8 cb_data, bool is_temp)
@@ -8824,6 +10781,16 @@ buffer_readv_complete(PgAioHandle *ioh, PgAioResult prior_result,
  * The error is encoded / decoded in buffer_readv_encode_error() /
  * buffer_readv_decode_error().
  */
+/*
+ * buffer_readv_report
+ *      (中文)AIO readv 的错误上报回调(aio_shared/local_buffer_readv_cb 共用)
+ *
+ * 【作用】把编码过的 readv 错误信息解码后生成面向用户的报告。先
+ * 解码,再处理"既有清零页又有被忽略校验"的特殊组合(太不规则,
+ * 单独报一条错误);其余情况拼装可复用的翻译格式串:单页/多页
+ * 分别报告,含首个问题块号、范围与 server log 指引。elevel 由
+ * 调用方决定(LOG 或 DEBUG1)。
+ */
 static void
 buffer_readv_report(PgAioResult result, const PgAioTargetData *td,
 					int elevel)
@@ -8919,12 +10886,18 @@ buffer_readv_report(PgAioResult result, const PgAioTargetData *td,
 			affected_count > 1 ? errhint_internal(hint_mult, affected_count - 1) : 0);
 }
 
+/*
+ * (中文)共享缓冲 readv 的暂存(stage)回调:通用实现,读、非临时表
+ */
 static void
 shared_buffer_readv_stage(PgAioHandle *ioh, uint8 cb_data)
 {
 	buffer_stage_common(ioh, false, false);
 }
 
+/*
+ * (中文)共享缓冲 readv 的完成回调(可在任意后端执行):读、非临时表
+ */
 static PgAioResult
 shared_buffer_readv_complete(PgAioHandle *ioh, PgAioResult prior_result,
 							 uint8 cb_data)
@@ -8938,6 +10911,15 @@ shared_buffer_readv_complete(PgAioHandle *ioh, PgAioResult prior_result,
  * happen if the reporting backend has previously called
  * pgstat_prepare_report_checksum_failure(), which we can only guarantee in
  * the backend that started the IO. Hence this callback.
+ */
+/*
+ * shared_buffer_readv_complete_local
+ *      (中文)共享缓冲 readv 的后端本地完成回调(专门上报校验失败)
+ *
+ * 【作用】共享缓冲的校验失败统计必须由发起 I/O 的后端上报(只有
+ * 它调用过 pgstat_prepare_report_checksum_failure)。故只在该后端
+ * 执行的 complete_local 里解码结果:若有校验失败,按库汇总上报
+ * pgstat_report_checksum_failures_in_db。
  */
 static PgAioResult
 shared_buffer_readv_complete_local(PgAioHandle *ioh, PgAioResult prior_result,
@@ -8970,12 +10952,22 @@ shared_buffer_readv_complete_local(PgAioHandle *ioh, PgAioResult prior_result,
 	return prior_result;
 }
 
+/*
+ * (中文)本地(临时表)缓冲 readv 的暂存回调:通用实现,读、临时表
+ */
 static void
 local_buffer_readv_stage(PgAioHandle *ioh, uint8 cb_data)
 {
 	buffer_stage_common(ioh, false, true);
 }
 
+/*
+ * (中文)本地(临时表)缓冲 readv 的完成回调:读、临时表
+ *
+ * 注意:必须走 complete_local 而非 complete_shared,因为只有发起
+ * I/O 的后端能访问本地缓冲所需的数据结构(完成可能被别的后端
+ * 意外消费,这点很重要)。
+ */
 static PgAioResult
 local_buffer_readv_complete(PgAioHandle *ioh, PgAioResult prior_result,
 							uint8 cb_data)
@@ -8984,6 +10976,16 @@ local_buffer_readv_complete(PgAioHandle *ioh, PgAioResult prior_result,
 }
 
 /* readv callback is passed READ_BUFFERS_* flags as callback data */
+/*
+ * aio_shared_buffer_readv_cb
+ *      (中文)共享缓冲向量读(StartReadBuffers)的 AIO 句柄回调集
+ *
+ * 【作用】注册读共享缓冲用到的回调:stage 走通用实现
+ * (buffer_stage_common,读、非临时);complete_shared 走通用完成
+ * (任意后端可执行);complete_local 只报校验失败统计(见
+ * shared_buffer_readv_complete_local);report 统一由
+ * buffer_readv_report 生成面向用户的错误报告。
+ */
 const PgAioHandleCallbacks aio_shared_buffer_readv_cb = {
 	.stage = shared_buffer_readv_stage,
 	.complete_shared = shared_buffer_readv_complete,
@@ -8993,6 +10995,15 @@ const PgAioHandleCallbacks aio_shared_buffer_readv_cb = {
 };
 
 /* readv callback is passed READ_BUFFERS_* flags as callback data */
+/*
+ * aio_local_buffer_readv_cb
+ *      (中文)本地(临时表)缓冲向量读的 AIO 句柄回调集
+ *
+ * 【作用】与 aio_shared_buffer_readv_cb 类似,但完成回调只有
+ * complete_local(local_buffer_readv_complete)——本地缓冲只允许
+ * 发起 I/O 的后端访问其数据结构,且 I/O 完成可能被别的后端
+ * 意外消费,必须限定在本后端执行。
+ */
 const PgAioHandleCallbacks aio_local_buffer_readv_cb = {
 	.stage = local_buffer_readv_stage,
 

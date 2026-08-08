@@ -3,6 +3,41 @@
  * bufpage.c
  *	  POSTGRES standard buffer page code.
  *
+ * 【模块总览(中文)】
+ * 本文件实现 PostgreSQL 标准的"磁盘页(Page)"结构操作,是存储系统最
+ * 底层的页格式代码。堆表(heap)、各类索引(btree/hash/gist 等)以及
+ * 空闲空间映射(FSM)都复用同一套页布局与操作。
+ *
+ * 页布局(相关宏与字段定义见 src/include/storage/bufpage.h):
+ * - 页头 PageHeaderData:含 pd_lsn(最近 WAL 记录位点)、pd_checksum、
+ *   pd_flags(提示位与状态位)、pd_lower(行指针数组上界)、pd_upper
+ *   (项数据区下界)、pd_special(特殊空间起点)、pd_pagesize_version、
+ *   pd_prune_xid(可见性修剪相关的 xid);
+ * - 行指针数组(ItemIdData,pd_linp):从页头之后(pd_lower)向上增长,
+ *   每个行指针描述一项数据(偏移 lp_off、长度 lp_len、状态标志
+ *   lp_flags),是访问页内数据的"索引项";
+ * - 项数据区:位于 pd_upper 与 pd_special 之间,由 pd_upper 向页头
+ *   方向增长,实际存放元组/索引项的数据;
+ * - 特殊空间(special space):页尾,供索引 AM(如 btree 的页尾元数据)
+ *   自由使用,pd_special 标记其起点。
+ *
+ * 本文件主要职责:
+ * 1) 页的初始化(PageInit)与读盘后的完整性校验(PageIsVerified);
+ * 2) 项的插入(PageAddItemExtended)、删除(PageIndexTupleDelete 系列)、
+ *    覆盖(PageIndexTupleOverwrite);
+ * 3) 碎片整理与压缩(PageRepairFragmentation、compactify_tuples、
+ *    PageTruncateLinePointerArray);
+ * 4) 空闲空间查询(PageGetFreeSpace 系列;注意堆表有 MaxHeapTuplesPerPage
+ *    行指针上限的特殊约束,见 PageGetHeapFreeSpace);
+ * 5) 临时页的创建与回写(PageGetTempPage 系列,供"在内存中改造一页后
+ *    整页写回"的算法使用,如 btree 页分裂);
+ * 6) 写盘前计算页校验和(PageSetChecksum),与 checksum.c 配合。
+ *
+ * 与相邻模块的关系:本文件不涉及缓冲池管理与加锁(调用者负责持有合适
+ * 的缓冲锁);不直接写 WAL(调用者在修改页后自行记录);提示位(hint
+ * bits)与可见性修剪(pruning)相关的页级操作通过 pd_flags / pd_prune_xid
+ * 完成,相关宏同样在 bufpage.h。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -23,7 +58,10 @@
 #include "utils/memutils.h"
 
 
-/* GUC variable */
+/* GUC 变量:ignore_checksum_failure(与 data_checksums 配套使用)。
+ * 为 true 时,页校验和不匹配不再视为致命错误:读到的页仍会被接受,只
+ * 记录告警(见 PageIsVerified 的 PIV_IGNORE_CHECKSUM_FAILURE 标志)。
+ * 这是仅供紧急抢救数据用的危险开关,默认 false。 */
 bool		ignore_checksum_failure = false;
 
 
@@ -33,6 +71,30 @@ bool		ignore_checksum_failure = false;
  */
 
 /*
+ * PageInit
+ *      (中文)初始化一个空页(页头 + 空行指针数组 + 空项区)
+ *
+ * 【作用】把一片 pageSize 大小的内存初始化为可用的空页:整页清零,行
+ * 指针数组下界 pd_lower 指向页头之后(即"零个行指针"),项数据上界
+ * pd_upper 与特殊空间起点 pd_special 都指向页尾扣除 specialSize 的
+ * 位置,页大小与布局版本号写入页头。凡是从零创建一页的地方都会调用它:
+ * 新建文件页、FSM 页、索引页、临时页等。
+ *
+ * 【设计思想】
+ * - 整页 MemSet 清零是刻意为之:使"未初始化字段"必然为零,而零值恰好
+ *   是各字段的安全默认(pd_prune_xid = InvalidTransactionId、行指针均为
+ *   未使用、pd_flags = 0 等),同时 PageIsNew(整页全零判定)对新页成立;
+ * - 故意不在这里计算校验和:内存中的页会被频繁修改,写盘时由
+ *   PageSetChecksum 统一计算,避免校验和反复失效;
+ * - specialSize 按 MAXALIGN 对齐,保证特殊空间与项数据区的边界满足
+ *   平台对齐要求,也保证 pd_special 本身对齐(多处代码依赖该不变量)。
+ *
+ * 【参数】
+ *   page        —— 目标内存(通常是缓冲池中的一块 BLCKSZ 内存);
+ *   pageSize    —— 页大小(当前必须等于 BLCKSZ);
+ *   specialSize —— 页尾特殊空间的大小(索引 AM 用;堆页为 0)。
+ * 【返回值】无。
+ *
  * PageInit
  *		Initializes the contents of a page.
  *		Note that we don't calculate an initial checksum here; that's not done
@@ -61,6 +123,38 @@ PageInit(Page page, Size pageSize, Size specialSize)
 
 
 /*
+ * PageIsVerified
+ *      (中文)校验页头与校验和(页读入后的第一道完整性检查)
+ *
+ * 【作用】页从磁盘读入缓冲池时调用,以低代价检测"烂页":验证页头字段
+ * 是否自洽(行指针数组上下界、特殊空间边界、标志位合法性),并在启用
+ * data_checksums 时核验 CRC32C 校验和。目的是在"拿着错误行指针或错误
+ * xid 继续操作、造成连锁破坏"之前拦住损坏页。
+ *
+ * 【设计思想】
+ * 1. 全零页必须放行:虽然"故意扩展关系"的路径不会调用本函数,但存在
+ *    扩展后崩溃、WAL 未落盘的场景——内核已把零页留在文件中,重启后
+ *    零页就在那里。因此这里允许全零页通过,并约定各页访问宏把全零页
+ *    视为"空页、无空闲空间",由后续 VACUUM 清理;若把零页当损坏,恢复
+ *    后数据库可能连启动都困难;
+ * 2. 校验和只对"非新页"计算,且计算期间 HOLD_INTERRUPTS,防止中断处理
+ *    修改页内容造成误报(页内容在 I/O 期间不再被改,但保持防御性习惯);
+ * 3. "页头自洽"与"校验和正确"是两套独立证据:页头自洽只是允许进缓冲池
+ *    的门槛,后续使用仍可能暴露问题——这正是启用校验和的意义;
+ * 4. flags 控制失败时的行为:PIV_LOG_WARNING/PIV_LOG_LOG 决定记录级别,
+ *   PIV_IGNORE_CHECKSUM_FAILURE 允许校验失败但仍接受页(配合 GUC
+ *   ignore_checksum_failure,供紧急恢复),PIV_ZERO_BUFFERS_ON_ERROR
+ *   通知调用方出错缓冲区将被清零(防止带病页被写回);
+ * 5. 输出参数 checksum_failure_p 让调用方在"整体判定通过"时也能统计
+ *   校验失败次数(IGNORE 模式下函数可返回 true 但校验实际失败)。
+ *
+ * 【参数】
+ *   page               —— 待检查的页;
+ *   blkno              —— 该页的块号(参与校验和计算);
+ *   flags              —— PIV_* 标志(见 bufpage.h,记录日志/忽略失败等);
+ *   checksum_failure_p —— 输出参数(可空):是否发生了校验和不匹配。
+ * 【返回值】页可安全放入缓冲池返回 true,否则返回 false。
+ *
  * PageIsVerified
  *		Check that the page header and checksum (if any) appear valid.
  *
@@ -173,6 +267,39 @@ PageIsVerified(PageData *page, BlockNumber blkno, int flags, bool *checksum_fail
 
 
 /*
+ * PageAddItemExtended
+ *      (中文)向页中添加一个数据项(通用插入函数,PageAddItem 的底层实现)
+ *
+ * 【作用】把 item 指向的 size 字节数据作为新项插入页中:选定一个行指针
+ * 槽位(显式指定或自动查找空闲槽)、在项数据区从 pd_upper 处向下分配
+ * 空间、写入行指针并更新页头边界。堆表与所有索引 AM 的"插入一行"最终
+ * 都汇聚到这里。
+ *
+ * 【设计思想】
+ * - offsetNumber 的语义分三种:InvalidOffsetNumber 表示"自动找第一个
+ *   空闲行指针";指定槽 + PAI_OVERWRITE 表示覆盖写入指定槽(必须当前
+ *   未使用,供索引 AM 原地重用行指针);指定槽但无 OVERWRITE 表示在数组
+ *   中间插入、把后续行指针后移一位(needshuffle);
+ * - 自动找槽时总是从数组头部扫起、优先最早的空闲槽:因为
+ *   PageTruncateLinePointerArray 只能截掉"数组尾部连续的空闲行指针",
+ *   若新项总往尾部放,行指针数组就永远缩不回去;
+ * - PAI_IS_HEAP 强制行指针总数不超过 MaxHeapTuplesPerPage(堆表硬上限,
+ *   见 PageGetHeapFreeSpace 的说明);
+ * - 所有失败路径只发 WARNING 并返回 InvalidOffsetNumber,绝不抛 ERROR:
+ *   空间不足等失败对调用者(插入路径)是可预期的,应当换页重试而不是
+ *   中断事务;只有真正不可能的内部错误才允许 elog(见 !!! 注释);
+ * - 计算新 lower/upper 用带符号 int,防止 alignedSize 大于 pd_upper 时
+ *   无符号回绕导致"空间够"的误判。
+ *
+ * 【参数】
+ *   page         —— 目标页;
+ *   item         —— 要插入的数据;
+ *   size         —— 数据长度;
+ *   offsetNumber —— 指定行指针槽位(1 基)或 InvalidOffsetNumber;
+ *   flags        —— PAI_OVERWRITE(覆盖指定槽)/ PAI_IS_HEAP(堆表约束)。
+ * 【返回值】插入位置的行号(offsetNumber);失败返回 InvalidOffsetNumber。
+ * 注意:页被修改后是否标脏、是否写 WAL 由调用者负责。
+ *
  *	PageAddItemExtended
  *
  *	Add an item to a page.  Return value is the offset at which it was
@@ -367,6 +494,22 @@ PageAddItemExtended(Page page,
 
 /*
  * PageGetTempPage
+ *      (中文)申请一块"临时页"内存(内容未初始化)
+ *
+ * 【作用】按给定页的页大小在内存中分配一块页内存,供"离线改造一页"
+ * 的算法使用。返回的页内容未定义,调用者必须自行初始化(通常接着调用
+ * PageInit 或整页复制)。
+ *
+ * 【设计思想】某些操作(如 btree 页分裂、堆 HOT 链处理)不便在原页上
+ * 就地修改——尤其是需要同时看到"改造前、改造后两版"时。经典做法:
+ * 先用本函数(或 Copy / CopySpecial 变体)建一份内存副本,在副本上改,
+ * 最后用 PageRestoreTempPage 整页拷回并释放临时页。注意页大小可能
+ * 不是标准 BLCKSZ(特殊构造的页),因此用 PageGetPageSize 读取。
+ *
+ * 【参数】page —— 参考页(只取它的页大小)。
+ * 【返回值】palloc 分配的内存页;内容未初始化。
+ *
+ * PageGetTempPage
  *		Get a temporary page in local memory for special processing.
  *		The returned page is not initialized at all; caller must do that.
  */
@@ -383,6 +526,16 @@ PageGetTempPage(const PageData *page)
 }
 
 /*
+ * PageGetTempPageCopy
+ *      (中文)创建给定页的内存副本(内容逐字节相同)
+ *
+ * 【作用】分配一块与给定页同大小的内存并完整拷贝其内容,得到一份
+ * "改造用的工作副本"。与 PageGetTempPage 的区别仅在于初始化方式:
+ * 前者留给调用者初始化,本函数直接复制原页。
+ *
+ * 【参数】page —— 被复制的源页。
+ * 【返回值】内容与源页一致的内存副本。
+ *
  * PageGetTempPageCopy
  *		Get a temporary page in local memory for special processing.
  *		The page is initialized by copying the contents of the given page.
@@ -402,6 +555,21 @@ PageGetTempPageCopy(const PageData *page)
 }
 
 /*
+ * PageGetTempPageCopySpecial
+ *      (中文)创建给定页的"特殊空间副本"
+ *
+ * 【作用】分配临时页:先用与源页相同的特殊空间大小 PageInit 成空页,
+ * 再把源页特殊空间的内容整段拷贝过来,得到"结构与特殊空间完整、但行
+ * 指针与数据区全空"的页。
+ *
+ * 【设计思想】某些索引 AM(如 btree)的页尾特殊空间保存本页的布局元
+ * 信息(如右兄弟指针、页级空闲汇总等),复制页时这些元信息必须保留,
+ * 而行指针/项数据通常要重建。本函数正好提供"保留特殊空间、清空主体"
+ * 的模板页,比 PageGetTempPageCopy 省去"先拷全部、再删主体"的冗余。
+ *
+ * 【参数】page —— 源页。
+ * 【返回值】初始化完成的临时页。
+ *
  * PageGetTempPageCopySpecial
  *		Get a temporary page in local memory for special processing.
  *		The page is PageInit'd with the same special-space size as the
@@ -426,6 +594,23 @@ PageGetTempPageCopySpecial(const PageData *page)
 
 /*
  * PageRestoreTempPage
+ *      (中文)把临时页拷回原页并释放临时页
+ *
+ * 【作用】PageGetTempPage 系列函数的收尾:把改造完成的 tempPage 的
+ * 全部内容拷回 oldPage(目标缓冲区的页),然后 pfree 释放临时页。
+ *
+ * 【设计思想】"临时页工作流"的完整闭环:GetTempPage(建副本)→ 修改
+ * → RestoreTempPage(提交回原页)。调用者应已持有原页缓冲区的排他锁,
+ * 拷贝完成后整页内容一次性可见、WAL 与脏标记由调用者处理。页大小以
+ * tempPage 为准,保证与拷贝源一致(拷贝方向固定,避免调用者传错顺序
+ * 造成越界)。
+ *
+ * 【参数】
+ *   tempPage —— 临时页(被拷贝且随后释放);
+ *   oldPage  —— 目标页(内容被覆盖)。
+ * 【返回值】无。
+ *
+ * PageRestoreTempPage
  *		Copy temporary page back to permanent page after special processing
  *		and release the temporary page.
  */
@@ -441,7 +626,20 @@ PageRestoreTempPage(Page tempPage, Page oldPage)
 }
 
 /*
- * Tuple defrag support for PageRepairFragmentation and PageIndexMultiDelete
+ * itemIdCompactData
+ *      (中文)碎片整理的工作记录结构(供 PageRepairFragmentation /
+ *      PageIndexMultiDelete / compactify_tuples 使用)
+ *
+ * 【作用】把"页上需要保留的项"的摘要信息压缩成定长记录数组:每项一条,
+ * 描述其行指针在数组中的下标(offsetindex)、项数据在页内的起始偏移
+ * (itemoff)和对齐后的长度(alignedlen)。整理时只操作这个轻量数组,
+ * 最后统一搬运数据。
+ *
+ * 【设计思想】页整理需要"重新排列"页内所有项:先扫描行指针数组收集
+ * 存活项,再按新布局搬移数据。为避免搬移过程中反复解析行指针(取偏移、
+ * 取长度、反复对齐),先压缩成定长记录;alignedlen 预先存 MAXALIGN 后
+ * 的长度,使搬移与目标位置计算无需重复对齐。itemoff 同时被用于
+ * "是否已有序(presorted)"的判定与搬移源地址计算。
  */
 typedef struct itemIdCompactData
 {
@@ -452,6 +650,43 @@ typedef struct itemIdCompactData
 typedef itemIdCompactData *itemIdCompact;
 
 /*
+ * compactify_tuples
+ *      (中文)把存活元组向页尾搬移,消除被删项留下的空洞(碎片整理核心)
+ *
+ * 【作用】在删除/标记若干项之后,按 itemidbase 数组(由调用者构造,只
+ * 含存活项)把元组数据搬到页尾,并按"行号小的项更靠页尾"的规范重新排列,
+ * 最后更新 pd_upper。这是 PageRepairFragmentation 与 PageIndexMultiDelete
+ * 共同的核心,也是页面上最热门的代码路径之一(频繁更新的大表每次修剪
+ * 都会走到)。
+ *
+ * 【设计思想】
+ * 1. presorted 快速路径(itemidbase 已按 itemoff 降序——元组首次插入
+ *    页时的天然顺序,更新型负载下也很常见):
+ *    - 先用 memmove 只搬"需要搬的"部分:跳过页尾已经位于正确位置的
+ *      连续元组,对剩余部分只在出现空洞(相邻元组之间有间隙)时做一次
+ *      合并 memmove,memmove 调用次数降到最少;
+ *    - 之所以可以放心 memmove:按 itemoff 降序处理,目标区(upper 之上)
+ *      永远不与未搬的源区重叠。
+ * 2. 非 presorted 路径(乱序):直接 memmove 可能覆盖尚未搬走的元组,
+ *    必须先把要搬的元组复制进临时缓冲(PGAlignedBlock 栈上缓冲,8KB),
+ *    再从缓冲按目标顺序 memcpy 回页:
+ *    - 存活项很少(< 最大行号/4,即 75% 以上被删)时逐项拷入临时缓冲
+ *      (此时页尾大概率没有可跳过的元组);
+ *    - 否则只把"需要移动的那段"(phdr->pd_upper 到当前 upper 之间)
+ *      一次性 memcpy 进临时缓冲。
+ * 3. 无论哪个分支,搬完后元组都恢复成规范排列,下一次整理大概率命中
+ *    presorted 快速路径——这个"自愈有序"的效果对频繁更新的表很重要;
+ * 4. 行指针(ItemId)只改 lp_off 指向新位置,数组本身不动——数组的收缩
+ *    由调用者另行处理(PageRepairFragmentation 截断、PageIndexMultiDelete
+ *    用新数组覆盖)。
+ *
+ * 【参数】
+ *   itemidbase —— 存活项摘要数组;
+ *   nitems     —— 存活项个数(调用者必须保证 > 0);
+ *   page       —— 目标页;
+ *   presorted  —— 数组是否已按 itemoff 降序。
+ * 【返回值】无(更新页内 pd_upper 与各 lp_off)。
+ *
  * After removing or marking some line pointers unused, move the tuples to
  * remove the gaps caused by the removed items and reorder them back into
  * reverse line pointer order in the page.
@@ -690,6 +925,30 @@ compactify_tuples(itemIdCompact itemidbase, int nitems, Page page, bool presorte
 
 /*
  * PageRepairFragmentation
+ *      (中文)整理堆页碎片:把项压缩到页尾并截断行指针数组(修剪之后)
+ *
+ * 【作用】在堆页的可见性修剪(pruning)删除一批死元组(尤其是 HOT 链
+ * 中多个死元组)之后调用:把存活元组压缩到页尾消除空洞,并截掉行指针
+ * 数组尾部的连续未使用项,把空间归还给后续插入。
+ *
+ * 【设计思想】
+ * - 只适用于堆页(索引页用 PageIndexMultiDelete);调用者必须持有页缓冲
+ *   的 cleanup lock——本函数允许在持该锁期间清除 LP_DEAD 等位;
+ * - 因为要重新摆布(通常是共享缓冲池中的)页内数据,这里比别处更偏执
+ *   地校验页头与每个行指针(偏移/长度/对齐),防止损坏指针把破坏扩散
+ *   到相邻缓冲区;
+ * - 扫描时顺带完成三件事:统计未使用行指针数、记录"最后一个被使用的
+ *   行指针"(finalusedlp,决定数组截断点)、判断项是否天然有序
+ *   (presorted,决定 compactify_tuples 是否走快速路径);
+ * - 截断后调整 pd_lower,并把 PD_HAS_FREE_LINES 提示位设置/清除:
+ *   PageAddItemExtended 依赖该位跳过"扫描找空闲行指针"的昂贵步骤;
+ * - 页完全为空时直接重置 pd_upper = pd_special,免去搬移。
+ *
+ * 【参数】page —— 目标堆页。
+ * 【返回值】无。副作用:pd_upper、pd_lower、提示位变化;调用者需要
+ * 处理"行指针数组变短"带来的影响(如 HOT 链根指针编号)。
+ *
+ * PageRepairFragmentation
  *
  * Frees fragmented space on a heap page following pruning.
  *
@@ -823,6 +1082,27 @@ PageRepairFragmentation(Page page)
 
 /*
  * PageTruncateLinePointerArray
+ *      (中文)仅截断行指针数组尾部的连续未使用项(VACUUM 第二趟专用)
+ *
+ * 【作用】VACUUM 第二趟扫描堆时调用:从数组尾部向前扫描,把连续的
+ * LP_UNUSED 行指针从数组中删掉(pd_lower 下移),回收行指针占用的空间;
+ * 若截断后数组前端仍残留未使用行指针,则设置 PD_HAS_FREE_LINES 提示位。
+ *
+ * 【设计思想】
+ * - 与 PageRepairFragmentation 不同:本函数不搬移任何元组数据,只删
+ *   行指针,因此调用者只需排他锁或 cleanup lock(不需要最高级锁);
+ *   预期页上至少有一个刚被 VACUUM 置为 LP_UNUSED 的项,否则不应调用;
+ * - 特意避免把行指针数组截到 0 个(必要时留下 1 个 LP_UNUSED):防止
+ *   留下 PageIsEmpty() 的页——PageIsEmpty 是许多代码"页为空"的判据,
+ *   空行指针数组会让"是否为空"的判断产生歧义;
+ * - 扫描逻辑分两段:先(尾部)计数可截断的连续未使用项,遇到第一个
+ *   使用中的项后停止计数,但继续向前找"前端是否还有未使用项",据此
+ *   决定提示位的设置。
+ *
+ * 【参数】page —— 目标堆页。
+ * 【返回值】无。
+ *
+ * PageTruncateLinePointerArray
  *
  * Removes unused line pointers at the end of the line pointer array.
  *
@@ -906,6 +1186,21 @@ PageTruncateLinePointerArray(Page page)
 
 /*
  * PageGetFreeSpace
+ *      (中文)返回页上可分配的空闲空间(已扣除一个新行指针的占用)
+ *
+ * 【作用】计算"还能容纳多少字节的新数据":pd_upper - pd_lower 再减去
+ * 一个 ItemIdData 的大小——放新项必然还要新增一个行指针。通常用于
+ * 索引页(堆页请用 PageGetHeapFreeSpace,它额外检查行指针上限)。
+ *
+ * 【设计思想】用带符号算术,使"页已满甚至 lower > upper(损坏/未初始
+ * 化)"时得到负值并归一化为 0,而不是无符号回绕出巨大数值;减去的行
+ * 指针大小正是 PageAddItemExtended 插入新项时的真实消耗,因此返回值
+ * 与"能否成功插入一个 size 字节项"的判定严格一致。
+ *
+ * 【参数】page —— 目标页。
+ * 【返回值】可分配字节数(不含行指针空间)。
+ *
+ * PageGetFreeSpace
  *		Returns the size of the free (allocatable) space on a page,
  *		reduced by the space needed for a new line pointer.
  *
@@ -932,6 +1227,22 @@ PageGetFreeSpace(const PageData *page)
 }
 
 /*
+ * PageGetFreeSpaceForMultipleTuples
+ *      (中文)返回页上可分配的空闲空间(已扣除 ntups 个新行指针的占用)
+ *
+ * 【作用】PageGetFreeSpace 的批量版本:计算"一次性插入 ntups 个新项
+ * 时总共还能容纳多少字节的数据",即 pd_upper - pd_lower 再减去
+ * ntups 个 ItemIdData 的大小。索引 AM 预分配一批槽位(如 btree 批量
+ * 分裂)时用它判断批量插入是否可行。
+ *
+ * 【设计思想】与 PageGetFreeSpace 相同的带符号算术与"不足则 0"策略,
+ * 只是把行指针的占用按数量放大;调用方需保证 ntups >= 0。
+ *
+ * 【参数】
+ *   page  —— 目标页;
+ *   ntups —— 计划新增的行指针数量。
+ * 【返回值】可分配字节数(不含行指针空间)。
+ *
  * PageGetFreeSpaceForMultipleTuples
  *		Returns the size of the free (allocatable) space on a page,
  *		reduced by the space needed for multiple new line pointers.
@@ -960,6 +1271,20 @@ PageGetFreeSpaceForMultipleTuples(const PageData *page, int ntups)
 
 /*
  * PageGetExactFreeSpace
+ *      (中文)返回页上"原始"的空闲字节数(不考虑行指针)
+ *
+ * 【作用】直接返回 pd_upper - pd_lower 这一真实空白区间的大小,不
+ * 扣除新增行指针的消耗。用于需要精确知道页上空隙的场景(如索引 AM
+ * 判断现有空隙是否足够容纳一整块数据、评估压缩收益等)。
+ *
+ * 【设计思想】与 PageGetFreeSpace 的关系:后者是"实际可用的"、本函数
+ * 是"几何上的"。负值(页已满或异常)同样归一化为 0,保证调用方拿到的
+ * 一定是合法字节数。
+ *
+ * 【参数】page —— 目标页。
+ * 【返回值】空闲字节数(>= 0)。
+ *
+ * PageGetExactFreeSpace
  *		Returns the size of the free (allocatable) space on a page,
  *		without any consideration for adding/removing line pointers.
  */
@@ -983,6 +1308,27 @@ PageGetExactFreeSpace(const PageData *page)
 
 
 /*
+ * PageGetHeapFreeSpace
+ *      (中文)堆页专用空闲空间查询(额外强制 MaxHeapTuplesPerPage 行指针上限)
+ *
+ * 【作用】与 PageGetFreeSpace 同语义,但增加一条规则:若页上已有
+ * MaxHeapTuplesPerPage 个行指针且没有空闲的,则返回 0——即使物理空间
+ * 还够。这保证堆页的行指针数量永远不会突破该硬上限。
+ *
+ * 【设计思想】为什么需要这道额外检查:理论上页里放不下超过上限的元组,
+ * 但在存在 LP_REDIRECT(重定向)或 LP_DEAD 行指针时,行指针数可能超过
+ * 元组数;而大量代码假定 MaxHeapTuplesPerPage 是行指针数的绝对上限
+ * (例如 PageRepairFragmentation 用固定大小数组 itemidbase 收集存活
+ * 项)。因此这里宁可"报告空间不足",也绝不放行超限的行指针。
+ *
+ * 实现细节:"是否还有空闲行指针"用 PD_HAS_FREE_LINES 提示位判断,但
+ * 该位可能过期:提示位为真时实地扫描确认;发现提示位失真时也只能保守
+ * 返回 0——本函数不持锁、无权把页标脏,不能就地修正提示位。提示位为
+ * 假时同样返回 0(PageAddItem 会相信该位,这里必须保持一致)。
+ *
+ * 【参数】page —— 目标堆页。
+ * 【返回值】可分配字节数(受行指针上限约束)。
+ *
  * PageGetHeapFreeSpace
  *		Returns the size of the free (allocatable) space on a page,
  *		reduced by the space needed for a new line pointer.
@@ -1051,6 +1397,32 @@ PageGetHeapFreeSpace(const PageData *page)
 
 
 /*
+ * PageIndexTupleDelete
+ *      (中文)从索引页删除一个元组(行指针与数据一起压缩掉)
+ *
+ * 【作用】删除索引页中 offnum 指定的元组:把行指针数组从该位置起整体
+ * 前移一位(被删项的行指针被移除)、把被删元组"之后"的数据向前搬 size
+ * 字节补齐空洞,最后更新 pd_lower / pd_upper,并修正所有受影响行指针
+ * 的偏移。
+ *
+ * 【设计思想】
+ * - 与堆页不同,索引页删除时"彻底移除行指针"而不是置 LP_UNUSED:
+ *   索引不需要保持 TID 不变(需要时用 PageIndexTupleDeleteNoCompact),
+ *   压缩掉行指针能及时回收空间;
+ * - 两个 memmove 各司其职、互不重叠:一个把行指针数组后段前移一格,
+ *   另一个把"被删元组与页头之间的数据"(即元组数据区前段)向页头方向
+ *   搬 size 字节。若被删元组恰好就是数据区第一项,后者跳过;
+ * - 搬移后,所有"起始偏移 <= 被删元组偏移"的行指针都要加上 size,
+ *   重新指向正确的数据(注意循环从 1 基行号开始,保证索引项本身也
+ *   被修正或已消失);
+ * - 入口处像 PageRepairFragmentation 一样做"偏执式"的页头/行指针
+ *   校验,防止损坏页造成更大破坏。
+ *
+ * 【参数】
+ *   page   —— 索引页;
+ *   offnum —— 要删除的元组行号(1 基,须在 1..页内最大行号之间)。
+ * 【返回值】无。
+ *
  * PageIndexTupleDelete
  *
  * This routine does the work of removing a tuple from an index page.
@@ -1159,6 +1531,31 @@ PageIndexTupleDelete(Page page, OffsetNumber offnum)
 
 
 /*
+ * PageIndexMultiDelete
+ *      (中文)从索引页一次性删除多个元组
+ *
+ * 【作用】按 itemnos 数组(必须升序!)删除页上多个元组,把剩余元组
+ * 一次性"重排 + 压缩"完成,比循环调用 PageIndexTupleDelete 快得多
+ * (b-tree 的 page cleanup 使用)。
+ *
+ * 【设计思想】
+ * - 数量少(<= 2)时退回 PageIndexTupleDelete 循环(反向删除,避免行号
+ *   漂移),不为小删除付出构建摘要数组的开销;
+ * - 主路径分两遍:第一遍只读不改,把"要保留的元组"收集进 itemidbase
+ *   摘要数组与全新的行指针数组 newitemids,同时完成全部合法性检查
+ *   (行指针越界、itemnos 乱序/越界都会在此暴露);第二遍才真正动手:
+ *   整段 memcpy 回行指针数组(自然消去被删项),再用 compactify_tuples
+ *   压缩数据。这种"先验证、后提交"的两遍法保证检查失败时页保持原样,
+ *   不会留下半改的脏状态;
+ * - 一次性 memcpy + 一次压缩,总代价与元组数成正比,而逐个删除每次
+ *   都要搬移后面全部数据,是 O(n^2) 的差别。
+ *
+ * 【参数】
+ *   page    —— 索引页;
+ *   itemnos —— 待删行号数组(必须按升序,调用者保证);
+ *   nitems  —— 数组长度。
+ * 【返回值】无。
+ *
  * PageIndexMultiDelete
  *
  * This routine handles the case of deleting multiple tuples from an
@@ -1292,6 +1689,25 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 
 /*
  * PageIndexTupleDeleteNoCompact
+ *      (中文)删除索引元组但不压缩行指针(仅置 LP_UNUSED)
+ *
+ * 【作用】删除 offnum 指定的索引元组:数据区照常搬移回收,但行指针
+ * 只在"它是数组最后一个"时才被删掉,否则只是标记为未使用,保留其在
+ * 数组中的位置。
+ *
+ * 【设计思想】这是为"要求存活元组的 TID 永不变化"的索引 AM 准备的
+ * (如某些允许 LP_DEAD 位存在的 AM):若删除时压缩行指针,后面所有项
+ * 的行号都会变,可能破坏以 TID 为键的引用(如逻辑复制、索引扫描中的
+ * 定位)。代价是未使用行指针可能累积,需靠后续整理回收;注意保留的
+ * 行指针 lp_off 仍会被修正(数据已被搬走)。倒数第二个及以前的行指针
+ * 即使本来已未使用,也不顺手压缩——刻意保持简单。
+ *
+ * 【参数】
+ *   page   —— 索引页;
+ *   offnum —— 要删除的元组行号。
+ * 【返回值】无。
+ *
+ * PageIndexTupleDeleteNoCompact
  *
  * Remove the specified tuple from an index page, but set its line pointer
  * to "unused" instead of compacting it out, except that it can be removed
@@ -1393,6 +1809,33 @@ PageIndexTupleDeleteNoCompact(Page page, OffsetNumber offnum)
 
 
 /*
+ * PageIndexTupleOverwrite
+ *      (中文)原地替换索引页上的一个元组
+ *
+ * 【作用】用新元组 newtup 替换 offnum 处的旧元组:空间不够时返回 false,
+ * 否则把旧元组"前面"的数据整体搬移(新元组更大则向前推、更小则向后
+ * 让),把新元组写到旧元组的位置,同步更新行指针与 pd_upper。
+ *
+ * 【设计思想】
+ * - 相比"先删后插",本函数:① 元组对齐尺寸不变时零搬移;② 即使尺寸
+ *   变了也不动行指针数组——适合不希望触碰 LP_DEAD 位、或在乎元组
+ *   物理顺序的索引 AM(如 BRIN 依赖无存储行指针的元数据);
+ * - 搬移方向是"旧元组起点之前的整段数据"(页头与旧元组之间),size_diff
+ *   定义为"旧对齐尺寸 - 新对齐尺寸",于是 pd_upper 与受影响行指针的
+ *   修正统一为"加 size_diff",代码简洁;
+ * - 行指针的 lp_off 更新为 offset + size_diff,lp_len 直接写新的未
+ *   对齐长度 newsize,而 lp_flags 保持不变(这正是"不动 LP_DEAD"的
+ *   诉求);
+ * - 空间不足返回 false 而非报错,由调用者决定换页或抛错;其余异常
+ *   (页损坏等)直接 ERROR。
+ *
+ * 【参数】
+ *   page    —— 索引页;
+ *   offnum  —— 被替换元组的行号;
+ *   newtup  —— 新元组数据;
+ *   newsize —— 新元组长度。
+ * 【返回值】替换成功返回 true;空间不足返回 false;页损坏直接 ERROR。
+ *
  * PageIndexTupleOverwrite
  *
  * Replace a specified tuple on an index page.
@@ -1502,6 +1945,28 @@ PageIndexTupleOverwrite(Page page, OffsetNumber offnum,
 
 
 /*
+ * PageSetChecksum
+ *      (中文)为写盘前的页计算并写入校验和
+ *
+ * 【作用】页落盘前调用:若启用了 data_checksums 且页不是全零新页,
+ * 计算 CRC32C 校验和并写入页头 pd_checksum 字段(读盘时由
+ * PageIsVerified 用同一算法核验)。
+ *
+ * 【设计思想】
+ * - 全零页(PageIsNew)不需要校验和:读盘路径对全零页本就跳过校验
+ *   (见 PageIsVerified),写入端保持一致,避免对"还没初始化内容的页"
+ *   算出一个可能误导的校验和;
+ * - 历史上这里要求在页副本上计算,因为提示位(hint bits)可能被并发
+ *   修改;如今 I/O 进行期间提示位不再被设置(数据一致性协议保证),因此
+ *   可以放心就地计算;
+ * - HOLD_INTERRUPTS 防止计算期间被中断打断,写出半算好的值。
+ *
+ * 【参数】
+ *   page —— 要写入的页(若位于共享缓冲池,调用者需持有至少 SHARE 级
+ *           缓冲锁,通常持有排他锁);
+ *   blkno —— 块号(参与校验和计算)。
+ * 【返回值】无。
+ *
  * Set checksum on a page.
  *
  * If the page is in shared buffers, it needs to be locked in at least

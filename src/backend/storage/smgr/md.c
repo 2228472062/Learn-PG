@@ -10,6 +10,40 @@
  * It doesn't matter whether the bits are on spinning rust or some other
  * storage technology.
  *
+ * 【模块总览(中文)】
+ * 本文件实现 PostgreSQL 的"磁介质"存储管理器(md,magnetic disk),
+ * 是 smgr 抽象层(见 smgr.c)在 Unix 文件系统上的落地:它把 smgr 的
+ * 文件级操作翻译成 open/read/write/truncate/fsync/unlink 等系统调用,
+ * 因此对任何提供文件系统的设备(传统磁盘、SSD、NFS 等)都适用。
+ *
+ * 核心设计:关系按"段"(segment)切分存储。老式文件系统单文件上限
+ * (常见 2GB)可能小于一个大关系,因此 md 把每个关系切成多个段文件,
+ * 每段至多 RELSEG_SIZE 个块(默认 131072 块 = 1GB,由 configure 的
+ * --with-segsize 决定,见 pg_config.h)。磁盘上表现为:
+ *   - 若干个恰好 RELSEG_SIZE 块的"满段" + 一个 0 <= 大小 < RELSEG_SIZE
+ *     的"部分段"(二者合称"活动段") + 任意个大小为 0 的"非活动段"
+ *     (mdtruncate() 截断后残留、等待时机处理/复用的空文件)。
+ * 段文件命名:关系基础路径后追加 ".段号"(段 0 无后缀)。
+ *
+ * 本文件为每个关系的每个 fork 维护"已打开段"的数组(md_seg_fds,
+ * 元素为 MdfdVec),统一分配在 MdCxt 内存上下文中。打开是惰性的:
+ * mdopen 只做登记,真正的文件打开发生在首次读写访问时
+ * (_mdfd_getseg/_mdfd_openseg);关闭从数组末尾往前推进,便于内存
+ * 管理。文件都通过 fd.c 的 VFD(虚拟文件描述符)打开,受 fd.c 的统一
+ * 限额与关闭管理。
+ *
+ * 同步(sync)路径:写页时若非 skipFsync 且非临时关系,通过
+ * register_dirty_segment() 把"段文件"登记到 sync 请求队列,由
+ * checkpointer(或后端自己)在检查点统一 fsync;被删关系留下的"空首
+ * 段"(tombstone)的延迟删除(SYNC_UNLINK_REQUEST)也走同一队列。
+ * 检查点/恢复期间按 FileTag 直接操作文件的回调为
+ * mdsyncfiletag()/mdunlinkfiletag()/mdfiletagmatches()。
+ *
+ * 与上层的一致性:文件级"锁"语义由访问方法/锁管理器与 relcache 的
+ * 失效机制保证(例如 mdclose 配合 CacheInvalidateSmgr 让所有后端尽快
+ * 放弃对已删段的引用),md 自身只负责单进程内 fd 数组的一致性与
+ * O_EXCL 等内核原语提供的创建互斥。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -72,6 +106,10 @@
  * having a cross-check for this since configure's --with-segsize options
  * could let people select insane values.
  */
+/* 编译期断言:RELSEG_SIZE 必须能放进带符号 int。
+ * RELSEG_SIZE 定义时必须适合 BlockNumber,但既然它以整型 GUC 对外暴露
+ * (configure 的 --with-segsize 可能选出离谱的值),必须保证其不超过
+ * INT_MAX,否则 GUC 解析与相关算术都会出错。 */
 StaticAssertDecl(RELSEG_SIZE > 0 && RELSEG_SIZE <= INT_MAX,
 				 "RELSEG_SIZE must fit in an integer");
 
@@ -88,6 +126,15 @@ StaticAssertDecl(RELSEG_SIZE > 0 && RELSEG_SIZE <= INT_MAX,
  *
  * The entire MdfdVec array is palloc'd in the MdCxt memory context.
  */
+/* 单个段文件的描述结构(MdfdVec,"磁介质文件描述向量"):
+ * - mdfd_vfd  : 该段文件在 fd.c 虚拟文件描述符池中的句柄(File);
+ * - mdfd_segno: 段号(从 0 开始,即该段在关系中的序号)。
+ * 每个关系 fork 维护一个 MdfdVec 数组(reln->md_seg_fds[forknum]),数组
+ * 长度记录在 reln->md_num_open_segs[forknum] 中。注意:数组长度并不
+ * 等于"关系的总段数"——我们可能还没打开后面的段(其他后端也可能并发
+ * 扩展了关系);同时数组中不含非活动段:一旦发现"部分段"(未满段),
+ * 就认为其后所有段都是非活动的。整个数组用一次 palloc 分配在 MdCxt
+ * 上下文里,由 _fdvec_resize() 调整大小。 */
 
 typedef struct _MdfdVec
 {
@@ -95,10 +142,18 @@ typedef struct _MdfdVec
 	BlockNumber mdfd_segno;		/* segment number, from 0 */
 } MdfdVec;
 
+/* 所有 MdfdVec 数组的专用内存上下文(由 mdinit() 在进程启动时创建,
+ * 挂在 TopMemoryContext 之下)。单独建一个上下文,便于统计与整块回收,
+ * 避免与调用方的内存上下文纠缠。 */
 static MemoryContext MdCxt;		/* context for all MdfdVec objects */
 
 
-/* Populate a file tag describing an md.c segment file. */
+/* 初始化一个 FileTag(文件标签),用于描述 md.c 的一个段文件,作为
+ * sync 请求队列(sync.c)的键:
+ * - handler 置为 SYNC_HANDLER_MD,表示由 md 的回调(mdsyncfiletag /
+ *   mdunlinkfiletag)处理;
+ * - 记录关系 locator、fork 与段号,唯一对应一个物理文件。
+ * 先 memset 清零,保证未用字段一致。 */
 #define INIT_MD_FILETAG(a,xx_rlocator,xx_forknum,xx_segno) \
 ( \
 	memset(&(a), 0, sizeof(FileTag)), \
@@ -110,6 +165,21 @@ static MemoryContext MdCxt;		/* context for all MdfdVec objects */
 
 
 /*** behavior for mdopen & _mdfd_getseg ***/
+/* mdopen/_mdfd_getseg 的"段不存在时怎么办"行为标志(可按位或组合):
+ * - EXTENSION_FAIL            : 段不存在则直接 ereport(ERROR);
+ * - EXTENSION_RETURN_NULL     : 段不存在(或被删)则返回 NULL;配合
+ *                               FILE_POSSIBLY_DELETED(errno) 判定
+ *                               "文件可能已被删除"这一特殊情形;
+ * - EXTENSION_CREATE          : 允许按需创建新段(仅 mdextend/
+ *                               mdzeroextend 等扩展路径使用);
+ * - EXTENSION_CREATE_RECOVERY  : 恢复(recovery)期间允许创建缺失的段
+ *                               (重放可能写入一个后来被删的关系的
+ *                               高号段);
+ * - EXTENSION_DONT_OPEN       : 若目标段尚未打开,直接返回 NULL,绝不
+ *                               去打开文件(用于 mdwriteback:避免与
+ *                               PROCSIGNAL_BARRIER_SMGRRELEASE 竞态,
+ *                               不给自己留下一个即将被 unlink 文件的
+ *                               描述符)。 */
 /* ereport if segment not present */
 #define EXTENSION_FAIL				(1 << 0)
 /* return NULL if segment not present */
@@ -129,6 +199,11 @@ static MemoryContext MdCxt;		/* context for all MdfdVec objects */
  * The maximum number of segments is MaxBlockNumber / RELSEG_SIZE, where
  * RELSEG_SIZE can be set to 1 (for testing only).
  */
+/* 段号最多 SEGMENT_CHARS 个字符(与 OID 同宽,即无符号 32 位十进制
+ * 最大 10 位);据此算出"关系路径 + '.' + 段号"的最大长度
+ * MD_PATH_STR_MAXLEN,得到定长字符串类型 MdPathStr。用定长栈缓冲区
+ * 而非 palloc,保证在临界区(如 mdtruncate 承诺不分配内存)或高频
+ * 路径上也能安全使用。 */
 #define SEGMENT_CHARS	OIDCHARS
 #define MD_PATH_STR_MAXLEN \
 	(\
@@ -136,6 +211,9 @@ static MemoryContext MdCxt;		/* context for all MdfdVec objects */
 		+ sizeof((char)'.') \
 		+ SEGMENT_CHARS \
 	)
+/* 定长路径字符串(MdPathStr):存放 md.c 需要构造的段文件路径(基础
+ * relpath 最长 REL_PATH_STR_MAXLEN,加上 '.' 与段号)。用数组而非指针,
+ * 便于栈上分配与整块按值传递。 */
 typedef struct MdPathStr
 {
 	char		str[MD_PATH_STR_MAXLEN + 1];
@@ -166,12 +244,26 @@ static BlockNumber _mdnblocks(SMgrRelation reln, ForkNumber forknum,
 static PgAioResult md_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data);
 static void md_readv_report(PgAioResult result, const PgAioTargetData *td, int elevel);
 
+/* md 异步读(mdstartreadv)的 AIO 回调表:
+ * - complete_shared : IO 完成时调用,把"字节数"换算成"块数"并判定
+ *                     成功/部分/失败(md_readv_complete);
+ * - report          : 出错时生成并输出错误消息(md_readv_report)。 */
 const PgAioHandleCallbacks aio_md_readv_cb = {
 	.complete_shared = md_readv_complete,
 	.report = md_readv_report,
 };
 
 
+/*
+ * _mdfd_open_flags (中文)返回 md 打开文件使用的标准 open 标志
+ *
+ * 【作用】md 管理的文件一律以"读写 + 二进制"(O_RDWR | PG_BINARY)打开;
+ * 若启用了数据直接 I/O(io_direct_flags 含 IO_DIRECT_DATA),再附加
+ * PG_O_DIRECT。集中定义,避免各调用点重复书写或彼此不一致。
+ *
+ * 【参数】无。
+ * 【返回值】int 型 open 标志位。
+ */
 static inline int
 _mdfd_open_flags(void)
 {
@@ -184,6 +276,15 @@ _mdfd_open_flags(void)
 }
 
 /*
+ * mdinit (中文)初始化磁介质存储管理器的进程本地状态
+ *
+ * 【作用】由 smgrinit()(经 smgrsw[0].smgr_init)在每次后端启动时调用,
+ * 创建 MdCxt 内存上下文——之后所有 MdfdVec 段描述数组都在此分配。
+ * 除内存上下文外,md 没有其他进程内共享状态。
+ *
+ * 【参数】无。
+ * 【返回值】无。
+ *
  * mdinit() -- Initialize private state for magnetic disk storage manager.
  */
 void
@@ -195,6 +296,18 @@ mdinit(void)
 }
 
 /*
+ * mdexists (中文)判断某个 fork 的物理文件是否存在
+ *
+ * 【作用】分两步:先 mdclose() 关闭该 fork 已打开的文件(恢复期间跳过
+ * ——恢复里删除关系时本来就会关闭),确保能"看到"文件已被删除的事实;
+ * 再用 mdopenfork(EXTENSION_RETURN_NULL) 尝试打开首段,能打开即有
+ * 文件。注意:对"已标记删除、还没真正删掉"的残留文件,本函数返回
+ * true。
+ *
+ * 【参数】
+ *   reln —— 目标关系;forknum —— fork 编号。
+ * 【返回值】首段文件存在返回 true。
+ *
  * mdexists() -- Does the physical file exist?
  *
  * Note: this will return true for lingering files, with pending deletions
@@ -214,6 +327,23 @@ mdexists(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
+ * mdcreate (中文)在磁盘上创建一个新关系的物理文件(指定 fork)
+ *
+ * 【作用】用 O_CREAT|O_EXCL 原子创建(保证不覆盖已存在文件;重放时若
+ * 文件已存在,退回普通打开方式——isRedo 下"已存在"是正常现象)。首次
+ * 使用某个表空间/数据库时,顺带创建其 per-database 子目录
+ * (TablespaceCreateDbspace,一个有意为之的层次越界,见注释)。创建成功
+ * 后:登记首段 MdfdVec;若非临时关系,register_dirty_segment() 把新
+ * 文件登记给检查点 fsync。
+ *
+ * 【设计思想】O_EXCL 是这里的"并发互斥":两个后端不可能同时创建成功
+ * 同一个文件,把"文件锁"的职责交给内核原子性,md 自己无需加锁。
+ *
+ * 【参数】
+ *   reln —— 目标关系;forknum —— 要创建的 fork;
+ *   isRedo —— 是否处于重放(重放时允许文件已存在)。
+ * 【返回值】无(失败报 ERROR)。
+ *
  * mdcreate() -- Create a new relation on magnetic disk.
  *
  * If isRedo is true, it's okay for the relation to exist already.
@@ -273,6 +403,22 @@ mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 }
 
 /*
+ * mdunlink (中文)删除一个关系的物理文件(可按 fork 或全部)
+ *
+ * 【作用】真正删除关系的入口(经 smgrsw 由 smgrdounlinkall 调用)。
+ * 参数 forknum 为具体编号则只删该 fork;为 InvalidForkNumber 则删除
+ * 全部 fork。具体工作委托给 mdunlinkfork(),要点见那里。
+ *
+ * 【背景】本函数运行时通常已不在事务中(提交/回滚后的清理),因此任何
+ * 失败都只能 WARNING 不能 ERROR。
+ *
+ * 【参数】
+ *   rlocator —— 关系定位(注意:调用时 SMgrRelation 哈希表条目可能
+ *               已不存在,故只传 locator);
+ *   forknum  —— 要删除的 fork,或 InvalidForkNumber(全部);
+ *   isRedo   —— 重放模式:文件已消失不足为奇,且应立刻删、不能延迟。
+ * 【返回值】无。
+ *
  * mdunlink() -- Unlink a relation.
  *
  * Note that we're passed a RelFileLocatorBackend --- by the time this is called,
@@ -347,6 +493,16 @@ mdunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 }
 
 /*
+ * do_truncate (中文)把文件截断为 0 字节(尽力而为,失败仅告警)
+ *
+ * 【作用】mdunlinkfork 里用来"先截断、后删除"文件:截断为 0 后,其他
+ * 后端仍握着的打开描述符将不再占用磁盘空间,从而立即回收空间。
+ * ENOENT(文件本就不存在)不算错误;其余失败打 WARNING 后返回错误码,
+ * 并保留 errno 供调用方判断。
+ *
+ * 【参数】path —— 文件路径。
+ * 【返回值】0 成功;-1 失败(错误原因在 errno,且已打告警)。
+ *
  * Truncate a file to release disk space.
  */
 static int
@@ -370,6 +526,28 @@ do_truncate(const char *path)
 	return ret;
 }
 
+/*
+ * mdunlinkfork (中文)删除一个关系 fork 的全部物理文件
+ *
+ * 【作用】按 mdunlink() 注释中的策略执行:对主 fork 且"非重放 / 非
+ * 二进制升级 / 非临时关系",只把首段截断为 0 并登记"下个检查点后
+ * 删除"(register_unlink_tombstone)——留下一个空文件占住
+ * relfilenumber,防止该编号在下次检查点前被复用(详见 mdunlink 的英文
+ * 注释:避免崩溃后内容丢失);其余情况(重放、二进制升级、临时关系、
+ * 非主 fork)直接"截断 + 立即 unlink"。无论哪种情况,删除前都先
+ * register_forget_request() 撤销该文件尚未执行的同步请求。之后从段 1
+ * 起循环删除所有附加段(含非活动段):每段同样"先截断释放空间,再
+ * unlink",遇到 ENOENT 即停(预期中的"最后一个段之后")。
+ *
+ * 【设计思想】"截断再删"与"留空文件"的组合,精确解决了三个问题:
+ * 别的后端持有的 fd 占住磁盘空间、relfilenumber 的复用安全、崩溃恢复
+ * 时的文件一致性。
+ *
+ * 【参数】
+ *   rlocator —— 关系定位;forknum —— fork;
+ *   isRedo   —— 见 mdunlink()。
+ * 【返回值】无(失败打 WARNING 后继续)。
+ */
 static void
 mdunlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
@@ -475,6 +653,25 @@ mdunlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 }
 
 /*
+ * mdextend (中文)向关系文件末尾追加一个数据块
+ *
+ * 【作用】把 buffer 的一页(BLCKSZ 字节)写到 blocknum 处(blocknum 应
+ * >= 当前 EOF,即"扩展")。细节:
+ * - 块号 2^32-1(InvalidBlockNumber)是非法扩展目标,直接报错(上游
+ *   bufmgr 本应有检查,这里只是兜底);
+ * - _mdfd_getseg(EXTENSION_CREATE) 定位/创建块所在段;
+ * - 段内偏移 = BLCKSZ * (blocknum % RELSEG_SIZE),用 FileWrite 写;
+ * - 写满整块后,若非 skipFsync 且非临时关系,登记段为"待检查点 fsync"
+ *   (register_dirty_segment)。
+ *
+ * 【设计思想】写越过 EOF 时,操作系统会以零填充中间空洞——本函数依赖
+ * 这一点保证"中间空间读出为 0"的扩展语义。
+ *
+ * 【参数】
+ *   reln, forknum, blocknum —— 目标关系、fork 与新块块号;
+ *   buffer —— 待写页;skipFsync —— 跳过检查点登记。
+ * 【返回值】无(失败报 ERROR,如磁盘满)。
+ *
  * mdextend() -- Add a block to the specified relation.
  *
  * The semantics are nearly the same as mdwrite(): write at the
@@ -543,6 +740,25 @@ mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 }
 
 /*
+ * mdzeroextend (中文)一次向关系文件追加 nblocks 个清零块
+ *
+ * 【作用】mdextend() 的多块版,循环按段切块处理:每段内计算本次可扩展
+ * 的块数(不越过段边界);若块数 > 8 且配置允许,用 FileFallocate()
+ * (posix_fallocate)扩展——通常比逐块 write 高效得多,且不会为扩展
+ * 部分占用内核页缓存;否则用 FileZero()(基于 pg_pwritev 的整段写零)
+ * 一次写出,避免逐块系统调用。每次扩展后登记"待检查点 fsync"(非
+ * skipFsync 且非临时时)。
+ *
+ * 【设计思想】把"分配大段零页"从"逐块 write"里解放出来,是批量加载
+ * 与预热路径提速的关键;小于等于 8 块的扩展仍走写零路径,因为过小的
+ * fallocate 会干扰某些文件系统的延迟分配(延迟分配对空间利用率有利)。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;
+ *   blocknum —— 起始块号;nblocks —— 扩展块数(> 0);
+ *   skipFsync —— 见 mdextend()。
+ * 【返回值】无。
+ *
  * mdzeroextend() -- Add new zeroed out blocks to the specified relation.
  *
  * Similar to mdextend(), except the relation can be extended by multiple
@@ -662,6 +878,20 @@ mdzeroextend(SMgrRelation reln, ForkNumber forknum,
 }
 
 /*
+ * mdopenfork (中文)打开一个关系的指定 fork(只打开首段)
+ *
+ * 【作用】为 fork 打开首段文件(注意:多段关系也只在首次访问时打开
+ * 首段,其余段由 _mdfd_getseg 惰性打开),并把首段登记进
+ * md_seg_fds[forknum][0]。若首段缺失:按 behavior 决定是报错
+ * (EXTENSION_FAIL/EXTENSION_CREATE)还是返回 NULL(EXTENSION_RETURN_NULL,
+ * 且错误码属于"文件可能被删"时才返回 NULL)。已打开时直接返回现有
+ * 首段,不做任何事。
+ *
+ * 【参数】
+ *   reln —— 目标关系;forknum —— fork;
+ *   behavior —— EXTENSION_* 位组合(见宏定义处)。
+ * 【返回值】首段的 MdfdVec 指针;或 NULL(仅当 behavior 允许)。
+ *
  * mdopenfork() -- Open one fork of the specified relation.
  *
  * Note we only open the first segment, when there are multiple segments.
@@ -707,6 +937,14 @@ mdopenfork(SMgrRelation reln, ForkNumber forknum, int behavior)
 }
 
 /*
+ * mdopen (中文)初始化"新打开"的关系(所有 fork 标记为未打开)
+ *
+ * 【作用】smgr_open 的 md 实现:把各 fork 的 md_num_open_segs 清零,
+ * 表示"尚未打开任何段"。真正的文件打开推迟到首次访问(惰性打开)。
+ *
+ * 【参数】reln —— 目标关系。
+ * 【返回值】无。
+ *
  * mdopen() -- Initialize newly-opened relation.
  */
 void
@@ -718,6 +956,16 @@ mdopen(SMgrRelation reln)
 }
 
 /*
+ * mdclose (中文)关闭指定 fork 已打开的全部段文件
+ *
+ * 【作用】从数组末尾向前逐个 FileClose() 并收缩数组(_fdvec_resize),
+ * 直至全部关闭。从后往前关闭使数组收缩始终发生在"尾部",与数组增长
+ * 方向一致,内存管理最省事。已关闭时直接返回。
+ *
+ * 【参数】
+ *   reln —— 目标关系;forknum —— fork。
+ * 【返回值】无。
+ *
  * mdclose() -- Close the specified relation, if it isn't closed already.
  */
 void
@@ -741,6 +989,21 @@ mdclose(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
+ * mdprefetch (中文)对指定块区间发起预读(异步,尽力而为)
+ *
+ * 【作用】对 [blocknum, blocknum+nblocks) 逐段调用 FilePrefetch(),让
+ * 内核提前把数据载入页缓存,后续正式读页时命中。仅当构建支持
+ * (USE_PREFETCH)时有效,否则直接返回 true。直接 I/O 模式下断言不可用。
+ *
+ * 【返回值语义】范围超出 MaxBlockNumber+1 时返回 false;恢复期间目标
+ * 段可能已被删除(EXTENSION_RETURN_NULL 返回 NULL)也返回 false——
+ * 调用方应把 false 理解为"预读无意义/不可能",而非错误。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;
+ *   blocknum —— 起始块;nblocks —— 块数。
+ * 【返回值】是否成功发起(范围合法且文件存在)。
+ *
  * mdprefetch() -- Initiate asynchronous read of the specified blocks of a relation
  */
 bool
@@ -785,6 +1048,19 @@ mdprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 }
 
 /*
+ * buffers_to_iovec (中文)把缓冲地址数组折叠成 iovec 数组
+ *
+ * 【作用】mdreadv/mdwritev 的前置处理:检查 nblocks 个缓冲在内存中
+ * 是否彼此连续,把相邻的合并成同一个 iovec 项(整块连续时 iovcnt==1,
+ * 内核可直接当作一次普通非向量 IO 处理),返回实际使用的 iovec 数。
+ * 同时为直接 I/O 构建做对齐断言。
+ *
+ * 【参数】
+ *   iov     —— 输出数组,必须能容纳至多 nblocks 项;
+ *   buffers —— 输入缓冲指针数组(每项 BLCKSZ 字节);
+ *   nblocks —— 块数(>= 1)。
+ * 【返回值】生成的 iovec 项数(1 ~ nblocks)。
+ *
  * Convert an array of buffer address into an array of iovec objects, and
  * return the number that were required.  'iov' must have enough space for up
  * to 'nblocks' elements, but the number used may be less depending on
@@ -837,6 +1113,17 @@ buffers_to_iovec(struct iovec *iov, void **buffers, int nblocks)
 }
 
 /*
+ * mdmaxcombine (中文)返回从 blocknum 起最多能合并进一次 IO 的块数
+ *
+ * 【作用】md 的合并上限只受段边界限制:一次 IO 不能跨段(段是独立
+ * 文件)。因此返回"到本段末尾还有多少块"
+ * = RELSEG_SIZE - (blocknum % RELSEG_SIZE),含 blocknum 本身。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork(此处未实际使用);
+ *   blocknum —— 起始块号。
+ * 【返回值】可合并块数。
+ *
  * mdmaxcombine() -- Return the maximum number of total blocks that can be
  *				 combined with an IO starting at blocknum.
  */
@@ -852,6 +1139,25 @@ mdmaxcombine(SMgrRelation reln, ForkNumber forknum,
 }
 
 /*
+ * mdreadv (中文)从关系同步读取连续块到给定缓冲
+ *
+ * 【作用】把 [blocknum, blocknum+nblocks) 读入 buffers 数组。按段切分
+ * 循环处理(单次读不跨越段边界);每段内先 buffers_to_iovec 合并连续
+ * 内存,再用 FileReadV 读取;内部循环处理短读(继续读到 EOF,而非假定
+ * "短读即文件尾")。命中 EOF 或读到不完整的末块:
+ * - 若 zero_damaged_pages 或 InRecovery:把不足部分清零后继续(注意
+ *   断言 Assert(false):作者认为该路径在恢复下本不可达、计划移除,
+ *   详见英文注释);
+ * - 否则报 ERRCODE_DATA_CORRUPTED。
+ *
+ * 【设计思想】"以块为单位的接口,字节细节藏在实现里":上层永远看到
+ * 整块语义;短读在 md 层循环补齐,尽量不让调用方感知。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;
+ *   blocknum —— 起始块;buffers —— 输出缓冲数组;nblocks —— 块数。
+ * 【返回值】无(失败报 ERROR)。
+ *
  * mdreadv() -- Read the specified blocks from a relation.
  */
 void
@@ -990,6 +1296,21 @@ mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 }
 
 /*
+ * mdstartreadv (中文)mdreadv() 的异步版本(配合 AIO 框架)
+ *
+ * 【作用】发起异步读:定位段(段必须存在,与 mdreadv 相同的 behavior),
+ * 折叠 iovec,把 IO 目标设为 smgr(pgaio_io_set_target_smgr,便于 IO 在
+ * 其他进程执行时重开文件),注册 md_readv_cb 回调,最后 FileStartReadV()
+ * 提交 IO。数据到达后的错误检查在 md_readv_complete() 中完成。
+ *
+ * 【与同步版的差异】不实现 zero_damaged_pages 逻辑(该逻辑本身有争议、
+ * 计划移除,且异步下"定义者/完成者"的该 GUC 可能不一致,实现会更
+ * 复杂)。部分读与错误的最终处理由上层负责(见 smgrstartreadv 注释)。
+ *
+ * 【参数】
+ *   ioh —— AIO 句柄;其余与 mdreadv() 相同。
+ * 【返回值】无(发起失败报 ERROR)。
+ *
  * mdstartreadv() -- Asynchronous version of mdreadv().
  */
 void
@@ -1060,6 +1381,20 @@ mdstartreadv(PgAioHandle *ioh,
 }
 
 /*
+ * mdwritev (中文)把缓冲数组写到关系的指定位置(仅限已存在的块)
+ *
+ * 【作用】mdreadv 的写镜像:按段切分,iovec 合并连续缓冲,FileWriteV
+ * 循环处理短写(短写多为磁盘满,下次尝试会从内核拿到 ENOSPC)。整段
+ * 写完后,若非 skipFsync 且非临时关系,register_dirty_segment() 登记
+ * 检查点 fsync。CHECK_WRITE_VS_EXTEND 构建会断言写入范围不超过当前
+ * 大小(扩展必须走 mdextend)。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;
+ *   blocknum —— 起始块;buffers —— 待写缓冲数组;nblocks —— 块数;
+ *   skipFsync —— 跳过检查点 fsync 登记。
+ * 【返回值】无。
+ *
  * mdwritev() -- Write the supplied blocks at the appropriate location.
  *
  * This is to be used only for updating already-existing blocks of a
@@ -1166,6 +1501,19 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 
 /*
+ * mdwriteback (中文)通知内核把指定块区间写回磁盘
+ *
+ * 【作用】对 [blocknum, blocknum+nblocks) 调 FileWriteback()(异步回写,
+ * 不等待完成)。按段切分,尽量少发请求。使用 EXTENSION_DONT_OPEN:目标
+ * 段若尚未打开(说明最近没有写过它),直接忽略返回——正在写已删除关系
+ * 的缓冲也没关系,无需重新打开,以免与 PROCSIGNAL_BARRIER_SMGRRELEASE
+ * 竞态,拿到一个"即将被 unlink 的文件"的描述符。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;
+ *   blocknum —— 起始块;nblocks —— 块数。
+ * 【返回值】无。
+ *
  * mdwriteback() -- Tell the kernel to write pages back to storage.
  *
  * This accepts a range of blocks because flushing several pages at once is
@@ -1223,6 +1571,24 @@ mdwriteback(SMgrRelation reln, ForkNumber forknum,
 }
 
 /*
+ * mdnblocks (中文)计算关系某个 fork 的块数
+ *
+ * 【作用】先 mdopenfork 打开首段,再从"最后一个已打开的段"起向高段
+ * 推进:已打开段默认满(RELSEG_SIZE,此前验证过,避免重复 seek);每段
+ * 用 _mdnblocks 测大小,未满即停止,返回 segno*RELSEG_SIZE+nblocks;
+ * 满段则打开下一段继续(_mdfd_openseg,失败/不存在即返回当前累计大小)。
+ *
+ * 【重要副作用】调用后所有活动段都被打开并加入 md_seg_fds;若从未
+ * 调用过,数组里只有"实际访问到的那几个段"。
+ *
+ * 【一致性假设】"已打开段恰好满"的前提只在"其他后端截断了关系"时被
+ * 打破;上层通过 relcache 失效关闭并重开 md fd 处理该场景(checkpointer
+ * 不参与 relcache 失效,可能持有非活动段,但它从不需要计算关系大小)。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork。
+ * 【返回值】块数。
+ *
  * mdnblocks() -- Get the number of blocks stored in a relation.
  *
  * Important side effect: all active segments of the relation are opened
@@ -1285,6 +1651,28 @@ mdnblocks(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
+ * mdtruncate (中文)把关系截断到指定块数
+ *
+ * 【作用】从最后一个打开的段往前处理:
+ * - 段起始块号 >= 目标:整段作废——FileTruncate(0) 截成空文件但不
+ *   unlink(原因见文件头注释:别的后端/checkpointer 可能持有其 fd,且
+ *   截断后关系还可能再扩展回来复用此文件),登记 fsync,关闭 fd 并收缩
+ *   数组(首段除外,永不丢弃);
+ * - 段跨越目标边界:这是要保留的末段,截到目标大小(若目标恰好是
+ *   RELSEG_SIZE 的整数倍,会把"第 K+1 段"截成 0 长度但保留,以维持
+ *   "满段 + 一个部分段"的磁盘不变量);
+ * - 段完全在目标之前:无需处理,直接结束。
+ *
+ * 【约束】保证不分配内存(因此可安全用于临界区)!调用前提:调用方
+ * 先持锁调用 smgrnblocks 取得当前大小、期间不得使用该关系的 smgr
+ * 函数或处理中断(保证所有活动段都已打开、截断循环能见全)。
+ * nblocks > curnblk(荒唐请求):恢复期间静默忽略,否则 ERROR。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;
+ *   curnblk —— 当前大小;nblocks —— 目标大小。
+ * 【返回值】无。
+ *
  * mdtruncate() -- Truncate relation to specified number of blocks.
  *
  * Guaranteed not to allocate memory, so it can be used in a critical section.
@@ -1384,6 +1772,18 @@ mdtruncate(SMgrRelation reln, ForkNumber forknum,
 }
 
 /*
+ * mdregistersync (中文)把整个关系(含非活动段)登记为"检查点时需 fsync"
+ *
+ * 【作用】先 mdnblocks() 确保所有活动段已打开,再临时打开所有非活动
+ * 段(存在的话,它们是空文件),把每一段(活动 + 非活动)逐个
+ * register_dirty_segment() 登记;非活动段登记后立即关闭。必须连非活动
+ * 段一起登记的原因见 mdimmedsync 的注释(截断后被遗忘的段可能在崩溃
+ * 恢复后残留旧数据)。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork。
+ * 【返回值】无。
+ *
  * mdregistersync() -- Mark whole relation as needing fsync
  */
 void
@@ -1427,6 +1827,19 @@ mdregistersync(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
+ * mdimmedsync (中文)立即把关系(含非活动段)同步到稳定存储
+ *
+ * 【作用】对每一段(活动段 + 临时打开的非活动段)执行 FileSync(fsync),
+ * 非活动段同步后立即关闭。只同步"已经发出"的写;对缓冲池里尚未写回
+ * 的脏页一无所知(那是 FlushRelationBuffers 的职责)。同步请求处理
+ * 路径依赖"非活动段也被同步"这一性质:考虑一个跳过 WAL 的关系——
+ * 检查点同步了某段后,mdtruncate() 把它变成非活动段;若下次检查点前
+ * 崩溃,该段未被重新同步就会在恢复后存活,把不该有的旧数据带回表里。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork。
+ * 【返回值】无(失败按 data_sync_elevel 报错)。
+ *
  * mdimmedsync() -- Immediately sync a relation to stable storage.
  *
  * Note that only writes already issued are synced; this routine knows
@@ -1490,6 +1903,18 @@ mdimmedsync(SMgrRelation reln, ForkNumber forknum)
 	}
 }
 
+/*
+ * mdfd (中文)返回指定块所在段文件的原始内核文件描述符
+ *
+ * 【作用】供 AIO 框架在"其他进程执行 IO"的场景使用(smgr_aio_reopen
+ * 里调用):保证目标段已打开,计算出块在段内的字节偏移(写入 *off),
+ * 返回底层真实 fd(绕过 fd.c 的 VFD 抽象,因为跨进程不能共享 VFD)。
+ *
+ * 【参数】
+ *   reln, forknum, blocknum —— 目标关系、fork 与块号;
+ *   off —— 输出:块在段内的字节偏移。
+ * 【返回值】原始 fd(失败报 ERROR)。
+ */
 int
 mdfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 {
@@ -1506,6 +1931,19 @@ mdfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 }
 
 /*
+ * register_dirty_segment (中文)登记某段文件需要被 fsync(待检查点)
+ *
+ * 【作用】写页/建段/截断等修改文件的操作在"需要 fsync"时调用:
+ * 构造该段的 FileTag,通过 RegisterSyncRequest(SYNC_REQUEST) 投递到
+ * checkpointer 的请求队列,由它在下次检查点统一 fsync。若队列已满
+ * (retryOnError=false,返回 false):退化方案是"本进程立即自己 fsync"
+ * (记 DEBUG1),保证可靠性不因队列满而打折扣。临时关系绝不进入本函数
+ * (断言)。
+ *
+ * 【参数】
+ *   reln —— 目标关系;forknum —— fork;seg —— 段描述。
+ * 【返回值】无。
+ *
  * register_dirty_segment() -- Mark a relation segment as needing fsync
  *
  * If there is a local pending-ops table, just make an entry in it for
@@ -1556,6 +1994,16 @@ register_dirty_segment(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
 }
 
 /*
+ * register_unlink_tombstone (中文)登记"墓碑文件"在下次检查点后删除
+ *
+ * 【作用】mdunlink 留下的"空首段"(tombstone)不能马上删:要等下一个
+ * 检查点之后,确保所有后端都已放弃对旧 relfilenumber 的引用(机制
+ * 见 mdunlink 注释)。把任务以 SYNC_UNLINK_REQUEST 交给 checkpointer
+ * 处理。仅用于非临时关系的主 fork 首段(断言保证)。
+ *
+ * 【参数】rlocator —— 关系定位。
+ * 【返回值】无。
+ *
  * register_unlink_tombstone() -- Schedule a tombstone file to be deleted
  *
  * A tombstone file is an empty first segment of a relation that has already
@@ -1576,6 +2024,16 @@ register_unlink_tombstone(RelFileLocatorBackend rlocator)
 }
 
 /*
+ * register_forget_request (中文)撤销某段的待执行同步请求
+ *
+ * 【作用】文件即将被删除/失效前调用:把该段的 fsync 请求从检查点
+ * 队列中撤掉(SYNC_FORGET_REQUEST),避免对已删文件做无谓甚至出错的
+ * fsync。删除路径(如 mdunlinkfork)在真正 unlink 之前调用。
+ *
+ * 【参数】
+ *   rlocator —— 关系定位;forknum —— fork;segno —— 段号。
+ * 【返回值】无。
+ *
  * register_forget_request() -- forget any fsyncs for a relation fork's segment
  */
 static void
@@ -1590,6 +2048,15 @@ register_forget_request(RelFileLocatorBackend rlocator, ForkNumber forknum,
 }
 
 /*
+ * ForgetDatabaseSyncRequests (中文)撤销整个数据库的所有同步/删除请求
+ *
+ * 【作用】DROP DATABASE 时调用:以"数据库 OID 过滤"请求
+ * (SYNC_FILTER_REQUEST)把该库全部待执行 fsync/删除登记一次性撤销,
+ * 防止 checkpointer 继续处理已经消失的库的文件。
+ *
+ * 【参数】dbid —— 目标数据库 OID。
+ * 【返回值】无。
+ *
  * ForgetDatabaseSyncRequests -- forget any fsyncs and unlinks for a DB
  */
 void
@@ -1608,6 +2075,18 @@ ForgetDatabaseSyncRequests(Oid dbid)
 }
 
 /*
+ * DropRelationFiles (中文)批量删除一批关系的所有文件
+ *
+ * 【作用】删除关系文件的便捷入口(如 DROP TABLE 提交后的清理):对每个
+ * locator 打开 SMgrRelation(重放时先为每个 fork 发 XLogDropRelation
+ * 记录,让 WAL 重放时知道这些文件已删),再统一交给
+ * smgrdounlinkall() 执行删除,最后 smgrclose() 关闭并释放临时数组。
+ *
+ * 【参数】
+ *   delrels —— 待删关系 locator 数组;ndelrels —— 数量;
+ *   isRedo  —— 重放模式(允许文件已不存在)。
+ * 【返回值】无。
+ *
  * DropRelationFiles -- drop files of all given relations
  */
 void
@@ -1640,6 +2119,21 @@ DropRelationFiles(RelFileLocator *delrels, int ndelrels, bool isRedo)
 
 
 /*
+ * _fdvec_resize (中文)调整 fork 的已打开段数组大小
+ *
+ * 【作用】把 md_seg_fds[forknum] 数组(长度记录于 md_num_open_segs)
+ * 调整到 nseg 项,支持:清空(pfree 置 NULL)、首次分配(MdCxt 中
+ * palloc)、扩大(repalloc)。**绝不缩小**已扩大的数组,保证
+ * mdtruncate() "不分配内存"的承诺(它只减 md_num_open_segs,不动
+ * 内存),从而允许在临界区中使用。
+ *
+ * 【设计思想】扩大的 repalloc 不做摊销:它比 open/close 文件便宜得
+ * 多,不值得为摊销复杂化代码。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;nseg —— 新数组长度。
+ * 【返回值】无。
+ *
  * _fdvec_resize() -- Resize the fork's open segments array
  */
 static void
@@ -1687,6 +2181,15 @@ _fdvec_resize(SMgrRelation reln,
 }
 
 /*
+ * _mdfd_segpath (中文)构造指定段的文件路径
+ *
+ * 【作用】段 0 就是基础路径;段 n>0 为 "基础路径.段号"。返回定长
+ * MdPathStr(按值返回,整个结构拷贝,无指针泄漏问题)。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;segno —— 段号。
+ * 【返回值】段文件完整路径。
+ *
  * Return the filename for the specified segment of the relation. The
  * returned string is palloc'd.
  */
@@ -1707,6 +2210,18 @@ _mdfd_segpath(SMgrRelation reln, ForkNumber forknum, BlockNumber segno)
 }
 
 /*
+ * _mdfd_openseg (中文)打开指定段文件并登记段描述,失败返回 NULL
+ *
+ * 【作用】按 _mdfd_segpath 的路径打开文件(附带 oflags,如 O_CREAT),
+ * 成功则断言"总是按段号升序追加",_fdvec_resize(segno+1) 扩容后填入
+ * MdfdVec 并返回。打开失败(文件不存在等)返回 NULL 而不报错——由
+ * 调用方按自己的 behavior 决定如何处理。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;
+ *   segno —— 段号;oflags —— 附加 open 标志(可为 0 或 O_CREAT)。
+ * 【返回值】新段的 MdfdVec 指针;失败 NULL。
+ *
  * Open the specified segment of the relation,
  * and make a MdfdVec object for it.  Returns NULL on failure.
  */
@@ -1746,6 +2261,28 @@ _mdfd_openseg(SMgrRelation reln, ForkNumber forknum, BlockNumber segno,
 }
 
 /*
+ * _mdfd_getseg (中文)找到(必要时创建)包含指定块的段
+ *
+ * 【作用】md 读写路径的核心定位函数:计算 blkno 所在段号 targetseg,
+ * 若已打开直接返回;未打开则从"最后打开的段"(或首段)逐个向后推进
+ * _mdfd_openseg 直到 targetseg,过程中按 behavior 处理"缺失段":
+ * - EXTENSION_CREATE(或恢复期 EXTENSION_CREATE_RECOVERY):允许创建——
+ *   若前一段未满,先把它补满(mdextend 垫零,维持"末段之前的段必须
+ *   恰好 RELSEG_SIZE"的不变量;恢复或跳跃式扩展时会遇到),再用
+ *   O_CREAT 打开新段;
+ * - 前一段未满却要求继续:非创建路径下,按 behavior 返回 NULL
+ *   (EXTENSION_RETURN_NULL,并置 errno=ENOENT 供调用方区分原因)或
+ *   直接报错;
+ * - 打开失败:EXTENSION_RETURN_NULL 且 FILE_POSSIBLY_DELETED(errno)
+ *   时返回 NULL,否则报错。
+ * EXTENSION_DONT_OPEN 时,目标段未打开则直接返回 NULL(绝不开文件)。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork;
+ *   blkno —— 目标块号;skipFsync —— 仅在创建新段、垫零扩展时使用;
+ *   behavior —— EXTENSION_* 位组合。
+ * 【返回值】目标段描述;可能为 NULL(由 behavior 决定)。
+ *
  * _mdfd_getseg() -- Find the segment of the relation holding the
  *					 specified block.
  *
@@ -1880,6 +2417,16 @@ _mdfd_getseg(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 }
 
 /*
+ * _mdnblocks (中文)返回单个段文件当前的块数
+ *
+ * 【作用】用 FileSize 取文件字节长度除以 BLCKSZ,得到整块数(忽略
+ * EOF 处的部分块)。FileSize 失败(如文件被截断的竞态)报 ERROR。
+ *
+ * 【参数】
+ *   reln, forknum —— 目标关系与 fork(仅用于报错信息);
+ *   seg —— 目标段描述。
+ * 【返回值】段内块数。
+ *
  * Get number of blocks present in a single disk file
  */
 static BlockNumber
@@ -1898,6 +2445,19 @@ _mdnblocks(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
 }
 
 /*
+ * mdsyncfiletag (中文)按文件标签执行 fsync(sync 框架回调)
+ *
+ * 【作用】checkpointer 处理同步请求队列时、或后端从队列取回请求自刷
+ * 时调用:给定描述某 md 段文件的 FileTag,打开(或复用已打开的)该文件
+ * 并 FileSync()。路径写入 path 输出缓冲,供调用方在错误消息中引用。
+ *
+ * 【返回值语义】0 成功;-1 失败(errno 保留)。注意:复用 reln 已打开
+ * 的 fd 时无需关闭;临时打开的文件必须用完即关。
+ *
+ * 【参数】
+ *   ftag —— 目标段文件标签;path —— 输出:文件路径(MAXPGPATH)。
+ * 【返回值】见上。
+ *
  * Sync a file to disk, given a file tag.  Write the path into an output
  * buffer so the caller can use it in error messages.
  *
@@ -1950,6 +2510,16 @@ mdsyncfiletag(const FileTag *ftag, char *path)
 }
 
 /*
+ * mdunlinkfiletag (中文)按文件标签删除文件(仅用于墓碑文件)
+ *
+ * 【作用】checkpointer 处理 SYNC_UNLINK_REQUEST 时调用:删除 mdunlink
+ * 留下的空首段(tombstone)。断言只处理主 fork 首段;路径由 relpathperm
+ * 构造;直接 unlink,失败返回 -1 并保留 errno。
+ *
+ * 【参数】
+ *   ftag —— 目标文件标签;path —— 输出:文件路径。
+ * 【返回值】0 成功;-1 失败(errno 已设置)。
+ *
  * Unlink a file, given a file tag.  Write the path into an output
  * buffer so the caller can use it in error messages.
  *
@@ -1972,6 +2542,16 @@ mdunlinkfiletag(const FileTag *ftag, char *path)
 }
 
 /*
+ * mdfiletagmatches (中文)SYNC_FILTER_REQUEST 的匹配回调
+ *
+ * 【作用】处理"过滤"请求时,对队列中每个待处理请求调用:返回 true
+ * 表示该请求应被遗忘。当前实现只比较数据库 OID(只用于 DROP DATABASE
+ * 时撤销某库的全部待处理回调)。
+ *
+ * 【参数】
+ *   ftag —— 过滤请求的标签;candidate —— 队列中的候选请求标签。
+ * 【返回值】是否匹配(匹配则遗忘候选)。
+ *
  * Check if a given candidate request matches a given tag, when processing
  * a SYNC_FILTER_REQUEST request.  This will be called for all pending
  * requests to find out whether to forget them.
@@ -1989,6 +2569,23 @@ mdfiletagmatches(const FileTag *ftag, const FileTag *candidate)
 }
 
 /*
+ * md_readv_complete (中文)异步读的完成回调
+ *
+ * 【作用】mdstartreadv 提交的 IO 完成时由 AIO 框架调用,把内核返回的
+ * "字节数"换算成 smgr 层的"块数",并归类结果:
+ * - 硬错误(结果 < 0):置 PGAIO_RS_ERROR,把 errno 记录到 error_data,
+ *   立即向服务器日志(LOG_SERVER_ONLY)输出(发起者可能忙于处理其他
+ *   工作,或已被取消/因其他 IO 失败而报错,不能指望它及时看到);上层
+ *   处理结果时会把它转成 ERROR;
+ * - 读到 0 块:视为失败(同上);
+ * - 块数不足:标记 PGAIO_RS_PARTIAL,由上层对未读部分重发 IO。
+ * 注意本回调不实现 zero_damaged_pages 逻辑(理由见 mdstartreadv)。
+ *
+ * 【参数】
+ *   ioh —— AIO 句柄;prior_result —— 底层 IO 结果;cb_data —— 回调
+ *   数据(此处 0,未使用)。
+ * 【返回值】换算/归类后的结果。
+ *
  * AIO completion callback for mdstartreadv().
  */
 static PgAioResult
@@ -2052,6 +2649,17 @@ md_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data)
 }
 
 /*
+ * md_readv_report (中文)异步读的错误报告回调
+ *
+ * 【作用】pgaio_result_report() 最终输出错误消息时调用,把 IO 结果转
+ * 成可读的 PostgreSQL 日志/错误文本:error_data != 0 时按对应 errno
+ * 生成"读取失败"消息;否则生成"只读了部分字节"消息(通常是调试级别)。
+ * 路径按临时/普通关系分别构造。
+ *
+ * 【参数】
+ *   result —— 要报告的 IO 结果;td —— IO 目标数据;elevel —— 消息级别。
+ * 【返回值】无。
+ *
  * AIO error reporting callback for mdstartreadv().
  *
  * Errors are encoded as follows:

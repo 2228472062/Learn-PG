@@ -8,6 +8,28 @@
  *	  interrupted, unlike LWLock waits.  Condition variables are safe
  *	  to use within dynamic shared memory segments.
  *
+ * 【模块总览(中文)】
+ * 本文件实现 PostgreSQL 的条件变量(Condition Variable,简称 CV)。
+ * 条件变量是"等待某个特定条件成立"的同步原语:一个进程等待,另一个进程
+ * 通过 Signal/Broadcast 唤醒它。与 LWLock 等待相比,条件变量等待是可被
+ * 中断的(收到信号/超时/取消时会退出等待),且可安全地用于动态共享内存段
+ * (DSM)中,因此被大量用在 parallel query 等场景。
+ *
+ * 【核心设计思想】
+ * - 每个条件变量由两部分组成:一把自旋锁 mutex(保护等待队列)和一个
+ *   等待队列 wakeup(proclist,元素是 PGPROC 的 cvWaitLink 链)。
+ * - "唤醒"的实现依赖 PGPROC 里的 procLatch:发信号的一方把被唤醒者从
+ *   队列里摘下来并 SetLatch,等待方在 WaitLatch 返回后检查自己是否还在
+ *   队列中——不在队列里就说明"被信号唤醒了",应返回调用者重新检查条件。
+ * - 整个模块都建立在"一个进程同时只能睡在一个条件变量上"这一约定上:
+ *   进程的 PGPROC 里只有一条 cvWaitLink,全局静态变量 cv_sleep_target
+ *   记录当前"已准备入睡"的目标;换一个 CV 睡之前必须先取消旧睡眠。
+ * - 假唤醒(spurious wakeup)是允许的:Sleep 返回不代表条件已成立,调用者
+ *   必须用循环"重查条件";并且被唤醒后要立刻把自己重新放回等待队列,
+ *   防止在检查条件期间错过别的进程的 Signal(即"丢失唤醒"问题)。
+ * - 与 pthread 条件变量最大的不同:PG 版必须显式调用 PrepareToSleep /
+ *   CancelSleep 来进出"睡眠状态",这一显式化正是为避免"丢失唤醒"而设计的。
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -28,10 +50,28 @@
 #include "storage/spin.h"
 
 /* Initially, we are not prepared to sleep on any condition variable. */
+/* 全局静态变量:记录本进程当前"准备入睡"的条件变量(若正处于睡眠等待中,
+ * 则记录的是睡眠目标)。因为 PGPROC 中只有一条 cvWaitLink,一个进程同一
+ * 时刻只能睡在一个条件变量上,故用这一个静态变量即可跟踪状态;
+ * NULL 表示当前没有挂起的睡眠。此变量只被本进程访问,无需加锁。 */
 static ConditionVariable *cv_sleep_target = NULL;
 
 /*
  * Initialize a condition variable.
+ */
+/*
+ * ConditionVariableInit
+ *      (中文)初始化一个条件变量
+ *
+ * 【作用】在条件变量首次使用前调用:初始化保护等待队列的自旋锁 mutex,
+ * 并把等待队列 wakeup 置空。
+ *
+ * 【设计思想】条件变量可位于共享内存(如 DSM)或本进程内存中,但无论
+ * 位置如何,初始化动作都是一样的;队列采用 proclist(以 PGPROC 的
+ * cvWaitLink 为链元素),元素按"入队先后"排序,Signal 时唤醒最老的进程。
+ *
+ * 【参数】cv —— 待初始化的条件变量指针。
+ * 【返回值】无。
  */
 void
 ConditionVariableInit(ConditionVariable *cv)
@@ -53,6 +93,31 @@ ConditionVariableInit(ConditionVariable *cv)
  * condition between calling ConditionVariablePrepareToSleep and calling
  * ConditionVariableSleep.  If that is inconvenient, omit calling
  * ConditionVariablePrepareToSleep.
+ */
+/*
+ * ConditionVariablePrepareToSleep
+ *      (中文)准备在一个条件变量上入睡(把自己加入等待队列)
+ *
+ * 【作用】进入"测试条件-睡眠"循环之前调用:把本进程挂到指定条件变量的
+ * 等待队列尾部,并记录 cv_sleep_target。此后调用 ConditionVariableSleep
+ * 才会真正阻塞。
+ *
+ * 【设计思想】
+ * - 是否值得调用本函数取决于条件"大概率立即成立"还是"大概率要等":
+ *   若不调用,则 ConditionVariableSleep 第一次调用时会自动准备并立刻
+ *   返回,让调用者重查一次条件(相当于把"出队、重查、再入队"推迟);
+ *   若先调用 PrepareToSleep,则省去这多余的一次条件测试。文档建议:
+ *   预计第一次测试就成功 → 不调用;预计要睡 → 调用。
+ * - 注意约定:调用本函数之后、调用 ConditionVariableSleep 之前,
+ *   必须先测试一次退出条件!否则可能在条件已经成立的情况下白白睡觉,
+ *   甚至永远等不到信号。若不方便这样做,就不要调用本函数。
+ * - 若之前已为别的条件变量准备了睡眠,先 ConditionVariableCancelSleep
+ *   取消掉(因为 cv_sleep_target 和 PGPROC->cvWaitLink 都只有一份);
+ *   这不会丢信号——别的循环下次调用 ConditionVariableSleep 时会重新
+ *   建立自己的睡眠。
+ *
+ * 【参数】cv —— 要入睡的条件变量。
+ * 【返回值】无。
  */
 void
 ConditionVariablePrepareToSleep(ConditionVariable *cv)
@@ -94,6 +159,28 @@ ConditionVariablePrepareToSleep(ConditionVariable *cv)
  * defined in pgstat.h.  This controls the contents of pg_stat_activity's
  * wait_event_type and wait_event columns while waiting.
  */
+/*
+ * ConditionVariableSleep
+ *      (中文)等待条件变量被发信号(无超时版本)
+ *
+ * 【作用】阻塞本进程,直到被 ConditionVariableSignal/Broadcast 唤醒。
+ * 必须在"测试-睡眠"谓词循环中使用,典型用法:
+ *     ConditionVariablePrepareToSleep(cv);   // 可选
+ *     while (等待的条件不成立)
+ *         ConditionVariableSleep(cv, wait_event_info);
+ *     ConditionVariableCancelSleep();
+ * 注意:被唤醒不代表条件成立,循环体的条件测试才是真正的判断依据;
+ * 退出循环后必须调用 ConditionVariableCancelSleep() 把自己从队列摘下。
+ *
+ * 【实现】本函数就是 ConditionVariableTimedSleep 的"永不超时"包装
+ * (timeout 传 -1)。
+ *
+ * 【参数】
+ *   cv              —— 等待的条件变量;
+ *   wait_event_info —— pgstat.h 中 WaitEventXXX 枚举之一,控制等待期间
+ *                      pg_stat_activity 的 wait_event_type/wait_event 显示。
+ * 【返回值】无(仅在被信号唤醒后返回;等待期间可被中断/取消打断)。
+ */
 void
 ConditionVariableSleep(ConditionVariable *cv, uint32 wait_event_info)
 {
@@ -109,6 +196,40 @@ ConditionVariableSleep(ConditionVariable *cv, uint32 wait_event_info)
  * Returns true when timeout expires, otherwise returns false.
  *
  * See ConditionVariableSleep() for general usage.
+ */
+/*
+ * ConditionVariableTimedSleep
+ *      (中文)等待条件变量被发信号,或直到超时
+ *
+ * 【作用】带超时的睡眠版本,timeout 单位为毫秒。超时返回 true;被信号
+ * 唤醒(或假唤醒)返回 false。用法与 ConditionVariableSleep 相同,
+ * 只是循环退出条件里要同时判断"是否已超时"。
+ *
+ * 【执行流程与设计思想】
+ * 1. 若还没为这个 CV 准备睡眠(cv_sleep_target != cv),则先
+ *    ConditionVariablePrepareToSleep 并立刻返回 false——调用者会重查
+ *    条件,若仍不成立会再次调用本函数。这保证"退出条件在睡眠前至少被
+ *    检查过一次",从根本上杜绝丢失唤醒。
+ * 2. 循环等待 MyLatch:
+ *    - WaitLatch 返回后先 ResetLatch(清掉 latch,否则会立即再次唤醒);
+ *    - 持 cv->mutex 检查自己是否还在等待队列:不在 = 被 Signal 摘下,
+ *      但为了不遗漏"检查条件期间到来的新信号",必须立刻把自己重新
+ *      放回队列尾部,然后返回;
+ *    - CHECK_FOR_INTERRUPTS() 处理挂起的信号:若中断处理器改了
+ *      cv_sleep_target(意味着处理器曾等待别的条件变量),本次睡眠算
+ *      "假唤醒",返回;
+ *    - 有超时参数时用 instr_time 计算已等待的毫秒数,剩余时间不足
+ *      即返回 true。
+ * 3. 为什么要用"在不在队列里"判断是否被信号唤醒:Signal 的语义就是
+ *    "把队首进程摘下来并 SetLatch",所以若醒来后仍在队列里,说明 latch
+ *    是别人 Set 的(与本次 CV 无关)或纯属假唤醒,继续睡即可。
+ *
+ * 【参数】
+ *   cv              —— 等待的条件变量;
+ *   timeout         —— 超时毫秒数;-1 表示永不超时(等价于
+ *                      ConditionVariableSleep);
+ *   wait_event_info —— 等待事件的统计信息(见 ConditionVariableSleep)。
+ * 【返回值】true = 超时;false = 被信号唤醒或假唤醒(调用者应重查条件)。
  */
 bool
 ConditionVariableTimedSleep(ConditionVariable *cv, long timeout,
@@ -228,6 +349,27 @@ ConditionVariableTimedSleep(ConditionVariable *cv, long timeout,
  *
  * Return true if we've been signaled.
  */
+/*
+ * ConditionVariableCancelSleep
+ *      (中文)取消任何挂起的睡眠(把自己从等待队列中摘下)
+ *
+ * 【作用】结束对某条件变量的等待:若本进程还在该 CV 的等待队列里,把
+ * 自己摘除;返回"是否曾被信号唤醒"。
+ *
+ * 【设计思想】
+ * - 必须在退出"测试-睡眠"循环后调用,否则本进程会一直留在队列里,
+ *   将来该 CV 的任何一次 Signal 都会"唤醒"一个其实已不等待的进程
+ *   (浪费一次 SetLatch,并可能造成后续队列语义混乱);
+ * - 若当前根本没有挂起的睡眠(cv_sleep_target == NULL),直接返回 false。
+ *   这使得本函数可以在事务回滚清理路径上无条件调用,安全无害;
+ * - 返回"是否被信号唤醒"的语义:如果摘除时发现自己已不在队列里,
+ *   说明之前已被 Signal 摘下(信号已经送达),返回 true。这个返回值
+ *   供少数调用者(如 LWLock 释放路径)知道"不用再发信号了"。
+ *
+ * 【参数】无(作用于全局状态 cv_sleep_target)。
+ * 【返回值】true = 在被取消前已经收到过信号;false = 无挂起睡眠或
+ * 直接摘除(未收到信号)。
+ */
 bool
 ConditionVariableCancelSleep(void)
 {
@@ -257,6 +399,21 @@ ConditionVariableCancelSleep(void)
  * sentinel.  Hence, think twice before proposing that this should return
  * a flag telling whether it woke somebody.
  */
+/*
+ * ConditionVariableSignal
+ *      (中文)唤醒一个在指定条件变量上睡觉的进程(队首的、即最老的)
+ *
+ * 【作用】把 CV 等待队列中"最老"的进程摘下来并 SetLatch,使其从睡眠中
+ * 醒来。若队列为空,什么都不做。
+ *
+ * 【设计思想】队列按入队顺序排列,Signal 总唤醒第一个(最老)等待者,
+ * 保证公平;摘除与唤醒分两步:先在 mutex 保护下摘除(此时唤醒权已
+ * 转移给被摘除者),再 SetLatch。即使 SetLatch 前该进程已因其他原因
+ * 醒来,也只是一次无害的多余唤醒。
+ *
+ * 【参数】cv —— 要发信号的条件变量。
+ * 【返回值】无。
+ */
 void
 ConditionVariableSignal(ConditionVariable *cv)
 {
@@ -279,6 +436,27 @@ ConditionVariableSignal(ConditionVariable *cv)
  * This guarantees to wake all processes that were sleeping on the CV
  * at time of call, but processes that add themselves to the list mid-call
  * will typically not get awakened.
+ */
+/*
+ * ConditionVariableBroadcast
+ *      (中文)唤醒所有在指定条件变量上睡觉的进程
+ *
+ * 【作用】把 CV 等待队列里的全部进程(以调用时刻在队列中为准)逐个摘除
+ * 并 SetLatch。调用过程中新加入队列的进程通常不会被唤醒。
+ *
+ * 【设计思想】
+ * - 唤醒者可能在醒来后立即重新入队(常见于"唤醒-重查-再睡"循环),
+ *   若简单地把队列清空,会与这种进程陷入潜在的无限循环。因此用自己
+ *   的 cvWaitLink 作为"哨兵"插入队尾:只要哨兵还在队列里,就继续摘
+ *   队首;等哨兵也轮到被摘时,说明调用前在队列里的进程都已处理完。
+ * - 若别人恰好也在 Signal 并把我们的哨兵摘走了,则可能多唤醒一个
+ *   进程——那是故意的:与其"漏唤醒"(丢掉唤醒信号,可能永远睡死),
+ *   不如"多唤醒"(假唤醒,最多浪费几圈循环)。
+ * - 插入哨兵前,若自己正挂着别的睡眠(cv_sleep_target != NULL),必须
+ *   先取消,否则 cvWaitLink 已在别的队列里,无法复用(见函数内注释)。
+ *
+ * 【参数】cv —— 要广播的条件变量。
+ * 【返回值】无。
  */
 void
 ConditionVariableBroadcast(ConditionVariable *cv)
