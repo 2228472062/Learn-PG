@@ -476,6 +476,29 @@ add_paths_to_joinrel(PlannerInfo *root,
  * allow_star_schema_join() returns true if the param_source_rels restriction
  * should be overridden, ie, it's okay to perform this join.
  */
+/*
+ * allow_star_schema_join - (中文)判断是否允许"星型模式"连接,从而放宽
+ * param_source_rels 的启发式限制
+ *
+ * 【作用】try_nestloop_path() 在发现连接路径仍带参数化、且该参数来源不在
+ * param_source_rels 中时调用本函数,判断是否放行该连接。返回 true 表示
+ * 可以忽略 param_source_rels 的限制,继续构造该嵌套循环路径。
+ *
+ * 【设计思想】星型模式场景:大表(事实表)的参数化路径可能同时依赖多个小表
+ * (维表),而这些小表彼此之间并不直接连接。此时可以把小表叠放在外层,通过
+ * 嵌套循环逐层向内提供参数。这打破了 param_source_rels 启发式所依据的规则
+ * ("除非有连接顺序约束,否则不应跨连接下传参数")。判断条件是:外层关系
+ * 提供了内层参数化的一部分(inner_paramrels 与 outerrelids 有交集),但又
+ * 不是全部(bms_nonempty_difference 要求存在未被满足的部分)——即"部分满足
+ * 参数化"。全部满足时不需要 override,完全未满足时叠放无意义。
+ *
+ * 【参数】
+ *   root           —— PlannerInfo;
+ *   outerrelids    —— 外层关系的 relids;
+ *   inner_paramrels —— 内层路径所要求的外层参数来源集合。
+ * 【返回值】true:允许执行本次连接(忽略 param_source_rels 限制);
+ * false:参数化不合理,应拒绝该路径。
+ */
 static inline bool
 allow_star_schema_join(PlannerInfo *root,
 					   Relids outerrelids,
@@ -503,6 +526,29 @@ allow_star_schema_join(PlannerInfo *root,
  * as a backstop, but we only do so in assert-enabled builds.
  */
 #ifdef USE_ASSERT_CHECKING
+/*
+ * have_unsafe_outer_join_ref - (中文)检查被外层关系部分满足的参数化中,
+ * 未满足部分是否包含会对已满足部分产生 NULL 化的外层连接
+ *
+ * 【作用】仅用于 assert 构建(USE_ASSERT_CHECKING)的安全兜底检查:
+ * 当星型模式连接中,内层路径的参数化只被外层关系部分满足时,未满足的部分
+ * 不能包含"会把已满足部分的关系置 NULL 的外层连接 relid"。因为那意味着在
+ * 某个连接层,某个 Var 带非空 varnullingrels,但其对应的值此刻还无法计算。
+ *
+ * 【设计思想】把 inner_paramrels 拆成"已满足(satisfied)"与"未满足
+ * (unsatisfied)"两部分;若 unsatisfied 中确实含外层连接 relid
+ * (root->outer_join_rels),则逐条扫描 join_info_list,凡该外层连接的 RHS
+ * (或 FULL 连接的 LHS)与 satisfied 有交集,就说明已满足部分会被它 NULL 化,
+ * 判断为不安全。源码注释说明:实际中由于更早的连接顺序限制,此检查通常
+ * 不会发现任何问题,只是作为最后一道防线,所以仅放在 assert 构建里。
+ *
+ * 【参数】
+ *   root           —— PlannerInfo;
+ *   outerrelids    —— 外层关系的 relids;
+ *   inner_paramrels —— 内层路径要求的参数来源集合。
+ * 【返回值】true:存在不安全的引用,该路径不能采用;false:安全。
+ * 注意本函数内部会释放临时构建的 bms 集合,失败路径不泄漏内存。
+ */
 static inline bool
 have_unsafe_outer_join_ref(PlannerInfo *root,
 						   Relids outerrelids,
@@ -551,6 +597,42 @@ have_unsafe_outer_join_ref(PlannerInfo *root,
  * These are returned in parallel lists in *param_exprs and *operators.
  * We also set *binary_mode to indicate whether strict binary matching is
  * required.
+ */
+/*
+ * paraminfo_get_equal_hashops - (中文)判断内层路径的参数化子句与 LATERAL
+ * 变量能否作为 Memoize 缓存键,并收集哈希运算符
+ *
+ * 【作用】get_memoize_path() 的辅助函数:检查 param_info 中的参数化连接子句
+ * (ppi_clauses)以及 innerrel 的 LATERAL 变量,是否都能用哈希等值算子来
+ * 构造缓存键。成功时把各"外层表达式 + 对应哈希等值算子"分别填入
+ * *param_exprs 与 *operators(并行列表),并用 *binary_mode 表示是否需要
+ * 按二进制严格比较。失败返回 false。
+ *
+ * 【设计思想】
+ * - 每个 ppi_clauses 中的 RestrictInfo 必须是"outer op inner"或反之的
+ *   两目 OpExpr(clause_sides_match_join),否则无法确定哪一侧是外层表达式;
+ * - 取对应当前外层一侧(left_hasheqoperator / right_hasheqoperator)的哈希
+ *   等值算子;若无效则不能哈希,失败;
+ * - 若该连接算子本身不可哈希(rinfo->hashjoinoperator 无效),说明哈希等值
+ *   算子可能把两个不同的值判为相等(例如浮点的 +0.0 与 -0.0),必须置
+ *   *binary_mode = true,让 Memoize 做逐位比较而不是"逻辑"比较;
+ * - LATERAL 变量一律加入缓存键:含 volatile 函数则失败;类型必须同时有
+ *   哈希过程与等值算子;由于不了解这些 Var 的用途,一律要求二进制模式;
+ * - 用 list_member() 去重:同一表达式已在 ppi_clauses 中出现时不重复加入,
+ *   但若属上述需要二进制模式的情形,仍会切换模式。
+ *
+ * 【参数】
+ *   root          —— PlannerInfo;
+ *   param_info    —— 内层路径的参数化信息(可能为 NULL);
+ *   outerrel      —— 外层关系(可能用到其 top_parent 以便匹配 relids);
+ *   innerrel      —— 内层关系(取 innerrel->lateral_vars);
+ *   ph_lateral_vars —— 由 extract_lateral_vars_from_PHVs() 提取的、需在内层
+ *                      求值的 PlaceHolderVar 中的横向引用列表;
+ *   param_exprs   —— 出参:外层表达式列表;
+ *   operators     —— 出参:与 param_exprs 一一对应的哈希等值算子;
+ *   binary_mode   —— 出参:true 表示 Memoize 需二进制严格比较。
+ * 【返回值】true:所有参数都可哈希,出参有效;false:存在不可哈希的参数,
+ * 此时已释放部分累积的列表,出参不可用。
  */
 static bool
 paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
@@ -697,6 +779,33 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
  *	  Extract lateral references within PlaceHolderVars that are due to be
  *	  evaluated at 'innerrelids'.
  */
+/*
+ * extract_lateral_vars_from_PHVs - (中文)提取计划在内层关系处求值的
+ * PlaceHolderVar 中所含的横向引用,作为 Memoize 的候选缓存键
+ *
+ * 【作用】get_memoize_path() 的辅助函数:遍历 root->placeholder_list,找出
+ * 所有"应在本连接的内层关系(innerrelids)处求值"且含横向引用(ph_lateral
+ * 非空)的 PlaceHolderVar,把其中引用的 Var / PlaceHolderVar 提取出来返回,
+ * 供 get_memoize_path() 用作缓存键的一部分。
+ *
+ * 【设计思想】
+ * - 快速路径:查询无 LATERAL RTE 或 innerrelids 是多个关系(BMS_MULTIPLE,
+ *   即内层是 joinrel)时直接返回 NIL——因为 Memoize 不会加在 joinrel 路径
+ *   之上,joinrel 也维护不了缓存键;
+ * - 对每个满足条件的 PHInfo:若其表达式根本不引用 innerrelids 中的关系
+ *   (只由外层关系构成),则直接把这个表达式整体作为键,好处是某些场景下
+ *   表达式的不同值更少、缓存命中率更高;否则把 phexpr 中 level 0 的 Var
+ *   和 PlaceHolderVar 逐一提出来(pull_vars_of_level),仅保留确实属于
+ *   ph_lateral(横向引用集)的部分;
+ * - 提取嵌套 PHV 时要求其求值点 ph_eval_at 是 ph_lateral 的子集,保证它
+ *   在横向上下文中可计算。
+ *
+ * 【参数】
+ *   root        —— PlannerInfo;
+ *   innerrelids —— 期望求值位置(通常为内层关系的 relids)。
+ * 【返回值】横向引用(Var/PlaceHolderVar/表达式)的列表;无相关内容时返回
+ * NIL。列表元素由调用者负责按需使用。
+ */
 static List *
 extract_lateral_vars_from_PHVs(PlannerInfo *root, Relids innerrelids)
 {
@@ -787,6 +896,42 @@ extract_lateral_vars_from_PHVs(PlannerInfo *root, Relids innerrelids)
  * maintain ppi_clauses, as the set of relevant clauses varies depending on how
  * the join is formed.  In addition, joinrels do not maintain lateral_vars.  So
  * we do not have a way to extract cache keys from joinrels.
+ */
+/*
+ * get_memoize_path - (中文)尽可能在内层路径之上构造 Memoize 路径并返回,
+ * 否则返回 NULL
+ *
+ * 【作用】match_unsorted_outer() / consider_parallel_nestloop() 在尝试普通
+ * 嵌套循环路径的同时,调用本函数尝试把内层路径包一层 Memoize(缓存内层按
+ * 参数取值扫描的结果),若可行则返回新路径,再交给 try_nestloop_path /
+ * try_partial_nestloop_path 与普通版本比较代价。
+ *
+ * 【设计思想】Memoize 能避免"同一个内层参数值被重复扫描",但有多项前提:
+ * - pgs_mask 必须允许 Memoize(PGS_NESTLOOP_MEMOIZE);通常还要求外层至少
+ *   有 2 行(否则第一次扫描必是 cache miss,白费功夫),除非纯嵌套循环被
+ *   禁用时才冒险交给代价比较;
+ * - 必须存在缓存键:内层路径的参数化子句(ppi_clauses)、innerrel 的
+ *   LATERAL 变量、或从 PHV 提取的横向引用,三者至少其一;
+ * - SEMI/ANTI 连接中,嵌套循环可能不会把内层扫完(命中即跳),Memoize 无法
+ *   把缓存项标记为"完整",所以一般禁止;例外是内层已证明唯一
+ *   (extra->inner_unique)且整个连接条件都被参数化覆盖时,可在取到第一行后
+ *   标记完整;
+ * - 内层目标表、baserestrictinfo、参数化子句中都不能有 volatile 函数
+ *   (缓存命中会减少这些函数的调用次数,改变语义);
+ * - 所有参数都须可哈希(paraminfo_get_equal_hashops),并据此决定是否进入
+ *   二进制比较模式。
+ * 构造时用 create_memoize_path(),并传入 outer_path->rows 作为预估的单组
+ * 行数,用于代价估算。
+ *
+ * 【参数】
+ *   root       —— PlannerInfo;
+ *   innerrel   —— 内层关系;
+ *   outerrel   —— 外层关系;
+ *   inner_path —— 内层路径(将被包装);
+ *   outer_path —— 外层路径;
+ *   jointype   —— 连接类型;
+ *   extra      —— JoinPathExtraData 上下文。
+ * 【返回值】新的 Memoize 路径;任何条件不满足时返回 NULL。
  */
 static Path *
 get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
@@ -954,6 +1099,43 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
  *	  Consider a nestloop join path; if it appears useful, push it into
  *	  the joinrel's pathlist via add_path().
  */
+/*
+ * try_nestloop_path - (中文)考虑一条嵌套循环连接路径,若看似有用则加入
+ * joinrel 的 pathlist
+ *
+ * 【作用】match_unsorted_outer() 针对每条外层路径与每条内层候选路径,调用
+ * 本函数尝试生成嵌套循环路径。先做一系列合法性/代价预检,通过后调用
+ * create_nestloop_path() 构造完整路径并交给 add_path() 精确去劣。
+ *
+ * 【设计思想】
+ * - 合法性检查:若本层正在形成一个外层连接(extra->sjinfo->ojrelid != 0),
+ *   输入路径的参数化中绝不能包含该外层连接的 relid(否则意味着要依赖
+ *   尚未算出的 NULL 化结果);随后用 calc_nestloop_required_outer() 计算
+ *   结果路径真正需要的参数来源 required_outer,若它既与 param_source_rels
+ *   无交集、又不满足 allow_star_schema_join() 的星型例外,则拒绝该路径;
+ * - 分区裁剪相关:参数化一律针对 top_parent(顶层父表),因此必须用
+ *   top_parent_relids 参与判定;若内层路径被顶层父表参数化,还要确认
+ *   path_is_reparameterizable_by_child() 能在 create_plan() 阶段把参数化
+ *   翻译到子表上,否则直接放弃;
+ * - 两阶段代价方法:先用 initial_cost_nestloop() 算出廉价的下界
+ *   (startup_cost/total_cost),配合 add_path_precheck() 快速淘汰明显被
+ *   现有路径支配者;只有通过预检才构造完整路径走 add_path(),节省昂贵的
+ *   完整路径构造时间;
+ * - nestloop_subtype 区分 PGS_NESTLOOP_PLAIN / MATERIALIZE / MEMOIZE,
+ *   try_nestloop_path 阶段统一加 PGS_CONSIDER_NONPARTIAL(部分路径由
+ *   try_partial_nestloop_path 处理)。
+ *
+ * 【参数】
+ *   root             —— PlannerInfo;
+ *   joinrel          —— 目标连接关系;
+ *   outer_path       —— 外层路径;
+ *   inner_path       —— 内层路径;
+ *   pathkeys         —— 结果路径的输出排序(通常来自外层);
+ *   jointype         —— 连接类型;
+ *   nestloop_subtype —— 嵌套循环子类型(PGS_NESTLOOP_* 位);
+ *   extra            —— JoinPathExtraData 上下文。
+ * 【返回值】无(可能把路径加入 joinrel->pathlist)。
+ */
 static void
 try_nestloop_path(PlannerInfo *root,
 				  RelOptInfo *joinrel,
@@ -1075,6 +1257,35 @@ try_nestloop_path(PlannerInfo *root,
  *	  Consider a partial nestloop join path; if it appears useful, push it into
  *	  the joinrel's partial_pathlist via add_partial_path().
  */
+/*
+ * try_partial_nestloop_path - (中文)考虑一条并行(partial)嵌套循环路径,若
+ * 看似有用则加入 joinrel 的 partial_pathlist
+ *
+ * 【作用】consider_parallel_nestloop() 为每条并行外层路径与并行安全的内层
+ * 路径调用本函数,尝试生成 partial 嵌套循环路径。与 try_nestloop_path 的
+ * 区别:结果加入 partial_pathlist(通过 add_partial_path),且路径不能有任何
+ * 剩余参数化(并行路径不支持参数化)。
+ *
+ * 【设计思想】
+ * - 前置断言:joinrel 无横向依赖、外层路径无参数化(调用方已保证);
+ * - 内层参数化必须被外层关系完全满足(bms_is_subset),否则放弃——并行
+ *   路径的参数化必须是完整的、可由外层提供的;
+ * - 同样要考虑顶层父表的参数化翻译问题,不可翻译则放弃;
+ * - 代价预检用 add_partial_path_precheck(),通过后再构造路径。
+ * 创建时向 create_nestloop_path() 传 required_outer = NULL,保证产物无
+ * 参数化。
+ *
+ * 【参数】
+ *   root             —— PlannerInfo;
+ *   joinrel          —— 目标连接关系;
+ *   outer_path       —— 并行外层路径;
+ *   inner_path       —— 内层路径;
+ *   pathkeys         —— 结果路径的输出排序;
+ *   jointype         —— 连接类型;
+ *   nestloop_subtype —— 嵌套循环子类型;
+ *   extra            —— JoinPathExtraData 上下文。
+ * 【返回值】无(可能把路径加入 joinrel->partial_pathlist)。
+ */
 static void
 try_partial_nestloop_path(PlannerInfo *root,
 						  RelOptInfo *joinrel,
@@ -1155,6 +1366,42 @@ try_partial_nestloop_path(PlannerInfo *root,
  * try_mergejoin_path
  *	  Consider a merge join path; if it appears useful, push it into
  *	  the joinrel's pathlist via add_path().
+ */
+/*
+ * try_mergejoin_path - (中文)考虑一条归并连接路径,若看似有用则加入
+ * joinrel 的 pathlist(或 partial_pathlist)
+ *
+ * 【作用】sort_inner_and_outer() / generate_mergejoin_paths() 为每条候选
+ * (外层路径, 内层路径)组合调用本函数。is_partial 为 true 时转交
+ * try_partial_mergejoin_path() 处理;否则走与 try_nestloop_path 类似的两
+ * 阶段预检流程,构造 MergeJoin 路径加入 pathlist。
+ *
+ * 【设计思想】
+ * - is_partial 分支直接把工作交给 try_partial_mergejoin_path()(partial
+ *   路径无参数化、加 partial_pathlist);
+ * - 非 partial 时:拒绝参数化中包含本层外层连接 relid 的输入路径;用
+ *   calc_non_nestloop_required_outer() 计算必需参数,若与 param_source_rels
+ *   无交集则拒绝;
+ * - 排序优化:若外层路径已经满足 outersortkeys 的前缀
+ *   (pathkeys_count_contained_in 同时给出前缀长度 outer_presorted_keys,
+ *   用于判断是否可应用增量排序 Incremental Sort),或内层路径已满足
+ *   innersortkeys,则把相应的显式排序需求置 NIL,省去排序步骤;
+ * - initial_cost_mergejoin() + add_path_precheck() 两阶段过滤,通过后
+ *   create_mergejoin_path() 构造完整路径。
+ *
+ * 【参数】
+ *   root             —— PlannerInfo;
+ *   joinrel          —— 目标连接关系;
+ *   outer_path       —— 外层路径;
+ *   inner_path       —— 内层路径;
+ *   pathkeys         —— 结果路径的输出排序;
+ *   mergeclauses     —— 本次归并使用的连接子句;
+ *   outersortkeys    —— 需要加在外层上的显式排序键(可为 NIL);
+ *   innersortkeys    —— 需要加在内层上的显式排序键(可为 NIL);
+ *   jointype         —— 连接类型;
+ *   extra            —— JoinPathExtraData 上下文;
+ *   is_partial       —— true 表示生成并行(partial)归并路径。
+ * 【返回值】无(可能把路径加入 joinrel->pathlist 或 partial_pathlist)。
  */
 static void
 try_mergejoin_path(PlannerInfo *root,
@@ -1272,6 +1519,36 @@ try_mergejoin_path(PlannerInfo *root,
  *	  Consider a partial merge join path; if it appears useful, push it into
  *	  the joinrel's pathlist via add_partial_path().
  */
+/*
+ * try_partial_mergejoin_path - (中文)考虑一条并行(partial)归并连接路径,若
+ * 看似有用则加入 joinrel 的 partial_pathlist
+ *
+ * 【作用】try_mergejoin_path() 在 is_partial 为 true 时转入本函数,或由
+ * sort_inner_and_outer() 直接调用。尝试用并行外层 + 并行安全内层生成
+ * partial 归并路径。
+ *
+ * 【设计思想】
+ * - 并行归并要求无横向依赖、外层无参数化、内层也无参数化
+ *   (bms_is_empty(PATH_REQ_OUTER(inner_path))),否则放弃;
+ * - 与 try_mergejoin_path 相同的外层/内层排序需求检测
+ *   (pathkeys_count_contained_in 计算外层已预排序键数,决定是否可用增量
+ *   排序;内层用 pathkeys_contained_in 判定);
+ * - initial_cost_mergejoin() + add_partial_path_precheck() 两阶段过滤;
+ * - 构造时 create_mergejoin_path() 的 required_outer 传 NULL(无参数化)。
+ *
+ * 【参数】
+ *   root          —— PlannerInfo;
+ *   joinrel       —— 目标连接关系;
+ *   outer_path    —— 并行外层路径;
+ *   inner_path    —— 内层路径;
+ *   pathkeys      —— 结果路径的输出排序;
+ *   mergeclauses  —— 归并连接子句;
+ *   outersortkeys —— 外层显式排序键(可为 NIL);
+ *   innersortkeys —— 内层显式排序键(可为 NIL);
+ *   jointype      —— 连接类型;
+ *   extra         —— JoinPathExtraData 上下文。
+ * 【返回值】无(可能把路径加入 joinrel->partial_pathlist)。
+ */
 static void
 try_partial_mergejoin_path(PlannerInfo *root,
 						   RelOptInfo *joinrel,
@@ -1350,6 +1627,31 @@ try_partial_mergejoin_path(PlannerInfo *root,
  *	  Consider a hash join path; if it appears useful, push it into
  *	  the joinrel's pathlist via add_path().
  */
+/*
+ * try_hashjoin_path - (中文)考虑一条哈希连接路径,若看似有用则加入
+ * joinrel 的 pathlist
+ *
+ * 【作用】hash_inner_and_outer() 为每条 (外层, 内层) 候选组合调用本函数
+ * 生成哈希连接路径。哈希连接按定义不产生有序输出,因此 pathkeys 恒为 NIL。
+ *
+ * 【设计思想】与 try_nestloop_path 相似:
+ * - 拒绝参数化中包含本层外层连接 relid 的输入路径;
+ * - 用 calc_non_nestloop_required_outer() 计算必需参数,与 param_source_rels
+ *   无交集则拒绝;
+ * - initial_cost_hashjoin()(parallel_hash 传 false)计算代价下界,经
+ *   add_path_precheck()(pathkeys 传 NIL)快速淘汰后,再
+ *   create_hashjoin_path() 构造完整路径(parallel_hash 传 false)。
+ *
+ * 【参数】
+ *   root       —— PlannerInfo;
+ *   joinrel    —— 目标连接关系;
+ *   outer_path —— 外层路径;
+ *   inner_path —— 内层路径;
+ *   hashclauses —— 哈希连接子句;
+ *   jointype   —— 连接类型;
+ *   extra      —— JoinPathExtraData 上下文。
+ * 【返回值】无(可能把路径加入 joinrel->pathlist)。
+ */
 static void
 try_hashjoin_path(PlannerInfo *root,
 				  RelOptInfo *joinrel,
@@ -1427,6 +1729,36 @@ try_hashjoin_path(PlannerInfo *root,
  *	  hash tables; otherwise the inner path must be complete and a copy of it
  *	  is run in every process to create separate identical private hash tables.
  */
+/*
+ * try_partial_hashjoin_path - (中文)考虑一条并行(partial)哈希连接路径,若
+ * 看似有用则加入 joinrel 的 partial_pathlist
+ *
+ * 【作用】hash_inner_and_outer() 在 joinrel 并行安全时调用本函数,尝试构建
+ * partial 哈希连接:外层必须是 partial 路径。根据 parallel_hash 决定内层
+ * 策略——true 时内层也用 partial 路径并行构造一个或多个共享哈希表;false
+ * 时内层是完整(非 partial)路径,每个 worker 各自复制执行构造一份私有
+ * 哈希表。
+ *
+ * 【设计思想】
+ * - 前置断言:无横向依赖、外层无参数化;内层若有参数化则放弃(并行路径
+ *   不支持参数化);
+ * - initial_cost_hashjoin()(parallel_hash 按实参传入)计算代价下界,经
+ *   add_partial_path_precheck() 快速过滤后,create_hashjoin_path() 构造
+ *   路径(required_outer 为 NULL,parallel_hash 按实参传入)并加入
+ *   partial_pathlist。
+ *
+ * 【参数】
+ *   root          —— PlannerInfo;
+ *   joinrel       —— 目标连接关系;
+ *   outer_path    —— 并行外层路径;
+ *   inner_path    —— 内层路径;
+ *   hashclauses   —— 哈希连接子句;
+ *   jointype      —— 连接类型;
+ *   extra         —— JoinPathExtraData 上下文;
+ *   parallel_hash —— true:内层也是 partial,构建共享哈希表;false:内层完整,
+ *                    每个进程各自建私有哈希表。
+ * 【返回值】无(可能把路径加入 joinrel->partial_pathlist)。
+ */
 static void
 try_partial_hashjoin_path(PlannerInfo *root,
 						  RelOptInfo *joinrel,
@@ -1485,6 +1817,41 @@ try_partial_hashjoin_path(PlannerInfo *root,
  * 'innerrel' is the inner join relation
  * 'jointype' is the type of join to do
  * 'extra' contains additional input values
+ */
+/*
+ * sort_inner_and_outer - (中文)对每种子句排序顺序,显式排序外/内两侧以生成
+ * 归并连接路径
+ *
+ * 【作用】add_paths_to_joinrel() 的第 1 步:两侧都需要显式排序的归并连接。
+ * 若存在可用的归并连接子句,就枚举多种排序顺序,分别调用
+ * try_mergejoin_path() 生成路径。
+ *
+ * 【设计思想】
+ * - 只用最便宜总代价的输入路径(outerrel->cheapest_total_path、
+ *   innerrel->cheapest_total_path):既然假设需要排序,就无需考虑最便宜启动
+ *   路径(那是 match_unsorted_outer 的职责);也刻意不考虑参数化输入路径,
+ *   以免归并路径组合爆炸;
+ * - 若某个 cheapest-total 路径被另一个关系参数化,则无法归并,直接返回;
+ * - joinrel 并行安全且连接类型不是 FULL/RIGHT/RIGHT_ANTI 时,尝试 partial
+ *   归并:取外层 partial 路径与并行安全的内层 cheapest-total 路径;
+ * - 关键技巧:不同归并子句排列会产生不同输出排序,但对高层归并可能各有
+ *   价值,因此把 mergeclause 列表换算成"规范路径键"列表
+ *   (select_outer_pathkeys_for_merge),再让每个 pathkey 依次"打头"、其余
+ *   按原序跟在后面,得到多种排序;对每种排序用
+ *   find_mergeclauses_for_outer_pathkeys() 重新排列子句、用
+ *   make_inner_pathkeys_for_merge() 求内层排序、用 build_join_pathkeys()
+ *   求输出排序,然后调用 try_mergejoin_path()(以及有并行输入时
+ *   try_partial_mergejoin_path());
+ * - try_mergejoin_path() 会检测"路径已有序"的情况,自动省略显式排序。
+ *
+ * 【参数】
+ *   root    —— PlannerInfo;
+ *   joinrel —— 连接关系;
+ *   outerrel —— 外层输入关系;
+ *   innerrel —— 内层输入关系;
+ *   jointype —— 连接类型;
+ *   extra   —— JoinPathExtraData 上下文(含 mergeclause_list)。
+ * 【返回值】无。
  */
 static void
 sort_inner_and_outer(PlannerInfo *root,
@@ -1669,6 +2036,42 @@ sort_inner_and_outer(PlannerInfo *root,
  * some sort key requirements).  So, we consider truncations of the
  * mergeclause list as well as the full list.  (Ideally we'd consider all
  * subsets of the mergeclause list, but that seems way too expensive.)
+ */
+/*
+ * generate_mergejoin_paths - (中文)为给定的外层路径生成各种归并连接路径
+ *
+ * 【作用】match_unsorted_outer() 与 consider_parallel_mergejoin() 对外层
+ * 的每条(已充分排序的)路径调用本函数。它先找与该外层排序匹配的归并子句,
+ * 再分别按"对内层最便宜总代价路径加显式排序"与"复用已预排序的内层路径"
+ * 两种方式构造归并路径。
+ *
+ * 【设计思想】
+ * - 用 find_mergeclauses_for_outer_pathkeys() 得到可用于当前外层排序的子
+ *   句序列;若无(且非 FULL JOIN 的空子句特例)则放弃;
+ * - useallclauses 为 true(右/右反/全连接)时,要求子句必须全部用上,否则
+ *   不能生成合法计划;
+ * - 方案 A:对内层最便宜总代价路径 inner_cheapest_total 加 innersortkeys
+ *   显式排序(若已有序, try_mergejoin_path 会自动省略);
+ * - 方案 B:从完整 innersortkeys 开始,逐轮截短(每轮去掉最后一个排序键),
+ *   用 get_cheapest_path_for_pathkeys 找满足该前缀排序的内层路径,并只保留
+ *   严格更便宜的路径(否则就是故意少用归并键,不是好主意);必要时用
+ *   trim_mergeclauses_for_inner_pathkeys() 截取匹配的子句前缀;
+ * - 分别按 TOTAL_COST 与 STARTUP_COST 两种准则各找一次内层路径;
+ * - is_partial 为 true 时,所有 try_mergejoin_path 调用都会转交给 partial
+ *   版本,且 get_cheapest_path_for_pathkeys 也限定在 partial_pathlist 中找。
+ *
+ * 【参数】
+ *   root               —— PlannerInfo;
+ *   joinrel            —— 连接关系;
+ *   innerrel           —— 内层关系;
+ *   outerpath          —— 外层路径;
+ *   jointype           —— 连接类型;
+ *   extra              —— JoinPathExtraData 上下文;
+ *   useallclauses      —— true 时必须用上全部归并子句;
+ *   inner_cheapest_total —— 内层最便宜总代价路径(排序基准);
+ *   merge_pathkeys     —— 结果路径的输出排序键;
+ *   is_partial         —— true 表示生成并行路径。
+ * 【返回值】无。
  */
 static void
 generate_mergejoin_paths(PlannerInfo *root,
@@ -1910,6 +2313,38 @@ generate_mergejoin_paths(PlannerInfo *root,
  * 'jointype' is the type of join to do
  * 'extra' contains additional input values
  */
+/*
+ * match_unsorted_outer - (中文)为每条"已有序的外层路径"生成嵌套循环与单边
+ * 归并连接路径
+ *
+ * 【作用】add_paths_to_joinrel() 的第 2 步:考虑"外层不必显式排序"的连接,
+ * 包括普通嵌套循环,以及外层已有序的单边归并连接。对每条外层路径,先生成
+ * 嵌套循环变体(普通 / Memoize / 物化),再交给 generate_mergejoin_paths()
+ * 生成归并变体。此外在 joinrel 并行安全时还尝试 partial 嵌套循环与 partial
+ * 归并(consider_parallel_nestloop / consider_parallel_mergejoin)。
+ *
+ * 【设计思想】
+ * - 连接类型分流:嵌套循环只支持 INNER/LEFT/SEMI/ANTI(nestjoinOK);
+ *   RIGHT/RIGHT_ANTI/FULL 只能走归并,且必须 useallclauses;
+ * - 若内层最便宜总代价路径被外层参数化,则置 inner_cheapest_total = NULL
+ *   (它稍后会在 cheapest_parameterized_paths 中被考虑),且若内层是"已唯一化
+ *   的关系"则完全无法在此生成合法路径,直接返回;
+ * - 允许物化时,若内层 cheapest-total 未物化且类型允许,先创建 matpath;
+ * - 外层主循环:跳过被内层参数化的外层路径;用 build_join_pathkeys() 计算
+ *   结果排序;对每条内层 cheapest_parameterized_paths(含无参数化情形)尝试
+ *   普通嵌套循环,再尝试 Memoize 包装;最后尝试物化内层;
+ * - 并行收尾:joinrel 并行安全、无横向依赖、非 FULL/RIGHT/RIGHT_ANTI 时,
+ *   对每条外层 partial 路径尝试 partial 嵌套循环与 partial 归并。
+ *
+ * 【参数】
+ *   root    —— PlannerInfo;
+ *   joinrel —— 连接关系;
+ *   outerrel —— 外层关系;
+ *   innerrel —— 内层关系;
+ *   jointype —— 连接类型;
+ *   extra   —— JoinPathExtraData 上下文。
+ * 【返回值】无。
+ */
 static void
 match_unsorted_outer(PlannerInfo *root,
 					 RelOptInfo *joinrel,
@@ -2132,6 +2567,30 @@ match_unsorted_outer(PlannerInfo *root,
  * 'extra' contains additional input values
  * 'inner_cheapest_total' cheapest total path for innerrel
  */
+/*
+ * consider_parallel_mergejoin - (中文)尝试用并行外层 + 完整内层构建
+ * partial 归并连接路径
+ *
+ * 【作用】match_unsorted_outer() 在 joinrel 并行安全时调用本函数:对外层
+ * 关系的每条 partial 路径,调用 generate_mergejoin_paths()(is_partial 为
+ * true)尝试构建并行归并路径。
+ *
+ * 【设计思想】并行归并的实现方式:外层用 partial 路径(各 worker 并行扫描
+ * 各自的数据分片),内层用一条完整(非 partial)路径(每个 worker 各自执行
+ * 同样的完整内层扫描),二者按归并键归并。每条外层 partial 路径都先计算其
+ * 输出排序 merge_pathkeys,再交给 generate_mergejoin_paths() 用同一内层
+ * 最便宜总代价路径 inner_cheapest_total 生成候选。
+ *
+ * 【参数】
+ *   root               —— PlannerInfo;
+ *   joinrel            —— 连接关系;
+ *   outerrel           —— 外层关系;
+ *   innerrel           —— 内层关系;
+ *   jointype           —— 连接类型;
+ *   extra              —— JoinPathExtraData 上下文;
+ *   inner_cheapest_total —— 内层最便宜总代价路径(并行归并的内层基准)。
+ * 【返回值】无。
+ */
 static void
 consider_parallel_mergejoin(PlannerInfo *root,
 							RelOptInfo *joinrel,
@@ -2171,6 +2630,32 @@ consider_parallel_mergejoin(PlannerInfo *root,
  * 'innerrel' is the inner join relation
  * 'jointype' is the type of join to do
  * 'extra' contains additional input values
+ */
+/*
+ * consider_parallel_nestloop - (中文)尝试用并行外层 + 完整内层构建
+ * partial 嵌套循环连接路径
+ *
+ * 【作用】match_unsorted_outer() 在 joinrel 并行安全时调用本函数:对外层
+ * 关系的每条 partial 路径,遍历内层 cheapest_parameterized_paths 中并行
+ * 安全的内层路径,尝试生成普通与 Memoize 两种 partial 嵌套循环路径,再尝试
+ * 物化内层变体。
+ *
+ * 【设计思想】
+ * - 内层 cheapest-total 路径满足"允许物化、并行安全、未被外层参数化、且
+ *   输出未物化"时,预先创建 matpath(物化路径并行安全);
+ * - 每条外层 partial 路径先用 build_join_pathkeys() 求输出排序;然后对每个
+ *   并行安全的内层候选依次:跳过不合条件者交给 try_partial_nestloop_path()
+ *   生成普通版本;再尝试 get_memoize_path() 生成 Memoize 版本交给
+ *   try_partial_nestloop_path();最后尝试物化版本。
+ *
+ * 【参数】
+ *   root    —— PlannerInfo;
+ *   joinrel —— 连接关系;
+ *   outerrel —— 外层关系;
+ *   innerrel —— 内层关系;
+ *   jointype —— 连接类型;
+ *   extra   —— JoinPathExtraData 上下文。
+ * 【返回值】无。
  */
 static void
 consider_parallel_nestloop(PlannerInfo *root,
@@ -2260,6 +2745,37 @@ consider_parallel_nestloop(PlannerInfo *root,
  * 'innerrel' is the inner join relation
  * 'jointype' is the type of join to do
  * 'extra' contains additional input values
+ */
+/*
+ * hash_inner_and_outer - (中文)用可哈希的连接子句生成哈希连接路径
+ *
+ * 【作用】add_paths_to_joinrel() 的第 4 步:扫描 restrictlist,找出对当前
+ * (outer, inner) 关系组合可用的哈希连接子句,并据此构造哈希连接路径(含
+ * 并行变体)。
+ *
+ * 【设计思想】
+ * - 收集子句:外层连接时只取"自身专有、未下推"的子句(RINFO_IS_PUSHED_DOWN);
+ *   子句必须 can_join 且 hashjoinoperator 有效;必须是 outer/inner 两侧
+ *   恰好落在当前两个关系上(clause_sides_match_join);若子句是
+ *   "inner op outer" 形式,其算子必须有可交换算子(createplan 的
+ *   get_switched_clauses 会把它换成 outer 在左);
+ * - 若无任何可用子句则什么都不做;
+ * - 路径枚举:内层只用 cheapest_total;外层考虑 cheapest_startup 与所有
+ *   cheapest_parameterized_paths(组合时跳过被另一侧参数化的路径,以及已经
+ *   试过的 startup×total 组合);
+ * - 并行变体:joinrel 并行安全、非 RIGHT_SEMI(共享/私有哈希表的 match 标志
+ *   并发不安全)、有外层 partial 路径且无横向依赖时,尝试(1)并行构建共享
+ *   哈希表(内层 partial,enable_parallel_hash);(2)每个进程复制完整内层
+ *   建私有哈希表(FULL/RIGHT/RIGHT_ANTI 时禁止,因无人持有全部 match 位)。
+ *
+ * 【参数】
+ *   root    —— PlannerInfo;
+ *   joinrel —— 连接关系;
+ *   outerrel —— 外层关系;
+ *   innerrel —— 内层关系;
+ *   jointype —— 连接类型;
+ *   extra   —— JoinPathExtraData 上下文(含 restrictlist)。
+ * 【返回值】无。
  */
 static void
 hash_inner_and_outer(PlannerInfo *root,
@@ -2487,6 +3003,40 @@ hash_inner_and_outer(PlannerInfo *root,
  * We examine each restrictinfo clause known for the join to see
  * if it is mergejoinable and involves vars from the two sub-relations
  * currently of interest.
+ */
+/*
+ * select_mergejoin_clauses - (中文)挑选可用于本次连接的归并连接子句
+ *
+ * 【作用】add_paths_to_joinrel() 在需要归并时调用本函数,从 restrictlist
+ * 中挑出对当前 (outer, inner) 组合可用、且可归并的子句,返回 RestrictInfo
+ * 列表。同时通过 *mergejoin_allowed 报告"本次连接整体上是否允许使用归并
+ * 连接"。
+ *
+ * 【设计思想】
+ * - RIGHT_SEMI 暂不支持归并,直接置 *mergejoin_allowed = false;
+ * - 外层连接时只用自身专有(未下推)的子句,下推子句将来作为 otherquals;
+ * - 逐条检查:必须 can_join 且有 mergeopfamilies;两侧 relids 必须恰好对应
+ *   outer/inner(clause_sides_match_join);"inner op outer" 形式算子必须有
+ *   可交换算子;两侧等价类都不得是"必冗余"的 EC(EC_MUST_BE_REDUNDANT,
+ *   冗余 EC 不能出现在规范路径键中);
+ * - 关键副作用:对每条合格子句调用 update_mergeclause_eclasses(),使
+ *   left_ec / right_ec 指向规范 EC,并把 outer_is_left 标记为当前外层一侧
+ *   ——这些是本次 add_paths_to_joinrel() 调用期间的临时标记;
+ * - 归并可用性:*mergejoin_allowed 只在 RIGHT/RIGHT_ANTI/FULL 时才可能为
+ *   false(当存在"非常量且不可归并"的连接子句时),因为执行器对这类连接
+ *   要求所有非归并子句必须是常量(FULL JOIN ON FALSE 的情形);注意该标志
+ *   与"是否存在归并子句"无关——某些情况(如 x FULL JOIN y ON true)需要
+ *   构建无子句的归并连接,返回 NIL 并不等于"不安全"。
+ *
+ * 【参数】
+ *   root              —— PlannerInfo;
+ *   joinrel           —— 连接关系;
+ *   outerrel          —— 外层关系;
+ *   innerrel          —— 内层关系;
+ *   restrictlist      —— 本次连接的子句列表;
+ *   jointype          —— 连接类型;
+ *   mergejoin_allowed —— 出参:本次连接是否允许生成归并连接计划。
+ * 【返回值】可归并子句的 RestrictInfo 列表(可能为空)。
  */
 static List *
 select_mergejoin_clauses(PlannerInfo *root,

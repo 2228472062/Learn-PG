@@ -7,6 +7,45 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本模块(joinrels.c)负责决定"哪些关系应该被连接",即连接关系(joinrel)
+ * 的发现与构建。它是规划器动态规划搜索(standard_join_search)中"自底向上
+ * 枚举连接组合"的一层:给定当前级别 level,把较低级别的 RelOptInfo 两两
+ * 组合出恰好包含 level 个基表的新 RelOptInfo,并为每个新 joinrel 填充路径。
+ *
+ * 【职责】
+ * - join_search_one_level():每一层连接搜索的顶层入口,先做左/右线性连接
+ *   (level-1 关系的连接),再做 2 <= k <= level/2 的 bushy 连接,最后兜底
+ *   强制生成笛卡尔积;
+ * - 通过 make_join_rel() 先验证连接是否合法(join_is_legal 依据
+ *   SpecialJoinInfo 判断外层连接语义、LATERAL 引用等约束),再构建/复用
+ *   joinrel,计算 restrictlist,并依次调用 make_grouped_join_rel() 与
+ *   populate_joinrel_with_paths();
+ * - populate_joinrel_with_paths():按连接类型(INNER/LEFT/FULL/SEMI/ANTI)
+ *   处理 dummy 关系与"常量 FALSE"限制的剪枝,再以两个方向调用 joinpath.c
+ *   的 add_paths_to_joinrel() 生成路径;最后尝试分区剪枝下的
+ *   partitionwise join(try_partitionwise_join());
+ * - 提供 join 顺序约束检测:have_join_order_restriction()、
+ *   has_join_restriction()、has_legal_joinclause();
+ * - 提供"关系已证明为空"的判定与标记:is_dummy_rel() / mark_dummy_rel();
+ * - 支持 eager aggregation(make_grouped_join_rel)与分区连接
+ *   (try_partitionwise_join 及其子函数)。
+ *
+ * 【设计思想】
+ * - 动态规划记忆化:同一组基表可能被多种顺序组合出来,但 joinrel 是唯一
+ *   的(以 join_rel_level[level] 列表去重),后续组合只会在已存在的 joinrel
+ *   上追加路径;
+ * - 连接合法性检查是正确性关键:外层连接不可任意交换输入,半连接可通过对
+ *   RHS 做 unique 化放宽顺序(join_is_legal 的 unique_ified 分支);
+ * - 用 join_cur_level 记录当前层,使新 joinrel 自动加入正确的层列表。
+ *
+ * 【核心数据结构】RelOptInfo(连接关系)、SpecialJoinInfo(连接语义)、
+ * join_rel_level(每层的关系列表)。
+ *
+ * 本文件与 joinpath.c(为 joinrel 生成路径)、pathnode.c(build_join_rel /
+ * create_*_path)、joininfo.c、equivclass.c(等价类)、appendinfo.c
+ * (分区子表映射)紧密配合。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/path/joinrels.c
  *
@@ -73,6 +112,36 @@ static void get_matching_part_pairs(PlannerInfo *root, RelOptInfo *joinrel,
  * root->join_rel_level[j], 1 <= j < level, is a list of rels containing j items
  *
  * The result is returned in root->join_rel_level[level].
+ */
+/*
+ * join_search_one_level - (中文)搜索并构建恰好包含 level 个 jointree 项的
+ * 所有连接关系(动态规划的一步)
+ *
+ * 【作用】standard_join_search() 对 level = 2, 3, ... 逐层调用本函数,考虑
+ * 所有产生"含 level 个基表"连接关系的方式,创建相应 joinrel 及其实现路径,
+ * 结果放入 root->join_rel_level[level]。这是 joinrels.c 的顶层入口,也是
+ * GEQO 之外的标准连接搜索的核心。
+ *
+ * 【设计思想】三个阶段:
+ * 1. 左/右线性连接:把 level-1 层的每个关系与初始关系(joinrels[1])连接;
+ *    若该关系有连接子句、等价类连接或连接顺序限制,只与存在子句/限制的
+ *    初始关系连接(make_rels_by_clause_joins);否则生成笛卡尔积
+ *    (make_rels_by_clauseless_joins)。level 2 时对称性使只用"当前项之后"
+ *    的初始关系即可(first_rel = foreach_current_index(r) + 1),因为镜像
+ *    组合由 make_join_rel 自动处理;
+ * 2. bushy 连接:对 2 <= k <= level-2,把 k 个与 level-k 个基表的关系两两
+ *    连接,只处理到中点(k > other_level 时 break,利用对称性);只有存在
+ *    相关连接子句或连接顺序限制时才组合,避免规划时间爆炸;
+ * 3. 兜底笛卡尔积:若上述两步未生成任何 level 层关系(例如某个子问题里
+ *    所有子句都指向子问题之外),强制对 level-1 层每个关系做笛卡尔积;
+ *    若仍失败且无特殊连接、无 LATERAL,则报错(理论上不应发生)。
+ * 每步都维护 root->join_cur_level = level,使 build_join_rel 创建的新
+ * joinrel 自动落入正确的层列表。
+ *
+ * 【参数】
+ *   root  —— PlannerInfo(其 join_rel_level 数组按层存放关系列表);
+ *   level —— 本层要构建的关系大小(含基表个数)。
+ * 【返回值】无(结果写入 root->join_rel_level[level])。
  */
 void
 join_search_one_level(PlannerInfo *root, int level)
@@ -281,6 +350,31 @@ join_search_one_level(PlannerInfo *root, int level)
  * Currently, this is only used with initial rels in other_rels, but it
  * will work for joining to joinrels too.
  */
+/*
+ * make_rels_by_clause_joins - (中文)把给定关系与"有连接子句/顺序限制的
+ * 其他关系"逐个构建连接关系
+ *
+ * 【作用】join_search_one_level() 在线性连接阶段,对每个带连接子句或
+ * 顺序限制的 old_rel 调用本函数:从 other_rels 中(从 first_rel_idx 起)
+ * 找出与 old_rel 无重叠、且存在相关连接子句或有连接顺序限制的其他关系,
+ * 逐个调用 make_join_rel() 构建连接关系。
+ *
+ * 【设计思想】
+ * - 过滤条件:relids 不重叠(不能自连接),且
+ *   have_relevant_joinclause() 或 have_join_order_restriction() 至少其一
+ *   为真——没有子句/限制时本就不该走这条路径;
+ * - first_rel_idx 用于 level 2 的对称剪枝:跳过列表前面的关系,因为反向
+ *   组合已经处理过;
+ * - 生成的新 joinrel 会经由 make_join_rel → build_join_rel 自动加入
+ *   root->join_rel_level[join_cur_level]。
+ *
+ * 【参数】
+ *   root         —— PlannerInfo;
+ *   old_rel      —— 待连接的关系;
+ *   other_rels   —— 候选其他关系列表;
+ *   first_rel_idx —— 从 other_rels 中开始考虑的下标(跳过已处理者)。
+ * 【返回值】无。
+ */
 static void
 make_rels_by_clause_joins(PlannerInfo *root,
 						  RelOptInfo *old_rel,
@@ -314,6 +408,26 @@ make_rels_by_clause_joins(PlannerInfo *root,
  *
  * Currently, this is only used with initial rels in other_rels, but it would
  * work for joining to joinrels too.
+ */
+/*
+ * make_rels_by_clauseless_joins - (中文)把给定关系与所有未包含的其他关系
+ * 构建笛卡尔积连接关系
+ *
+ * 【作用】join_search_one_level() 对"无任何连接子句/顺序限制"的关系,以及
+ * 兜底阶段的全部关系调用本函数:把 old_rel 与 other_rels 中每个 relids 不
+ * 重叠的关系都做一次 make_join_rel()(即笛卡尔积连接),尽力避免遗漏任何
+ * 可行计划。
+ *
+ * 【设计思想】这是最宽松的搜索:不做任何子句过滤,只要 relids 不重叠就
+ * 尝试连接。level 2 时若存在多个无子句的初始关系,可能在两个方向上重复
+ * 尝试(不过这类情形不常见,不值得为此增加复杂度去去重)。生成的 joinrel
+ * 仍由 make_join_rel 负责合法性检查与路径填充。
+ *
+ * 【参数】
+ *   root       —— PlannerInfo;
+ *   old_rel    —— 待连接的关系;
+ *   other_rels —— 候选其他关系列表。
+ * 【返回值】无。
  */
 static void
 make_rels_by_clauseless_joins(PlannerInfo *root,

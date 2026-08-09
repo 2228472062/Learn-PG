@@ -8,6 +8,32 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件提供 PlaceHolderVar(PHV)与 PlaceHolderInfo(PHI)的操纵例程。
+ * PHV 是在子查询上拉(pullup)过程中产生的占位符节点:当一个本该在低层
+ * 查询中计算的表达式被提升到上层查询后,就用一个 PHV 包裹该表达式,并
+ * 记录它"应该在何处计算"(phrels 语法位置)、"哪些关系引用它"等信息,
+ * 供规划器在正确的扫描/连接层把它算出来。
+ *
+ * 【核心数据结构】
+ * - PlaceHolderVar(PHV):表达式树里的节点,含 phexpr(被包裹的表达式)、
+ *   phrels(语法作用域)、phnullingrels(其上方的可置空外连接集合)、
+ *   phlevelsup、phid(全局唯一编号);
+ * - PlaceHolderInfo(PHI):规划期的登记信息,含 ph_eval_at(应在哪组关系
+ *   之上计算)、ph_lateral(其中的 LATERAL 引用)、ph_needed(哪些上层
+ *   关系还需要它)、ph_width(宽度估算)。PHI 同时链入 root->placeholder_list
+ *   与以 phid 为下标的 root->placeholder_array,以便按 phid 快速查找。
+ *
+ * 【主要函数关系】
+ * make_placeholder_expr 负责创建 PHV;find_placeholder_info 负责按 PHV
+ * 查找/创建 PHI;find_placeholders_in_jointree(+递归子函数)在 jointree
+ * 里搜集所有 PHV 并建立对应 PHI;fix_placeholder_input_needed_levels 与
+ * rebuild_placeholder_attr_needed 保证 PHV 的输入在最需要的层可见;
+ * add_placeholders_to_base_rels / add_placeholders_to_joinrel 把 PHV 加进
+ * 相应关系的关系目标列;contain_placeholder_references_to 判断子句是否
+ * 引用了某(外连接)关系的 PHV;get_placeholder_nulling_relids 计算能
+ * 置空某 PHV 的外连接集合;strip_noop_phvs 系列用于剥掉"无操作"PHV。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/util/placeholder.c
  *
@@ -52,6 +78,24 @@ static Node *strip_noop_phvs_mutator(Node *node, void *context);
  * only root->glob; messing with other parts of PlannerInfo would be
  * likely to do the wrong thing.
  */
+/*
+ * make_placeholder_expr - (中文)为给定表达式创建一个 PlaceHolderVar
+ *
+ * 【作用】把 expr 包装成 PHV 节点并返回,供子查询上拉等场景使用。调用者
+ * 后续负责按需调整 phlevelsup 与 phnullingrels。该函数只改写
+ * root->glob(递增 lastPHId 取得全局唯一 phid),不碰 PlannerInfo 的其他
+ * 部分——因为此刻尚不确定该 PHV 属于哪个查询层,乱动会出错。
+ *
+ * 【设计思想】phid 取自全局计数器 root->glob->lastPHId 并自增,保证整个
+ * 计划里每个 PHV 有唯一编号,可用于数组索引与相等比较。phrels 是"语法
+ * 位置"——即该表达式原本出现在哪组关系的范围内,决定它最迟可在哪里求值。
+ *
+ * 【参数】
+ *   root   —— 规划上下文,使用其 glob->lastPHId 分配编号;
+ *   expr   —— 被包裹的原始表达式;
+ *   phrels —— 表达式的语法作用域(关系 id 的位图)。
+ * 【返回值】新构造的 PlaceHolderVar 节点。
+ */
 PlaceHolderVar *
 make_placeholder_expr(PlannerInfo *root, Expr *expr, Relids phrels)
 {
@@ -80,6 +124,32 @@ make_placeholder_expr(PlannerInfo *root, Expr *expr, Relids phrels)
  * simplified query passed to query_planner().
  *
  * Note: this should only be called after query_planner() has started.
+ */
+/*
+ * find_placeholder_info - (中文)按 PHV 查找(必要时创建)对应的
+ * PlaceHolderInfo
+ *
+ * 【作用】规划期(在 query_planner 开始之后、placeholdersFrozen 置位之前)
+ * 根据 PHV 取得/创建其 PHI。若 PHI 尚不存在则创建并登记;若集合已冻结
+ * (placeholdersFrozen)仍发现新 PHV,说明逻辑错误,直接报错。
+ *
+ * 【设计思想】与 make_placeholder_expr 分开的原因:子查询上拉会为"上层
+ * 查询可能根本不用、或经常量化简后可能消失"的表达式创建 PHV,但只有
+ * 最终留在简化查询里的 PHV 才值得建 PHI。创建 PHI 时要算三组关系集合:
+ * - ph_lateral = 表达式引用的、但位于语法作用域之外的关系(即 LATERAL
+ *   引用),它们应算入 lateral 依赖但不影响 eval_at;
+ * - ph_eval_at = 引用关系与语法作用域的交集,即"最早可在哪里求值";
+ *   若为空(表达式不含任何 Var,或引用的全是作用域外的关系),则强制在
+ *   语法位置求值。
+ * 该 PHI 同时加入 placeholder_list 与按 phid 索引的 placeholder_array
+ * (数组按需翻倍扩容),因此注意:不能把整个 placeholder_list 交给
+ * expression_tree_mutator 之类的工具处理,否则数组与列表会失去一致性。
+ * 创建后立即递归处理其内含的低层 PHV,确保它们也有 PHI。
+ *
+ * 【参数】
+ *   root —— 规划上下文;
+ *   phv  —— 要查找/登记其 PHI 的 PlaceHolderVar(要求 phlevelsup == 0)。
+ * 【返回值】对应的 PlaceHolderInfo(新建或已存在)。
  */
 PlaceHolderInfo *
 find_placeholder_info(PlannerInfo *root, PlaceHolderVar *phv)
@@ -183,6 +253,21 @@ find_placeholder_info(PlannerInfo *root, PlaceHolderVar *phv)
  * We don't need to look at the targetlist because build_base_rel_tlists()
  * will already have made entries for any PHVs in the tlist.
  */
+/*
+ * find_placeholders_in_jointree - (中文)扫描 jointree,为其中的每个 PHV
+ * 建立 PlaceHolderInfo
+ *
+ * 【作用】由 query_planner 在冻结 PHI 集合之前调用:只要查询里出现过 PHV
+ * (root->glob->lastPHId != 0),就递归遍历 jointree 找出所有 PHV 并调用
+ * find_placeholder_info 建立登记信息。
+ *
+ * 【设计思想】无需检查目标列表——build_base_rel_tlists 已经为 tlist 中的
+ * PHV 建过 PHI。递归从解析树的 jointree 顶部(FromExpr)开始,沿 fromlist
+ * 与 JoinExpr 的左右子树深入,处理各层 quals。
+ *
+ * 【参数】root —— 规划上下文。
+ * 【返回值】无。
+ */
 void
 find_placeholders_in_jointree(PlannerInfo *root)
 {
@@ -204,6 +289,22 @@ find_placeholders_in_jointree(PlannerInfo *root)
  *	  One recursion level of find_placeholders_in_jointree.
  *
  * jtnode is the current jointree node to examine.
+ */
+/*
+ * find_placeholders_recurse - (中文)find_placeholders_in_jointree 的一层
+ * 递归
+ *
+ * 【作用】按节点类型分派:RangeTblRef 无 quals 直接返回;FromExpr 先递归
+ * 处理 fromlist 中的子连接,再处理顶层 quals;JoinExpr 先递归左右子树,
+ * 再处理本连接层的 quals。未知节点类型报错。
+ *
+ * 【设计思想】先深后横的顺序保证下层连接中的 PHV 先被登记,从而在递归
+ * 返回处理上层 quals 时,若有嵌套 PHV 依赖也能按正确顺序建立。
+ *
+ * 【参数】
+ *   root   —— 规划上下文;
+ *   jtnode —— 当前 jointree 节点。
+ * 【返回值】无。
  */
 static void
 find_placeholders_recurse(PlannerInfo *root, Node *jtnode)
@@ -255,6 +356,22 @@ find_placeholders_recurse(PlannerInfo *root, Node *jtnode)
  *		Find all PlaceHolderVars in the given expression, and create
  *		PlaceHolderInfo entries for them.
  */
+/*
+ * find_placeholders_in_expr - (中文)在给定表达式中找出所有 PHV 并为其
+ * 创建 PlaceHolderInfo
+ *
+ * 【作用】用 pull_var_clause 提取表达式中所有 Var 与 PHV(含聚合、窗口
+ * 函数内部),对每个 PHV 调用 find_placeholder_info 登记;普通 Var 忽略。
+ *
+ * 【设计思想】pull_var_clause 比实际需要的功能更强,但现成且方便。标记
+ * PVC_INCLUDE_PLACEHOLDERS 保证 PHV 也被视为"变量"一并取出。用完的
+ * vars 列表要 list_free 释放。
+ *
+ * 【参数】
+ *   root —— 规划上下文;
+ *   expr —— 待扫描的表达式树。
+ * 【返回值】无。
+ */
 static void
 find_placeholders_in_expr(PlannerInfo *root, Node *expr)
 {
@@ -298,6 +415,22 @@ find_placeholders_in_expr(PlannerInfo *root, Node *expr)
  * PlaceHolderInfos; that's okay because we don't examine ph_needed here, so
  * there are no ordering issues to worry about.
  */
+/*
+ * fix_placeholder_input_needed_levels - (中文)修正占位符输入在"何处需要
+ * 被提供"的层位标记
+ *
+ * 【作用】在确定所有 PHV 的 ph_eval_at 之后调用:对每个 PHV,将其内部
+ * 引用的所有 Var/PHV 标记为"在 ph_eval_at 这一层(扫描或连接)就必须可
+ * 用",即加入相应关系的目标列表(add_vars_to_targetlist)。看似扫描层
+ * 的求值无关紧要,实则不然:PHV 表达式里的 LATERAL 引用必须让被引用
+ * 的 Var/PHV 在对应扫描层被标记为需要。
+ *
+ * 【设计思想】本循环会修改其他 PHI 的 ph_needed 集合,但由于本函数从不
+ * 读 ph_needed,因此处理顺序无关紧要,不会有次序依赖问题。
+ *
+ * 【参数】root —— 规划上下文,遍历 root->placeholder_list。
+ * 【返回值】无。
+ */
 void
 fix_placeholder_input_needed_levels(PlannerInfo *root)
 {
@@ -324,6 +457,22 @@ fix_placeholder_input_needed_levels(PlannerInfo *root)
  * useless outer join.  It should match what
  * fix_placeholder_input_needed_levels did, except that we call
  * add_vars_to_attr_needed not add_vars_to_targetlist.
+ */
+/*
+ * rebuild_placeholder_attr_needed - (中文)重建 PHV 内 Var/PHV 的
+ * attr_needed 位
+ *
+ * 【作用】当移除一个无用的外连接后,基表列的 attr_needed 位图需要重建:
+ * 本函数对每个 PHV 重做 fix_placeholder_input_needed_levels 的工作,区别
+ * 是改用 add_vars_to_attr_needed 而非 add_vars_to_targetlist。
+ *
+ * 【设计思想】逻辑与 fix_placeholder_input_needed_levels 保持一一对应,
+ * 只是写入的目标不同——前者把依赖记到关系目标列(最终进入计划),后者
+ * 只重算 attr_needed 位(供后续去除无用列使用)。任何一处改动都须与
+ * 对方同步。
+ *
+ * 【参数】root —— 规划上下文。
+ * 【返回值】无。
  */
 void
 rebuild_placeholder_attr_needed(PlannerInfo *root)
@@ -353,6 +502,23 @@ rebuild_placeholder_attr_needed(PlannerInfo *root)
  * join removal happens in between, and can change the ph_eval_at sets.  There
  * is essentially the same logic in add_placeholders_to_joinrel, but we can't
  * do that part until joinrels are formed.
+ */
+/*
+ * add_placeholders_to_base_rels - (中文)把需要在基表之上计算的 PHV 加入
+ * 该基表的关系目标列
+ *
+ * 【作用】对每个"可在单个基表上计算(ph_eval_at 只有一个成员)且其上仍有
+ * 需要者(ph_needed 超出 eval_at)"的 PHV,复制一份 PHV 追加到该基表的
+ * reltarget->exprs,让扫描层把它算出来供上层使用。
+ *
+ * 【设计思想】必须独立于 fix_placeholder_input_needed_levels 的原因:两者
+ * 之间隔着一个"外连接消除"(join removal)阶段,它可能改变 ph_eval_at
+ * 集合。扫描层算出的值尚未被任何外连接置空,故断言 phnullingrels 为空。
+ * 复制 PHV 也许多余,但保持安全习惯。关系目标列的成本与宽度字段稍后由
+ * 其他模块统一更新。
+ *
+ * 【参数】root —— 规划上下文。
+ * 【返回值】无。
  */
 void
 add_placeholders_to_base_rels(PlannerInfo *root)
@@ -397,6 +563,34 @@ add_placeholders_to_base_rels(PlannerInfo *root)
  * in either join input rel, so we need add only newly-computable ones to
  * the targetlist.  However, direct_lateral_relids must be updated for every
  * PHV computable at or below this join, as explained below.
+ */
+/*
+ * add_placeholders_to_joinrel - (中文)把"在本次连接处新可计算"的 PHV 加入
+ * 连接关系的目标列,并维护其 LATERAL 依赖
+ *
+ * 【作用】由 build_join_rel 在创建连接关系时调用。两个输入关系已经贡献了
+ * 各自目标列里算好的 PHV,本函数只需补充"在本次连接处才首次可计算、且
+ * 上方仍需要"的 PHV;同时无论是否真正输出,都要把 PHV 的 LATERAL 源关系
+ * 并入 joinrel->direct_lateral_relids。
+ *
+ * 【设计思想】
+ * - 计算位置判定:ph_eval_at ⊆ joinrel->relids 说明本层(或之下)可算;
+ *   ph_needed 仍包含本层之上需要者,则应当输出;
+ * - 是否重复计费:仅当 ph_eval_at 不能被子集到任一输入关系时,才在目标列
+ *   追加 PHV 并计入其求值代价。注意这是基于"第一个考察到的输入对"做出的
+ *   决定,对其他输入对可能造成重复计费——当前接受此近似,将来可针对每个
+ *   输入对重算目标列代价;
+ * - direct_lateral_relids 必须无条件并入 ph_lateral,否则 join_is_legal
+ *   会拒绝合法的连接顺序。虽然调用者 build_join_rel 稍后会去掉本连接
+ *   自己的 relids,但这里只需累加即可。
+ *
+ * 【参数】
+ *   root      —— 规划上下文;
+ *   joinrel   —— 新建立的连接关系;
+ *   outer_rel —— 外部输入关系;
+ *   inner_rel —— 内部输入关系;
+ *   sjinfo    —— 描述本次连接的 SpecialJoinInfo(本函数当前不使用)。
+ * 【返回值】无。
  */
 void
 add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
@@ -489,6 +683,26 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
  * The code here to cope with upper-level PHVs is likely dead, but keep it
  * anyway just in case.
  */
+/*
+ * contain_placeholder_references_to - (中文)判断给定子句中是否有 PHV 包含
+ * 对指定 relid(通常是某个外连接的 relid)的引用
+ *
+ * 【作用】在规划阶段,当想知道"把某个外连接置空之后是否会改变该子句的
+ * 计算结果"时使用:只要子句内某个 PHV 的内含表达式用到了 relid,答案
+ * 就为真。典型调用者见外连接消除逻辑。
+ *
+ * 【设计思想】先快速判断:查询里根本没有 PHV(lastPHId == 0)直接返回
+ * false。否则用 contain_placeholder_references_walker 递归扫描。对"同层"
+ * PHV 只需检查其 phrels 是否包含 relid——phrels 已经概括了内含表达式
+ * 引用的关系,不必再下钻 phexpr,也不必看 phnullingrels(那表示之后的外
+ * 连接置空,不是内含引用)。处理上层查询(Query)时维护 sublevels_up。
+ *
+ * 【参数】
+ *   root   —— 规划上下文;
+ *   clause —— 待扫描的表达式;
+ *   relid  —— 关心的关系 id。
+ * 【返回值】true:子句中有 PHV 内含对该 relid 的引用;false:没有。
+ */
 bool
 contain_placeholder_references_to(PlannerInfo *root, Node *clause,
 								  int relid)
@@ -504,6 +718,24 @@ contain_placeholder_references_to(PlannerInfo *root, Node *clause,
 	return contain_placeholder_references_walker(clause, &context);
 }
 
+/*
+ * contain_placeholder_references_walker - (中文)
+ * contain_placeholder_references_to 的递归遍历器
+ *
+ * 【作用】expression_tree_walker 风格的深度优先遍历:命中"同层"PHV 时,
+ * 检查其 phrels 是否含目标 relid;遇到 Query 节点时递增 sublevels_up 递归
+ * 其内部(处理 RTE 子查询或尚未规划的子链接子查询)。
+ *
+ * 【设计思想】对 PHV 只判断 phrels 而不下钻内含表达式,是刻意为之——
+ * phrels 已足以概括表达式的引用关系。对跨层 PHV(phlevelsup !=
+ * sublevels_up)直接放行(看作普通节点继续遍历)。处理上层 Query 的逻辑
+ * 在单层规划中可能用不到,但保留以防万一。
+ *
+ * 【参数】
+ *   node    —— 当前访问的节点;
+ *   context —— 携带 relid 与当前 sublevels_up。
+ * 【返回值】true 表示已发现目标引用(可提前终止遍历)。
+ */
 static bool
 contain_placeholder_references_walker(Node *node,
 									  contain_placeholder_references_context *context)
@@ -556,6 +788,26 @@ contain_placeholder_references_walker(Node *node,
  * at most once per query, so there's little value in doing otherwise.  If it
  * ever gains more widespread use, perhaps we should cache the result in
  * PlaceHolderInfo.
+ */
+/*
+ * get_placeholder_nulling_relids - (中文)计算能够置空给定 PHV 的外连接
+ * relid 集合
+ *
+ * 【作用】对 PHV 而言,任何在 ph_eval_at 之上、且能置空其任一组件的变量
+ * 的外连接,都能影响该 PHV 最终结果。本函数算出"应该包含在 PHV 的
+ * phnullingrels 里"的那些外连接,供外层在 PHV 被提升/复制时设置
+ * nullingrels。
+ *
+ * 【设计思想】类比 Var 的 RelOptInfo.nulling_relids,但这里按需现场计算
+ * 而非预存:因为目前每个查询最多用一次,不值得缓存。算法:对 ph_eval_at
+ * 中每个基表 relid,取其 nulling_relids 求并;跳过 RTE_GROUP 的伪 RTE 与
+ * 本身就是外连接占位的 relid(它们已在 outer_join_rels 中);最后去掉
+ * 已包含在 ph_eval_at 中的外连接(那些在求值点之下,不会置空结果)。
+ *
+ * 【参数】
+ *   root   —— 规划上下文;
+ *   phinfo —— 目标 PlaceHolderInfo。
+ * 【返回值】能置空该 PHV 的外连接 relid 位图。
  */
 Relids
 get_placeholder_nulling_relids(PlannerInfo *root, PlaceHolderInfo *phinfo)
@@ -610,6 +862,23 @@ get_placeholder_nulling_relids(PlannerInfo *root, PlaceHolderInfo *phinfo)
  * invoked only if a candidate is found, avoiding unnecessary memory allocation
  * and tree copying in the common case where no PlaceHolderVars are present.
  */
+/*
+ * strip_noop_phvs - (中文)从表达式树中剥掉"无操作"的 PlaceHolderVar
+ *
+ * 【作用】在扫描层表达式(如索引键、分区键匹配)中,未被标记为可置空
+ * (phnullingrels 为空)的 PHV 其实是个空转包装——它不改变计算结果。本
+ * 函数把这类 PHV 替换为其内含表达式,使底层表达式"露出真容",便于与
+ * 索引键/分区键比对。子查询上拉时会把表达式包进 PHV,故需要此清理。
+ *
+ * 【设计思想】重要前提:调用者必须保证该表达式确为扫描层表达式,否则
+ * 这些 PHV 并非空转,不可剥除。剥离是递归的(PHV 可嵌套或与其他节点交
+ * 错),须剥到最底层。性能优化:先跑轻量的 contain_noop_phv_walker 探测
+ * 是否存在可剥 PHV,没有则原样返回节点(避免无谓的复制/内存分配);只有
+ * 命中才调用耗时的 strip_noop_phvs_mutator。
+ *
+ * 【参数】node —— 待处理的表达式树。
+ * 【返回值】剥除后(或原样)的表达式树。
+ */
 Node *
 strip_noop_phvs(Node *node)
 {
@@ -627,6 +896,21 @@ strip_noop_phvs(Node *node)
  *
  * We identify a PlaceHolderVar as strippable only if its phnullingrels is
  * empty.
+ */
+/*
+ * contain_noop_phv_walker - (中文)探测树中是否存在可剥离的 PHV
+ *
+ * 【作用】strip_noop_phvs 的快速预检:只要发现一个 phnullingrels 为空的
+ * PHV 就返回 true,让上层决定是否进入代价较高的 mutator。
+ *
+ * 【设计思想】判定标准与 strip_noop_phvs_mutator 完全一致(空 nullingrels
+ * 才可剥),保证预检与执行不会出现偏差。用 expression_tree_walker 遍历,
+ * 命中即短路返回。
+ *
+ * 【参数】
+ *   node    —— 当前访问节点;
+ *   context —— 未使用,预留。
+ * 【返回值】true:存在可剥离的 PHV;false:不存在。
  */
 static bool
 contain_noop_phv_walker(Node *node, void *context)
