@@ -465,6 +465,40 @@ make_rels_by_clauseless_joins(PlannerInfo *root,
  * *reversed_p is set true if the given relations need to be swapped to
  * match the SpecialJoinInfo node.
  */
+/*
+ * join_is_legal - (中文)判断一个候选连接是否合法,并确定其连接类型
+ *
+ * 【作用】make_join_rel() 在构建 joinrel 之前调用本函数:根据查询的连接
+ * 顺序约束(尤其是外层连接 SpecialJoinInfo 与 LATERAL 引用)判断 rel1 与
+ * rel2 的连接是否允许。合法时返回 true,并通过 *sjinfo_p 给出对应的
+ * SpecialJoinInfo(纯内连接时为 NULL)、通过 *reversed_p 说明是否需要交换
+ * rel1/rel2 以匹配该 SJ 的左右手侧。
+ *
+ * 【设计思想】逐条扫描 root->join_info_list,对每个与候选连接有关的 SJ
+ * (其 RHS 与 joinrelids 有交集、候选连接未被 RHS 完全包含、SJ 也未在任一
+ * 输入内完成)分情形判定:
+ * - rel1 含其 min_lefthand 且 rel2 含其 min_righthand(或反序):可以在本
+ *   连接实现该 SJ,记下 match_sjinfo 与 reversed;若匹配到两个 SJ 则非法;
+ * - SEMI 且某输入恰好等于 syn_righthand 且可 unique 化:通过对 RHS 做
+ *   unique 化把半连接降级为内连接,放宽连接顺序(如 C 较小可先与 A 连、
+ *   再与 B 连),记 unique_ified;
+ * - 其余情形:SJ 的 RHS 已被部分违反。若两个输入都与 RHS 有交集,视为
+ *   此前已被允许的违规,继续;否则只有该 SJ 是 LEFT 且候选连接不触及 LHS
+ *   时才可能"并入其 RHS",并置 must_be_leftjoin 要求随后匹配的 SJ 必须是
+ *   LEFT 且 lhs_strict(本质对应外层连接恒等式 3);
+ * - LATERAL 检查:两个输入互相横向引用则非法;单向引用必须用嵌套循环实现
+ *   (匹配的 SJ 不得是 FULL / reversed / unique_ified 情形)且必须是直接
+ *   引用(间接引用拒绝);最后用 min_join_parameterization() 计算连接最小
+ *   参数化,若其中某个关系会落到某个外层连接的 RHS 内侧(不可连接),非法。
+ *
+ * 【参数】
+ *   root        —— PlannerInfo;
+ *   rel1, rel2  —— 候选连接的两个输入关系;
+ *   joinrelids  —— 两者的 relids 并集(不含可能需在此执行的外层连接 RT 索引);
+ *   sjinfo_p    —— 出参:关联的 SpecialJoinInfo(纯内连接为 NULL);
+ *   reversed_p  —— 出参:是否需要交换 rel1/rel2 以匹配 SJ。
+ * 【返回值】true:连接合法;false:非法(调用方应放弃该连接路径)。
+ */
 static bool
 join_is_legal(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 			  Relids joinrelids,
@@ -774,6 +808,25 @@ join_is_legal(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
  * least the information of which relations are being joined.  So we initialize
  * that information here.
  */
+/*
+ * init_dummy_sjinfo - (中文)为一次纯内连接初始化一个"哑" SpecialJoinInfo
+ *
+ * 【作用】普通内连接在 join_info_list 中没有对应的 SpecialJoinInfo,但若干
+ * 连接规划函数(如 make_join_rel 内为选择率估算准备的 sjinfo_data)需要一
+ * 个至少能说明"连接了哪些关系"的 SpecialJoinInfo。本函数就把给定结构按
+ * 左/右关系填充成最简内连接语义。
+ *
+ * 【设计思想】除了把两侧 relids 同时填进 min_/syn_lefthand/righthand 并把
+ * jointype 置为 JOIN_INNER、ojrelid 置 0(表示无外层连接)之外,其余字段
+ * (lhs_strict、semi_* 等)不做有效处理——因为它们只对真正的特殊连接有意义,
+ * 哑节点用不到。commute_* 指针置 NULL 表示没有可交换的外层连接。
+ *
+ * 【参数】
+ *   sjinfo      —— 待填充的 SpecialJoinInfo(通常位于调用者栈上);
+ *   left_relids —— 左侧关系的 relids;
+ *   right_relids —— 右侧关系的 relids。
+ * 【返回值】无。
+ */
 void
 init_dummy_sjinfo(SpecialJoinInfo *sjinfo, Relids left_relids,
 				  Relids right_relids)
@@ -808,6 +861,33 @@ init_dummy_sjinfo(SpecialJoinInfo *sjinfo, Relids left_relids,
  * NB: will return NULL if attempted join is not valid.  This can happen
  * when working with outer joins, or with IN or EXISTS clauses that have been
  * turned into joins.
+ */
+/*
+ * make_join_rel - (中文)查找或创建两个关系连接的 RelOptInfo,并为其添加
+ * 路径信息
+ *
+ * 【作用】join_search_one_level() 及其辅助函数在确定"值得尝试某对关系"后
+ * 调用本函数:构建/复用 joinrel,计算 restrictlist,并在其上填充以该两关系
+ * 为外/内输入生成的路径。若连接非法(如违反外层连接语义),返回 NULL。
+ *
+ * 【设计思想】核心流程:
+ * 1. 计算 joinrelids = rel1 ∪ rel2,调 join_is_legal() 判定合法性并取
+ *    sjinfo / reversed;
+ * 2. 用 add_outer_joins_to_relids() 把需要在本次连接中结算的外层连接 relid
+ *    加进 joinrelids,形成规范标识,并把被"下推"进 RHS 的 SJ 追加到
+ *    pushed_down_joins;
+ * 3. 若需要则交换 rel1/rel2 以匹配 SJ;纯内连接时构造哑 sjinfo;
+ * 4. build_join_rel() 查找或构建 joinrel 并计算 restrictlist;
+ * 5. 若该 joinrel 已被证明为空(is_dummy_rel),无需再考虑路径;
+ * 6. 否则依次 make_grouped_join_rel()(eager aggregation)与
+ *    populate_joinrel_with_paths()(为 rel1×rel2 与 rel2×rel1 生成路径)。
+ * 注意 joinrel 可能已被其他 (rel1', rel2') 组合创建过,本函数只负责追加
+ * 路径。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel1, rel2 —— 两个待连接的输入关系(relids 不得重叠,有断言)。
+ * 【返回值】构建出的连接关系 RelOptInfo;连接非法时返回 NULL。
  */
 RelOptInfo *
 make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
@@ -909,6 +989,37 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
  * added to the result along with sjinfo's own relid.  If pushed_down_joins
  * is not NULL, then also the SpecialJoinInfos for such added outer joins will
  * be appended to *pushed_down_joins (so caller must initialize it to NIL).
+ */
+/*
+ * add_outer_joins_to_relids - (中文)把本次连接将结算的外层连接 relid 加入
+ * relids 集合,构成连接的规范标识
+ *
+ * 【作用】make_join_rel() 调用本函数:在输入 relids 并集(input_relids)的
+ * 基础上,加入"将在本次连接中被计算出来"的外层连接的 relid(含按外层连接
+ * 恒等式 3 被下推、现在该补算的连接),形成连接的规范 relids。可选地把这些
+ * 被补算 SJ 的 SpecialJoinInfo 追加到 *pushed_down_joins。
+ *
+ * 【设计思想】
+ * - 若非外层连接(无 ojrelid),直接返回原集合;
+ * - 非 LEFT 连接没有交换执行规则,只需加上自身 ojrelid 后返回(此时其
+ *   commute_below_l / commute_above_l 必为空);
+ * - LEFT 连接:仅当"下交换"条件满足(commute_below_l ⊆ input_relids)才能
+ *   加上自身 relid;否则该 OJ 是被推进更低层 LEFT 连接的 RHS,不能声称其
+ *   输出已完成;
+ * - 若该 OJ 曾允许"上交换"(commute_above_l 非空),则遍历 join_info_list,
+ *   把同样满足结算条件(ojrelid ∈ commute_above_rels、min_lefthand/
+ *   min_righthand/commute_below_l 都已就绪)的被下推 LEFT 连接一并加入;
+ *   由于 join_info_list 自底向上构建,一遍遍历即可(本次加入的 ojrelid 不会
+ *   影响更早迭代的判断),并递归扩展 commute_above_rels。
+ *
+ * 【参数】
+ *   root             —— PlannerInfo;
+ *   input_relids     —— 两个输入关系的 relids 并集(会被原地修改并返回,
+ *                       调用方如需保留须先 bms_copy);
+ *   sjinfo           —— 本次进行的连接对应的 SpecialJoinInfo;
+ *   pushed_down_joins —— 可为 NULL;非 NULL 时把被补算的 SJ 追加进来。
+ * 【返回值】扩展后的 relids 集合(与传入 input_relids 是同一对象,可能被
+ * 原地扩展)。
  */
 Relids
 add_outer_joins_to_relids(PlannerInfo *root, Relids input_relids,
@@ -1025,6 +1136,34 @@ add_outer_joins_to_relids(PlannerInfo *root, Relids input_relids,
  * These heuristics also ensure that all grouped paths for the same grouped
  * relation produce the same set of rows, which is a basic assumption in the
  * planner.
+ */
+/*
+ * make_grouped_join_rel - (中文)若"急切聚合"(eager aggregation)适用,为
+ * 给定的 joinrel 构建分组连接关系(grouped join rel)并生成分组路径
+ *
+ * 【作用】make_join_rel() 在 populate_joinrel_with_paths() 之前调用本函数:
+ * 若查询含聚合/分组表达式,且分组路径被认为有用,则构建与 joinrel 对应的
+ * grouped_rel,并调用 populate_joinrel_with_paths() 为其填充路径。
+ *
+ * 【设计思想】两种生成分组路径的策略:
+ * 1. 一个分组输入 + 一个非分组输入连接(如 AGG(B) JOIN A);
+ * 2. 在既有非分组连接路径之上做部分聚合(如 AGG(A JOIN B))。
+ * 为避免规划组合爆炸,限制部分聚合只下推到"最低的有用层":若能走策略 1
+ * 就跳过同一层的策略 2;多个候选最低层(如 AGG(A JOIN B) JOIN C 与
+ * A JOIN AGG(B JOIN C) 都合法)时只采用搜索中先遇到的那个
+ * (joinrel->agg_info->apply_agg_at 记录"应用聚合的关系集合"作为唯一指定层)。
+ * 这些启发式也保证同一个 grouped_rel 的所有分组路径产生相同的行集。
+ * 细节:create_rel_agg_info() 评估聚合是否有用(agg_useful);rel1_empty /
+ * rel2_empty 表示某输入没有分组关系或为空;若指定层 apply_agg_at 与已记录
+ * 的不同:是其子集则更新记录并重算大小估计,否则跳过。
+ *
+ * 【参数】
+ *   root        —— PlannerInfo;
+ *   rel1, rel2  —— joinrel 的两个输入关系;
+ *   joinrel     —— 连接关系(其 grouped_rel 字段保存分组关系);
+ *   sjinfo      —— 连接上下文;
+ *   restrictlist —— 本次连接的子句列表。
+ * 【返回值】无。
  */
 static void
 make_grouped_join_rel(PlannerInfo *root, RelOptInfo *rel1,
@@ -1181,6 +1320,35 @@ make_grouped_join_rel(PlannerInfo *root, RelOptInfo *rel1,
  *	  SpecialJoinInfo provides details about the join and the restrictlist
  *	  contains the join clauses and the other clauses applicable for given pair
  *	  of the joining relations.
+ */
+/*
+ * populate_joinrel_with_paths - (中文)为给定的 joinrel 及一对连接关系添加
+ * 路径
+ *
+ * 【作用】make_join_rel() 与 make_grouped_join_rel()(以及分区连接的
+ * try_partitionwise_join)调用本函数:根据 sjinfo 的连接类型,以两个方向
+ * 调用 joinpath.c 的 add_paths_to_joinrel() 生成路径,并处理"可证明为空"
+ * 的剪枝。
+ *
+ * 【设计思想】按 sjinfo->jointype 分派:
+ * - INNER/SEMI:任一侧为 dummy 或限制恒为 FALSE 则整个 joinrel 标为 dummy;
+ * - LEFT/ANTI:外层(rel1)为 dummy 或恒 FALSE(推下)则 joinrel 为 dummy;
+ *   恒 FALSE(未推下)且 rel2 属于 syn_righthand 时只把内层标记 dummy;
+ * - FULL:两侧都 dummy 或恒 FALSE 才标 dummy;若最终一条路径都没生成,
+ *   报错(FULL JOIN 只支持可归并/可哈希的连接条件);
+ * - SEMI 特殊处理:若 rel1/rel2 恰好满足 min_lefthand/min_righthand,按
+ *   JOIN_SEMI 与 JOIN_RIGHT_SEMI 两个方向生成;若某输入恰好等于
+ *   syn_righthand 且可 unique 化,则用 unique 化后的关系以
+ *   JOIN_UNIQUE_INNER / JOIN_UNIQUE_OUTER 生成路径;
+ * 最后若连接双方是分区关系,调用 try_partitionwise_join() 尝试分区剪枝。
+ *
+ * 【参数】
+ *   root        —— PlannerInfo;
+ *   rel1, rel2  —— 一对连接关系(可能其一为 grouped 关系);
+ *   joinrel     —— 目标连接关系;
+ *   sjinfo      —— 连接上下文;
+ *   restrictlist —— 本次连接的子句列表。
+ * 【返回值】无。
  */
 static void
 populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
@@ -1364,6 +1532,30 @@ populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
  * willing to try bushy plans in the "last ditch" case, but that seems much
  * less efficient.
  */
+/*
+ * have_join_order_restriction - (中文)检测两个关系是否因特殊连接或横向连接
+ * 产生的连接顺序限制而必须被连接
+ *
+ * 【作用】make_rels_by_clause_joins() / join_search_one_level() 用来判断
+ * "即使没有连接子句,这两个关系是否也必须连接",以满足外层连接、IN/EXISTS
+ * 子查询或 LATERAL 引用强加的顺序约束。实践中总与 have_relevant_joinclause()
+ * 一起使用。
+ *
+ * 【设计思想】四种需要强制连接的情形:
+ * 1. 一方对另一方有直接横向引用(direct_lateral_relids);
+ * 2. 双方同时是某个 PlaceHolderVar 求值点(ph_eval_at)的子集——需要它们
+ *    一起才能算出该 PHV;
+ * 3. 双方恰好构成某个非 FULL 外层连接的 LHS/RHS(正序或反序);
+ * 4. 双方都重叠某个外层连接的 RHS(或 LHS)——说明需要它们共同补全该侧。
+ * 最后的关键启发式:若任一输入可以用连接子句合法地连到别的关系,就不强制
+ * 本次连接(result 置回 false)——即"无子句的 bushy 连接尽量推迟",以免在
+ * 高层顺序限制内部浪费大量规划时间。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel1, rel2 —— 待检测的两个关系。
+ * 【返回值】true:应强制连接;false:无此必要。
+ */
 bool
 have_join_order_restriction(PlannerInfo *root,
 							RelOptInfo *rel1, RelOptInfo *rel2)
@@ -1477,6 +1669,28 @@ have_join_order_restriction(PlannerInfo *root,
  * say "true" incorrectly.  (Therefore, we don't bother with the relatively
  * expensive has_legal_joinclause test.)
  */
+/*
+ * has_join_restriction - (中文)检测指定关系是否带有连接顺序限制
+ *
+ * 【作用】join_search_one_level() 判断一个关系是否可能受到顺序约束,以便
+ * 决定走 make_rels_by_clause_joins()(有子句/限制)还是
+ * make_rels_by_clauseless_joins()(纯笛卡尔积)。本质上是
+ * have_join_order_restriction() 对该关系"与其他某个关系"成立的可能性的
+ * 廉价近似。
+ *
+ * 【设计思想】三种情况返回 true:
+ * - rel 有横向依赖或被其他关系横向引用(lateral_relids / lateral_referencers);
+ * - rel 是某个多关系 PlaceHolderVar 求值点的真子集(ph_eval_at 严格包含
+ *   rel->relids)——需要 rel 与别的关系一起求值;
+ * - rel 与某个非 FULL 外层连接的 LHS 或 RHS 有交集,但尚未完整包含该 SJ。
+ * 允许偶发误报("true" 但实际没有限制),因为多花一点规划时间代价很小,且
+ * 因此刻意省略较昂贵的 has_legal_joinclause() 检测。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 待检测的关系。
+ * 【返回值】true:该关系可能有连接顺序限制;false:没有。
+ */
 static bool
 has_join_restriction(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -1533,6 +1747,26 @@ has_join_restriction(PlannerInfo *root, RelOptInfo *rel)
  * may be forced to make clauseless joins within initial_rels even though
  * there are join clauses linking to other parts of the query.)
  */
+/*
+ * has_legal_joinclause - (中文)检测指定关系能否用连接子句合法地连到其他
+ * 关系
+ *
+ * 【作用】have_join_order_restriction() 的辅助判断:当存在顺序限制时,若
+ * rel 还能用连接子句连到别的某个关系,则不强制无子句连接(推迟 bushy)。
+ * 本函数在 root->initial_rels 中寻找 rel 的合法连接对象。
+ *
+ * 【设计思想】只考虑"与单个初始关系"的连接,就足以在绝大多数真实查询中
+ * 得到正确结果;偶尔的误判"false"只多花一点规划时间。限制到初始关系是因为
+ * 若要去证明"与某个连接关系"连接合法,成本过高;而且规划子问题时,即使
+ * 查询其他部分存在连接子句,initial_rels 内部也可能被迫做无子句连接。对每
+ * 个 relids 不重叠的候选,若 have_relevant_joinclause() 成立,则用
+ * join_is_legal() 验证合法性,合法即返回 true。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 待检测的关系。
+ * 【返回值】true:rel 能用连接子句连到某个初始关系;false:不能。
+ */
 static bool
 has_legal_joinclause(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -1573,6 +1807,21 @@ has_legal_joinclause(PlannerInfo *root, RelOptInfo *rel)
 
 /*
  * is_dummy_rel --- has relation been proven empty?
+ */
+/*
+ * is_dummy_rel - (中文)判断关系是否已被证明为空(dummy)
+ *
+ * 【作用】各处规划代码(如 populate_joinrel_with_paths、joinpath 的路径
+ * 生成、partitionwise join)调用本函数判断某关系是否可被证明为空,以便
+ * 提前剪枝。
+ *
+ * 【设计思想】被证明为空的关系,其 pathlist 的第一个路径是一条"无子节点的
+ * Append"(成本为零,必然排在最前)。此后规划阶段可能在其上叠加 ProjectSet /
+ * Projection 路径(因为 Append 不能投影),所以需要循环下钻,直到发现
+ * IS_DUMMY_APPEND 路径为止。若 pathlist 为空(尚无路径)则不算 dummy。
+ *
+ * 【参数】rel —— 待检测的关系。
+ * 【返回值】true:关系已被证明为空;false:否则。
  */
 bool
 is_dummy_rel(RelOptInfo *rel)
@@ -1623,6 +1872,26 @@ is_dummy_rel(RelOptInfo *rel)
  * is that the best solution is to explicitly make the dummy path in the same
  * context the given RelOptInfo is in.
  */
+/*
+ * mark_dummy_rel - (中文)把一个关系标记为"已证明为空"
+ *
+ * 【作用】当规划器证明某关系不会产生任何行时(如限制恒为 FALSE、输入关系
+ * 为空),调用本函数:清空既有路径、把行数估计置 0、放入一条无子节点的
+ * Append 路径作为 dummy 标记。
+ *
+ * 【设计思想】
+ * - 已标记时直接返回(GEQO 规划中同一个基表可能被重复调用本函数);
+ * - 内存上下文:GEQO 连接规划运行在短生命周期的上下文里,而基表结构要跨
+ *   GEQO 循环存活,因此 dummy 路径必须创建在 rel 所在的上下文
+ *   (GetMemoryChunkContext(rel))中;反之标记 joinrel 时又不希望它污染主
+ *   规划上下文——统一在 rel 所在上下文创建正好两全;
+ * - 行数置 0、pathlist / partial_pathlist 清空,再通过 add_path() 加入
+ *   无子节点 Append(dummy 路径成本为零),最后 set_cheapest() 刷新最便宜
+ *   路径字段。
+ *
+ * 【参数】rel —— 待标记为空的关系。
+ * 【返回值】无。
+ */
 void
 mark_dummy_rel(RelOptInfo *rel)
 {
@@ -1666,6 +1935,26 @@ mark_dummy_rel(RelOptInfo *rel)
  *
  * If only_pushed_down is true, then consider only quals that are pushed-down
  * from the point of view of the joinrel.
+ */
+/*
+ * restriction_is_constant_false - (中文)判断 restrictlist 中是否存在"恒为
+ * FALSE"的限制子句
+ *
+ * 【作用】populate_joinrel_with_paths() 调用本函数,检测限制列表里是否有
+ * 可证明恒为 FALSE 的子句,以便把整个连接或某侧输入标记为 dummy,避免只
+ * 为验证"外层行没有匹配"而计算笛卡尔积。
+ *
+ * 【设计思想】正常情况下 eval_const_expressions() 会把与常量 FALSE 相与的
+ * 子句全部折叠掉;但在外层连接场景,其他 qual 可能被下推到外层连接层,所以
+ * 列表里可能还残留其他成员,必须逐条检查。常量 NULL 与常量 FALSE 在本用途
+ * 上等价(都不能产生匹配行)。only_pushed_down 为 true 时只检查从本 joinrel
+ * 视角"已下推"(RINFO_IS_PUSHED_DOWN)的子句。
+ *
+ * 【参数】
+ *   restrictlist     —— 限制子句列表;
+ *   joinrel          —— 相关连接关系(用于判断下推);
+ *   only_pushed_down —— true:只看已下推的子句;false:全部子句。
+ * 【返回值】true:存在恒为 FALSE(或 NULL)的常量子句;false:否则。
  */
 static bool
 restriction_is_constant_false(List *restrictlist,
@@ -1720,6 +2009,40 @@ restriction_is_constant_false(List *restrictlist,
  *
  * The RelOptInfo, SpecialJoinInfo and restrictlist for each child join are
  * obtained by translating the respective parent join structures.
+ */
+/*
+ * try_partitionwise_join - (中文)评估并实施"分区连接"(partitionwise join)
+ *
+ * 【作用】populate_joinrel_with_paths() 在生成完父级连接路径后调用本函数:
+ * 若两个输入关系共享同一分区方案且分区键之间存在等值连接,则把父连接分解
+ * 为"匹配分区对之间的子连接",为每个子连接构建子 joinrel 并填充路径,上层
+ * 再通过 generate_partitionwise_join_paths() 汇总成 Append/MergeAppend。
+ *
+ * 【设计思想】
+ * - 前置条件:joinrel 已分区(part_scheme 非空、nparts > 0),双方都是分区
+ *   关系,且考虑分区连接(consider_partitionwise_join);任一不满足则返回;
+ * - compute_partition_bounds() 计算连接关系的分区边界与匹配的分区对
+ *   (parts1 / parts2):边界相同则同位配对,否则调用 partition_bounds_merge
+ *   合并边界;
+ * - 主循环:对每个分区段,取出子关系对,依据父连接类型跳过可证明为空的段
+ *   (规则与 populate_joinrel_with_paths 对 dummy 输入的处理等价);子关系
+ *   被整体剪除(NULL)或是不完整(consider_partitionwise_join=false)则放弃
+ *   整个分区连接(joinrel->nparts = 0);
+ * - 用 build_child_join_sjinfo() 翻译父 SJ,用 adjust_appendrel_attrs()
+ *   翻译 restrictlist 与 relids,再 build_child_join_rel() 构建/复用子
+ *   joinrel,最后 make_grouped_join_rel() + populate_joinrel_with_paths()
+ *   生成子连接路径;
+ * - 每轮迭代末 eager 释放局部对象(appinfos、child_relids、子 SJ),避免
+ *   成千上万分区时内存膨胀;
+ * - check_stack_depth() 防止过深分区层级导致栈溢出。
+ *
+ * 【参数】
+ *   root              —— PlannerInfo;
+ *   rel1, rel2        —— 两个输入(分区)关系;
+ *   joinrel           —— 父连接关系;
+ *   parent_sjinfo     —— 父连接的 SpecialJoinInfo;
+ *   parent_restrictlist —— 父连接的子句列表。
+ * 【返回值】无。
  */
 static void
 try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
@@ -1948,6 +2271,31 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
  * If translations are added to or removed from this function, consider
  * updating free_child_join_sjinfo() accordingly.
  */
+/*
+ * build_child_join_sjinfo - (中文)由父连接的 SpecialJoinInfo 构造子连接的
+ * SpecialJoinInfo
+ *
+ * 【作用】try_partitionwise_join() 为每个子连接调用本函数:把父级 SJ 的
+ * min_/syn_lefthand 与 min_/syn_righthand 从父 relids 翻译成子 relids,并
+ * 翻译 semi_rhs_exprs,得到子连接的 SJ。
+ *
+ * 【设计思想】
+ * - 父连接是纯内连接(JOIN_INNER,ojrelid == 0)时,直接构造哑 SJ,无需
+ *   翻译;
+ * - 否则整体 memcpy 父 SJ,再分别用 adjust_child_relids() 把左/右 relids
+ *   翻译到子关系(左/右各自用对应侧的 AppendRelInfo),用
+ *   adjust_appendrel_attrs() 翻译 semi_rhs_exprs;ojrelid 等外层连接标识
+ *   不需要调整(子连接共享同一 OJ 节点);
+ * - 注意:翻译出的字段是指向新分配结构的,因此配对函数
+ *   free_child_join_sjinfo() 需要知道哪些字段是翻译副本、哪些与父共享。
+ *
+ * 【参数】
+ *   root          —— PlannerInfo;
+ *   parent_sjinfo —— 父连接的 SpecialJoinInfo;
+ *   left_relids   —— 子连接左侧(rel1 侧)的子 relids;
+ *   right_relids  —— 子连接右侧(rel2 侧)的子 relids。
+ * 【返回值】新建的、字段已翻译的子连接 SpecialJoinInfo(调用方负责释放)。
+ */
 static SpecialJoinInfo *
 build_child_join_sjinfo(PlannerInfo *root, SpecialJoinInfo *parent_sjinfo,
 						Relids left_relids, Relids right_relids)
@@ -2002,6 +2350,25 @@ build_child_join_sjinfo(PlannerInfo *root, SpecialJoinInfo *parent_sjinfo,
  * Only members that are translated copies of their counterpart in the parent
  * SpecialJoinInfo are freed here.
  */
+/*
+ * free_child_join_sjinfo - (中文)释放 build_child_join_sjinfo() 创建的子
+ * 连接 SpecialJoinInfo
+ *
+ * 【作用】try_partitionwise_join() 每轮迭代结束调用本函数回收子 SJ 占用的
+ * 内存,防止大量分区时内存膨胀。
+ *
+ * 【设计思想】只有"翻译副本"(即 build_child_join_sjinfo 中新分配、与父
+ * 节点不同的字段)才需要释放:min_/syn_lefthand/righthand 若与父 SJ 对应
+ * 字段不是同一对象,则 bms_free。commute_above_l/r 与 commute_below_l/r、
+ * semi_operators 断言与父一致(共享,不释放);semi_rhs_exprs 理论上也是
+ * 翻译副本,但简单 pfree 不够,所以不动它。内连接的哑 SJ 没有任何翻译字段,
+ * 直接释放结构本身即可。
+ *
+ * 【参数】
+ *   child_sjinfo  —— 子连接 SJ(由 build_child_join_sjinfo 创建);
+ *   parent_sjinfo —— 父连接 SJ(用于对照判断字段是否共享)。
+ * 【返回值】无。
+ */
 static void
 free_child_join_sjinfo(SpecialJoinInfo *child_sjinfo,
 					   SpecialJoinInfo *parent_sjinfo)
@@ -2043,6 +2410,32 @@ free_child_join_sjinfo(SpecialJoinInfo *child_sjinfo,
 /*
  * compute_partition_bounds
  *		Compute the partition bounds for a join rel from those for inputs
+ */
+/*
+ * compute_partition_bounds - (中文)根据输入关系的分区边界计算连接关系的
+ * 分区边界与匹配的分区对
+ *
+ * 【作用】try_partitionwise_join() 调用本函数:为 joinrel 计算分区边界
+ * (boundinfo / nparts / part_rels),并产生与每个分区段对应的匹配分区对
+ * (parts1 / parts2)。
+ *
+ * 【设计思想】分两种情况:
+ * - joinrel->nparts == -1(边界尚未计算):若两个输入都未合并边界、分区数
+ *   相同且边界逐点相等(partition_bounds_equal),则直接复用 rel1 的
+ *   boundinfo,同位分区即配对(不劳合并);否则调用 partition_bounds_merge()
+ *   合并边界,产出 parts1/parts2,并置 partbounds_merged 标志;合并失败
+ *   (boundinfo == NULL)则 nparts = 0,放弃分区连接;
+ * - nparts > 0(之前已计算):若 partbounds_merged 为真,输入边界不保证
+ *   一致,须调用 get_matching_part_pairs() 从已构建的子 joinrel 反推匹配
+ *   分区对;否则(边界一致)同位配对,无需额外处理。
+ *
+ * 【参数】
+ *   root          —— PlannerInfo;
+ *   rel1, rel2    —— 两个输入(分区)关系;
+ *   joinrel       —— 连接关系(就地填充 boundinfo/nparts/part_rels);
+ *   parent_sjinfo —— 父连接 SJ(合并边界时需知道连接类型);
+ *   parts1, parts2 —— 出参:与 joinrel 各分区段对应的两个输入分区列表。
+ * 【返回值】无。
  */
 static void
 compute_partition_bounds(PlannerInfo *root, RelOptInfo *rel1,
@@ -2133,6 +2526,34 @@ compute_partition_bounds(PlannerInfo *root, RelOptInfo *rel1,
 /*
  * get_matching_part_pairs
  *		Generate pairs of partitions to be joined from inputs
+ */
+/*
+ * get_matching_part_pairs - (中文)根据已构建的子连接关系生成输入侧的分区
+ * 匹配对
+ *
+ * 【作用】compute_partition_bounds() 在 joinrel 的 partbounds_merged 为真
+ * (输入边界不一致)时调用本函数:遍历 joinrel->part_rels(各分区段的子
+ * joinrel),为每段从 rel1 侧与 rel2 侧各解析出一个子关系,填进 parts1 /
+ * parts2,与 joinrel 各分区段一一对应。
+ *
+ * 【设计思想】
+ * - 某段子 joinrel 为空(NULL):说明此前 try_partitionwise_join() 已因输入
+ *   为空而跳过该段,这里也对应地放入两个 NULL,让后续逻辑再次跳过;
+ * - 对每段,用 bms_intersect 把子 joinrel 的 relids 分别与 rel1->all_partrels
+ *   (或 rel2)求交,得到属于 rel1 侧(或 rel2 侧)的分区 relids;断言其成员
+ *   数与该侧父关系基表数一致;
+ * - 简单关系(IS_SIMPLE_REL)按唯一 varno 用 find_base_rel 取子表,否则用
+ *   find_join_rel 取子连接关系;断言非空——因为该段子 joinrel 存在,意味着
+ *   输入侧相应的子关系此前必然已被构建(边界匹配/重叠的指定分区会被视为
+ *   待连接对象)。
+ *
+ * 【参数】
+ *   root    —— PlannerInfo;
+ *   joinrel —— 分区连接关系(其 part_rels 保存各段子 joinrel);
+ *   rel1    —— 输入侧 1(其 all_partrels 列出该侧全部子关系 relids);
+ *   rel2    —— 输入侧 2;
+ *   parts1, parts2 —— 出参:与 joinrel 各分区段对应的两侧子关系列表。
+ * 【返回值】无。
  */
 static void
 get_matching_part_pairs(PlannerInfo *root, RelOptInfo *joinrel,

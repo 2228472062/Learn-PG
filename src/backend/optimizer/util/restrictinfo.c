@@ -7,6 +7,33 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件提供 RestrictInfo 节点的构造与操纵例程。RestrictInfo 是规划器中
+ * 最核心的"条件描述"结构:一个 WHERE/ON 子句(可能带 AND/OR 结构)经
+ * 规范化后,以 RestrictInfo 的形式挂在基表的 baserestrictinfo(限制条件)
+ * 或 joininfo(连接条件)列表上,并携带大量便于路径生成与代价估算的缓存
+ * 信息。
+ *
+ * 【核心数据结构】
+ * - RestrictInfo:含 clause(原始子句)、orclause(OR 子句的变形)、
+ *   clause_relids / left_relids / right_relids(关系引用位图)、
+ *   required_relids(计算所需关系,含外连接)、pseudoconstant、
+ *   is_pushed_down、security_level / leakproof(安全与提前求值控制)、
+ *   can_join(是否像普通二元连接条件)、merge/hash 相关缓存
+ *   (mergeopfamilies、left/right_ec、scansel_cache、hashjoinoperator、
+ *   bucketsize 等)、rinfo_serial(去重与克隆用序列号)。
+ *
+ * 【主要函数关系】
+ * make_restrictinfo 是主入口,内部把 OR 子句交给 make_sub_restrictinfos
+ * 递归地在每个子句上方插入 RestrictInfo,非 OR 子句则直接交给
+ * make_plain_restrictinfo 完成常规字段初始化;commute_restrictinfo 交换
+ * 二元子句左右操作数(用于索引派生条件);restriction_is_or_clause /
+ * restriction_is_securely_promotable / rinfo_is_constant_true 是三个小型
+ * 判定例程;get_actual_clauses / extract_actual_clauses /
+ * extract_actual_join_clauses 从 RestrictInfo 列表提取裸子句;
+ * join_clause_is_movable_to / join_clause_is_movable_into 判定连接条件
+ * 能否"下推/移入"某扫描层或连接层,支撑参数化路径生成。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/util/restrictinfo.c
  *
@@ -47,6 +74,32 @@ static Expr *make_sub_restrictinfos(PlannerInfo *root,
  * We initialize fields that depend only on the given subexpression, leaving
  * others that depend on context (or may never be needed at all) to be filled
  * later.
+ */
+/*
+ * make_restrictinfo - (中文)构造一个包含给定子表达式的 RestrictInfo
+ *
+ * 【作用】规划期构造 RestrictInfo 的总入口。若 clause 是 OR 子句,则构建
+ * 一个"在每个顶层 AND/OR 结构的分支上方插入了 RestrictInfo"的修改版拷贝
+ * (见 make_sub_restrictinfos);否则直接走 make_plain_restrictinfo 初始化。
+ * is_pushed_down、has_clone、is_clone、pseudoconstant、security_level、
+ * incompatible_relids、outer_relids 必须由调用者提供;required_relids 可
+ * 为 NULL,此时默认取实际子句内容(clause_relids)。
+ *
+ * 【设计思想】OR 子句与普通子句在规划器中待遇不同(OR 需要能够逐分支
+ * 提取限制条件,故每个分支都要有独立的 RestrictInfo 包装),因此这里按
+ * 类型分流。传入的 clause 本身不会被修改,OR 情况创建的是树形拷贝。
+ *
+ * 【参数】
+ *   root               —— 规划上下文;
+ *   clause             —— 待包装的布尔表达式;
+ *   is_pushed_down     —— 是否已被下推到其语义层之下;
+ *   has_clone / is_clone —— 是否拥有/是"克隆"(外连接条件变体)标志;
+ *   pseudoconstant     —— 是否伪常量(可在任何地方求值一次);
+ *   security_level     —— 安全等级(RLS 等),决定求值顺序;
+ *   required_relids    —— 计算该条件所需的最小关系集,可为 NULL;
+ *   incompatible_relids —— 与其不兼容(不可同时使用)的关系集;
+ *   outer_relids       —— 该条件所在的外连接相关关系集。
+ * 【返回值】新建的 RestrictInfo 节点。
  */
 RestrictInfo *
 make_restrictinfo(PlannerInfo *root,
@@ -98,6 +151,33 @@ make_restrictinfo(PlannerInfo *root,
  * Common code for the main entry points and the recursive cases.  Also,
  * useful while constructing RestrictInfos above OR clause, which already has
  * RestrictInfos above its subclauses.
+ */
+/*
+ * make_plain_restrictinfo - (中文)构造 RestrictInfo 的公共实现
+ *
+ * 【作用】make_restrictinfo 与 make_sub_restrictinfos 递归情况的共同实现,
+ * 也用于"在已经带子 RestrictInfo 的 OR 结构上再套一层 RestrictInfo"。
+ * 负责把 RestrictInfo 的全部字段初始化到位。
+ *
+ * 【设计思想】重点说明几个字段的初始化逻辑:
+ * - can_join:纯语法判定——二元 OpExpr 且左右操作数引用不相交的非空关系
+ *   集合时置真(注意这是无上下文语境的判定,是否真的能用来连接由后续
+ *   阶段结合上下文决定);
+ * - leakproof:security_level > 0 时才真正检测(低层条件不会被安全等级
+ *   延迟,没必要测);否则置 false 表示"未知";
+ * - has_volatile:置 VOLATILITY_UNKNOWN,首次需要时由
+ *   contain_volatile_functions 惰性确定;
+ * - required_relids 缺省取 clause_relids;
+ * - num_base_rels:从 clause_relids 中剔除 outer_join_rels 后计数。这里
+ *   存在一点"看起来不安全"的做法——调用发生在 deconstruct_jointree 的
+ *   遍历中,outer_join_rels 正在被填充;但由于递归顺序保证"任何会被本
+ *   子句提到的外连接都已被访问过",实际是安全的;
+ * - 各种缓存字段(选择性、代价、merge/hash 信息)统一置"未设置"哨兵值,
+ *   只有在相应上下文(如连接条件列表顶层)中才被惰性计算,避免无谓开销。
+ *
+ * 【参数】同 make_restrictinfo,另加 orclause —— 若本 RestrictInfo 代表
+ *         一个 OR 子句,这里存放其"带子 RestrictInfo 的 OR 树"。
+ * 【返回值】新建的 RestrictInfo 节点。
  */
 RestrictInfo *
 make_plain_restrictinfo(PlannerInfo *root,
@@ -258,6 +338,23 @@ make_plain_restrictinfo(PlannerInfo *root,
  * but any OR-clause constituents are allowed to default to just the
  * contained rels.
  */
+/*
+ * make_sub_restrictinfos - (中文)递归地在布尔表达式的子句上方插入
+ * 子 RestrictInfo
+ *
+ * 【作用】处理 OR 子句时的递归辅助:把 RestrictInfo 放到"简单(非 AND/OR)
+ * 子句"与"子 OR 子句"之上,但不在"子 AND 子句"之上——因为顶层用
+ * 隐式 AND 列表,只有 OR 和简单子句才是合法 RestrictInfo。is_pushed_down
+ * 等标志对结果中所有节点一视同仁;顶层输出应用给定的 required_relids,
+ * 但 OR 的分支子句允许缺省为仅含自身引用关系。
+ *
+ * 【设计思想】与"顶层列表是隐式 AND"的设计相呼应:AND 的每个参数本来
+ * 就会各自进入列表,无需包装;OR 分支则必须各自包装成 RestrictInfo 以便
+ * 独立管理。递归同时下钻 OR/AND 两层,直到简单子句。
+ *
+ * 【参数】同 make_restrictinfo(required_relids 语义见上述说明)。
+ * 【返回值】重建后的表达式树(节点上已插入 RestrictInfo)。
+ */
 static Expr *
 make_sub_restrictinfos(PlannerInfo *root,
 					   Expr *clause,
@@ -346,6 +443,32 @@ make_sub_restrictinfos(PlannerInfo *root,
  * assume without checking that the commutator op is a member of the same
  * btree and hash opclasses as the original op.
  */
+/*
+ * commute_restrictinfo - (中文)生成给定二元连接条件交换操作数后的
+ * RestrictInfo
+ *
+ * 【作用】为索引派生条件等场景,把 rinfo 中二元 OpExpr 的左右操作数交换、
+ * 算子换成调用者提供的交换算子 comm_op,生成新的 RestrictInfo。调用者
+ * 必须已查得 comm_op 的 OID(否则它不会知道交换是否合法)。
+ *
+ * 【设计思想】用 memcpy 扁平复制 clause 与 rinfo 两份结构,再修改需要变
+ * 的部分,以最大化复用:
+ * - 交换 opno 为 comm_op、重置 opfuncid(待重新解析)、交换 args;
+ * - left/right_relids、left/right_ec、left/right_em、bucketsize/mcvfreq
+ *   全部交叉互换;
+ * - 缓存的选择性/代价、parent_ec、rinfo_serial 直接保留——交换后这些
+ *   数值不变;
+ * - scansel_cache 重置(不为它费心)、左右 hasheqoperator 复位;
+ * - 若原 hashjoinoperator 正是被交换的算子,则改为 comm_op,否则置
+ *   InvalidOid。
+ * 警告:结果与源结构共享子结构,故源对象不能随后被修改;并假设交换算子
+ * 与原算子属于同一 btree/hash 操作符类(不做检查)。
+ *
+ * 【参数】
+ *   rinfo   —— 源连接条件(RestrictInfo,内含二元 OpExpr);
+ *   comm_op —— 交换算子(commutator)的 OID。
+ * 【返回值】交换后的新 RestrictInfo。
+ */
 RestrictInfo *
 commute_restrictinfo(RestrictInfo *rinfo, Oid comm_op)
 {
@@ -403,6 +526,19 @@ commute_restrictinfo(RestrictInfo *rinfo, Oid comm_op)
  *
  * Returns t iff the restrictinfo node contains an 'or' clause.
  */
+/*
+ * restriction_is_or_clause - (中文)判断 RestrictInfo 是否包含 OR 子句
+ *
+ * 【作用】利用 orclause 字段快速判断:make_restrictinfo 在遇到 OR 子句时
+ * 会为其填充 orclause 字段,非 OR 子句该字段为 NULL,故非空即真。
+ *
+ * 【设计思想】该字段专为此判定而设,比检查 clause 本身是否 BoolExpr 更
+ * 可靠(经 make_sub_restrictinfos 处理后,顶层 RestrictInfo 的 clause 仍
+ * 是原始 OR,但其 orclause 是带子包装的版本)。
+ *
+ * 【参数】restrictinfo —— 待检查的 RestrictInfo。
+ * 【返回值】true:是 OR 子句;false:不是。
+ */
 bool
 restriction_is_or_clause(RestrictInfo *restrictinfo)
 {
@@ -417,6 +553,22 @@ restriction_is_or_clause(RestrictInfo *restrictinfo)
  *
  * Returns true if it's okay to evaluate this clause "early", that is before
  * other restriction clauses attached to the specified relation.
+ */
+/*
+ * restriction_is_securely_promotable - (中文)判断该条件能否"安全地提前
+ * 求值"
+ *
+ * 【作用】决定一个限制条件能否被提到本关系其他限制条件之前执行(例如
+ * 提前到扫描阶段做 TID 扫描、提前过滤等)。
+ *
+ * 【设计思想】安全的前提:要么本条件等级不高于该关系当前最低安全等级
+ * (baserestrict_min_security)——即前面没有必须比它更早执行的更安全条件;
+ * 要么本条件 leakproof(不泄露数据),即使等级较高提前求值也不违反安全。
+ *
+ * 【参数】
+ *   restrictinfo —— 待检查条件;
+ *   rel          —— 所属基表,提供 baserestrict_min_security。
+ * 【返回值】true:可安全提前求值;false:不可。
  */
 bool
 restriction_is_securely_promotable(RestrictInfo *restrictinfo,
@@ -440,6 +592,21 @@ restriction_is_securely_promotable(RestrictInfo *restrictinfo,
  * reasons discussed therein.  We should drop them again when creating
  * the finished plan, which is handled by the next few functions.
  */
+/*
+ * rinfo_is_constant_true - (中文)判断 RestrictInfo 的子句是否为常量 TRUE
+ *
+ * 【作用】检测 rinfo->clause 是否是"非空且为真的布尔常量"。此类 WHERE
+ * 子句本不该通过限定条件规范化(qual canonicalization)存活,但
+ * equivclass.c 出于其内部原因可能生成这样的 RestrictInfo,故在生成最终
+ * 计划时应将其丢弃(由后续几个提取函数处理)。
+ *
+ * 【设计思想】纯粹是布尔常量判定的封装:IsA Const + !constisnull +
+ * DatumGetBool。供 get_actual_clauses、extract_actual_clauses、
+ * extract_actual_join_clauses 复用。
+ *
+ * 【参数】rinfo —— 待检查的 RestrictInfo。
+ * 【返回值】true:子句是常量 TRUE;false:不是。
+ */
 static inline bool
 rinfo_is_constant_true(RestrictInfo *rinfo)
 {
@@ -455,6 +622,18 @@ rinfo_is_constant_true(RestrictInfo *rinfo)
  *
  * This is only to be used in cases where none of the RestrictInfos can
  * be pseudoconstant clauses (for instance, it's OK on indexqual lists).
+ */
+/*
+ * get_actual_clauses - (中文)从 RestrictInfo 列表提取裸子句列表
+ *
+ * 【作用】返回 restrictinfo_list 中每个节点的裸子句(rinfo->clause)组成
+ * 的列表。只允许在"不存在伪常量"的场合使用(如 indexqual 列表)。
+ *
+ * 【设计思想】逐个断言非伪常量、非常量 TRUE(恒真子句将被丢弃),直接
+ * lappend 取出裸子句。用断言而非运行期检查,因为调用者已保证前置条件。
+ *
+ * 【参数】restrictinfo_list —— RestrictInfo 列表。
+ * 【返回值】裸子句(Expr)列表。
  */
 List *
 get_actual_clauses(List *restrictinfo_list)
@@ -480,6 +659,21 @@ get_actual_clauses(List *restrictinfo_list)
  * Extract bare clauses from 'restrictinfo_list', returning either the
  * regular ones or the pseudoconstant ones per 'pseudoconstant'.
  * Constant-TRUE clauses are dropped in any case.
+ */
+/*
+ * extract_actual_clauses - (中文)按伪常量标志提取裸子句,恒真子句一律丢弃
+ *
+ * 【作用】从 restrictinfo_list 中提取裸子句,按参数 pseudoconstant 决定
+ * 提取"普通"还是"伪常量"子句;常量 TRUE 在任何情况下都被丢弃。
+ *
+ * 【设计思想】与 get_actual_clauses 的差异在于:这里允许出现伪常量,并
+ * 由调用者选择提取哪一类;恒真子句(见 rinfo_is_constant_true)对执行
+ * 无意义,统一剔除。
+ *
+ * 【参数】
+ *   restrictinfo_list —— RestrictInfo 列表;
+ *   pseudoconstant    —— true:只提取伪常量子句;false:只提取普通子句。
+ * 【返回值】提取出的裸子句列表。
  */
 List *
 extract_actual_clauses(List *restrictinfo_list,
@@ -508,6 +702,25 @@ extract_actual_clauses(List *restrictinfo_list,
  *
  * This is only used at outer joins, since for plain joins we don't care
  * about pushed-down-ness.
+ */
+/*
+ * extract_actual_join_clauses - (中文)把 RestrictInfo 列表拆分为"本层连接
+ * 条件"与"下推条件"两组裸子句
+ *
+ * 【作用】仅在外连接处使用:把 restrictinfo_list 按 RINFO_IS_PUSHED_DOWN
+ * 分成 joinquals(语义上属于本连接层的条件)与 otherquals(被下推到本层
+ * 的条件),各自返回裸子句;伪常量与常量 TRUE 被排除在外。
+ *
+ * 【设计思想】对普通(内)连接我们并不关心"是否下推",故本函数只服务于
+ * 外连接。joinquals 不应被标记为伪常量(有断言兜底);下推类若为伪常量
+ * 或恒真则剔除。
+ *
+ * 【参数】
+ *   restrictinfo_list —— RestrictInfo 列表;
+ *   joinrelids        —— 当前连接层的关系集合,用于判定是否下推;
+ *   joinquals         —— 输出:本层连接条件裸子句列表;
+ *   otherquals        —— 输出:下推条件裸子句列表。
+ * 【返回值】无(结果经输出参数返回)。
  */
 void
 extract_actual_join_clauses(List *restrictinfo_list,
@@ -570,6 +783,34 @@ extract_actual_join_clauses(List *restrictinfo_list,
  * that differ only in which outer joins null the parameterization rel(s).
  * Generating one path from the minimally-parameterized has_clone version
  * is sufficient.
+ */
+/*
+ * join_clause_is_movable_to - (中文)判断连接条件能否被移入(用于参数化)
+ * 指定基表的扫描
+ *
+ * 【作用】参数化路径生成的基础判定:连接条件能否安全地在其正常语义层
+ * (required_relids)之下的某个基表扫描处求值,前提是它所需的其它关系变量
+ * 通过参数传入。它既要求条件确实引用目标关系(保证移动有唯一去处),又
+ * 要排除会改变结果的各种情况。
+ *
+ * 【设计思想】五个必要条件:
+ * 1. 条件必须实际引用目标基表(否则是退化连接,移动无意义且不唯一);
+ * 2. 不能把外连接条件移进其连接的外侧(那会把"空扩展"变成"被过滤",
+ *    结果改变);
+ * 3. 目标基表的 Var 不能被任何外连接置空——利用 clause_relids 已含
+ *    varnullingrels 的特点,直接检查 clause_relids 与 baserel->nulling_relids
+ *    是否相交。即使相交的 OJ relid 来自别的关系的 Var,也说明该条件来自
+ *    那个外连接之上、本就不该下推,故不会误判;
+ * 4. 条件不能使用任何"对目标关系有 LATERAL 反向引用"的关系(否则无法把
+ *    它们放在以目标关系为内层的 nestloop 外侧);
+ * 5. 拒绝 is_clone(克隆变体)版本的外连接条件——避免生成仅在"哪个外连接
+ *    置空参数化关系"上有差异的冗余参数化路径,由最小参数化的 has_clone
+ *    版本生成一条即可。
+ *
+ * 【参数】
+ *   rinfo   —— 待判定连接条件;
+ *   baserel —— 候选的目标基表。
+ * 【返回值】true:可移入 baserel 扫描;false:不可。
  */
 bool
 join_clause_is_movable_to(RestrictInfo *rinfo, RelOptInfo *baserel)
@@ -656,6 +897,33 @@ join_clause_is_movable_to(RestrictInfo *rinfo, RelOptInfo *baserel)
  * Note: get_joinrel_parampathinfo depends on the fact that if
  * current_and_outer is NULL, this function will always return false
  * (since one or the other of the first two tests must fail).
+ */
+/*
+ * join_clause_is_movable_into - (中文)判断连接条件能否移入给定的连接层
+ * 上下文
+ *
+ * 【作用】在已经确定"可移"(movable)之后,再判定条件能否在指定的求值
+ * 位置(当前连接层 currentrelids 及其外参数 current_and_outer)处求值。
+ * 供 get_joinrel_parampathinfo 等生成参数化连接路径的代码使用。
+ *
+ * 【设计思想】三个必要条件:
+ * 1. 可求值性:clause_relids 必须是 current_and_outer 的子集;
+ * 2. 引用唯一性:条件必须至少引用一个当前层关系,保证在参数化连接树中
+ *    有唯一的下推位置;
+ * 3. 不得推入其外连接的外侧(currentrelids 与 outer_relids 不相交)。
+ * 与 join_clause_is_movable_to 的差异:这里不再检查 LATERAL 反向引用
+ * (假定调用方在考虑连接路径时已经于 join_is_legal 等处预先验证过外部
+ * 关系与当前关系的 LATERAL 合法性),也不检查 is_clone(克隆变体的取舍
+ * 由上游决定)。注意:返回 true 只表示"能移到本层",并不保证本层是最低
+ * 可移层,调用者可能需对连接的每个输入再做检查。另外
+ * get_joinrel_parampathinfo 依赖一个性质:current_and_outer 为 NULL 时
+ * 本函数必返回 false。
+ *
+ * 【参数】
+ *   rinfo             —— 待判定连接条件;
+ *   currentrelids     —— 拟求值位置的关系集合;
+ *   current_and_outer —— currentrelids 与 required_outer(参数化外层)的并集。
+ * 【返回值】true:条件可在给定上下文求值;false:不可。
  */
 bool
 join_clause_is_movable_into(RestrictInfo *rinfo,

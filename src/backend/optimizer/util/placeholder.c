@@ -937,6 +937,22 @@ contain_noop_phv_walker(Node *node, void *context)
  * We strip a PlaceHolderVar only if its phnullingrels is empty, replacing it
  * with its contained expression.
  */
+/*
+ * strip_noop_phvs_mutator - (中文)递归地从树中移除可剥离的 PHV
+ *
+ * 【作用】strip_noop_phvs 的真正执行者:遍历整棵表达式树,遇到
+ * phnullingrels 为空的 PHV 就返回其内含表达式(并继续递归处理之),否则
+ * 保留该 PHV 但继续检查其内部;其他节点照常交给 expression_tree_mutator
+ * 深拷贝重建。
+ *
+ * 【设计思想】以"替换为内含表达式"的方式实现"剥离",天然支持 PHV 嵌套
+ * 与多层包裹的情形;递归发生在替换位置,保证底层表达式也被清理。
+ *
+ * 【参数】
+ *   node    —— 当前访问节点;
+ *   context —— 未使用,预留。
+ * 【返回值】处理后的节点(可能为 NULL,若输入为 NULL)。
+ */
 static Node *
 strip_noop_phvs_mutator(Node *node, void *context)
 {

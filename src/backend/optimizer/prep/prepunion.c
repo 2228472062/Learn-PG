@@ -16,6 +16,45 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件是 PostgreSQL 优化器"预处理器"(prep 模块)的成员,负责为集合运算
+ * 查询(UNION / INTERSECT / EXCEPT 及其 ALL 变体,合称 SetOperation)生成
+ * 计划路径。文件名是历史遗留(早期只实现 UNION)。
+ *
+ * 【两条代码路径】
+ * - "纯 UNION ALL"子查询会被转换为"append 关系"(append relation):其各
+ *   叶子子查询变成 AppendRelInfo 成员,交由 prepjointree.c 的
+ *   pull_up_simple_union_all / flatten_simple_union_all 与 allpaths.c 共同
+ *   处理(本文件只有少量辅助代码);
+ * - 一般集合运算由本文件主导:plan_set_operations 递归遍历集合运算树,为
+ *   每个节点生成 RelOptInfo 与路径(Append / MergeAppend + Unique / Agg /
+ *   SetOp 节点),并构造输出目标列表。
+ *
+ * 【设计思想】
+ * - 递归自底向上:对 UNION 节点,先把所有叶子/子节点规划好,收集各自的
+ *   cheapest 路径(以及可能的"已排序"路径与并行 partial 路径),再决定用
+ *   简单 Append(UNION ALL)、Append+HashAgg/Unique(SETOP_HASHED/SORTED,
+ *   UNION 去重)还是 MergeAppend+Unique(充分利用子查询的排序);
+ * - INTERSECT/EXCEPT 语义上"分组计数",可用 SetOp 节点(HashSetOp 或
+ *   SortSetOp,前者要求可哈希,后者要求可排序)实现,因此生成
+ *   generate_nonunion_paths 分支;
+ * - 递归 UNION 用 RecursiveUnion 节点,只支持哈希去重(grouping_is_hashable),
+ *   非递归分支(larg)同时作为工作表的初始内容;
+ * - 目标列表统一约定:输出列的 sortgroupref 等于其 resno,便于上层按列号
+ *   描述排序/分组属性;类型不一致的列用 coerce_to_common_type 强制转换;
+ * - Append 的目标列表 Vars 统一用 varno == 0(占位),配合
+ *   create_setop_pathtarget 用子路径的平均宽度修正宽度估算。
+ *
+ * 【核心数据结构与函数关系】
+ * plan_set_operations(入口) -> recurse_set_operations(递归:叶子子查询由
+ * subquery_planner 规划后 build_setop_child_paths 生成 SubqueryScan 路径;
+ * 内部节点按类型转 generate_union_paths / generate_nonunion_paths) ;
+ * generate_recursion_path 处理递归 UNION;plan_union_children 负责把
+ * "同构的 UNION 子树"上提合并成一棵 N 路 UNION;generate_setop_tlist /
+ * generate_append_tlist / generate_setop_grouplist / create_setop_pathtarget
+ * 是目标列表与分组列表的构造工具;postprocess_setop_rel 做收尾(选最便宜
+ * 路径)。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/prep/prepunion.c
  *
@@ -93,6 +132,28 @@ static PathTarget *create_setop_pathtarget(PlannerInfo *root, List *tlist,
  * What we return is an "upperrel" RelOptInfo containing at least one Path
  * that implements the set-operation tree.  In addition, root->processed_tlist
  * receives a targetlist representing the output of the topmost setop node.
+ */
+/*
+ * plan_set_operations - (中文)为整棵集合运算树规划路径的对外入口
+ *
+ * 【作用】由 grouping_planner 在查询含 setOperations 时调用,规划给定
+ * Query 的 setOperations 树(不含顶层 ORDER BY / LIMIT,那些由
+ * grouping_planner 返回后再处理)。返回一个含至少一条可行路径的
+ * UPPERREL_SETOP RelOptInfo,并把顶层集合运算节点的输出目标列表写入
+ * root->processed_tlist。
+ *
+ * 【设计思想】
+ * - 前置断言:此类查询的 jointree 为空、无 GROUP BY/HAVING/WINDOW/DISTINCT
+ *   (解析器/重写器已保证);等价类在这个查询级别只用于"顶层目标与对应子
+ *   目标等价",不会有合并,故直接置 ec_merging_done = true 以便生成 pathkey;
+ * - 列名统一取自"最左叶子子查询"的目标列表,否则 SELECT INTO 的列名会错;
+ * - 递归 UNION(root->hasRecursion)走 generate_recursion_path 特殊路径,
+ *   否则走 recurse_set_operations 通用递归;
+ * - 在此先 setup_simple_rel_arrays,因为叶子子查询是 RTE_SUBQUERY,后续要
+ *   为它们建立 RelOptInfo 与可能的 AppendRelInfo。
+ *
+ * 【参数】root —— PlannerInfo,其 parse->setOperations 为集合运算树根。
+ * 【返回值】实现该集合运算树的 RelOptInfo(上层通过它挑选最终路径)。
  */
 RelOptInfo *
 plan_set_operations(PlannerInfo *root)
@@ -209,6 +270,39 @@ plan_set_operations(PlannerInfo *root)
  * We don't have to care about typmods here: the only allowed difference
  * between set-op input and output typmods is input is a specific typmod
  * and output is -1, and that does not require a coercion.
+ */
+/*
+ * recurse_set_operations - (中文)递归处理集合运算树中的一步
+ *
+ * 【作用】对给定节点 setOp 生成 RelOptInfo。叶子节点(RangeTblRef):用
+ * subquery_planner 规划叶子子查询、由 generate_setop_tlist 构造其输出目标
+ * 列表并生成 SubqueryScan 路径(路径生成由调用者随后调 build_setop_child_paths
+ * 完成);内部节点(SetOperationStmt):按 op 分派给 generate_union_paths
+ * 或 generate_nonunion_paths;必要时再加一层 Result 节点做列类型/排序规则
+ * 修正投影;最后 postprocess_setop_rel 选最便宜路径。输出参数给出顶层目标
+ * 列表与"目标列表是否平凡(类型无需转换)"标志。
+ *
+ * 【设计思想】
+ * - parentOp 非 NULL 时表示父节点需要"按默认 btree 排序"的输入,会传给
+ *   subquery_planner 鼓励子查询生成带正确 pathkey 的路径(INTERSECT/EXCEPT
+ *   的排序实现与去重 UNION 都需要);
+ * - "平凡 tlist"的定义:子查询输出类型与集合运算结果列类型完全一致、无需
+ *   强制转换,此时 SubqueryScan 可以省略投影(trivial_subqueryscan);
+ * - 类型/排序规则不一致时,用 generate_setop_tlist(varno = 0, hack_constants
+ *   = false)生成投影 tlist 并对每条路径(含 partial 路径)应用投影;用
+ *   apply_projection_to_path 的原因见函数体注释(必须与 setrefs.c 的
+ *   fix_upper_expr 对 Var 的 equal() 要求契合)。
+ *
+ * 【参数】
+ *   setOp           —— 当前节点(SetOperationStmt 或叶子 RangeTblRef);
+ *   root            —— 当前 PlannerInfo;
+ *   parentOp        —— 需要本节点输出的父集合运算(用于传排序需求),否则 NULL;
+ *   colTypes        —— 结果列类型 OID 列表;
+ *   colCollations   —— 结果列排序规则 OID 列表;
+ *   refnames_tlist  —— 取列名的目标列表(最左叶子子查询的 targetList);
+ *   pTargetList     —— 输出:本子树顶层计划的目标列表;
+ *   istrivial_tlist —— 输出:父/子类型是否完全一致(平凡 tlist 标志)。
+ * 【返回值】本子树的 RelOptInfo(叶子节点不含路径,路径由调用者补建)。
  */
 static RelOptInfo *
 recurse_set_operations(Node *setOp, PlannerInfo *root,
@@ -361,6 +455,32 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 /*
  * Generate paths for a recursive UNION node
  */
+/*
+ * generate_recursion_path - (中文)为递归 UNION 节点生成 RecursiveUnion 路径
+ *
+ * 【作用】处理递归 UNION(parser 只允许 UNION 递归,INTERSECT/EXCEPT 报错)。
+ * 分别递归规划左(larg,非递归分支)右(rarg,递归分支)两侧:右侧子查询在
+ * 规划时会读取 root->non_recursive_path(先设置、用后清空)来引用工作表
+ * (工作表的 path 即左侧输出);随后用 generate_append_tlist 生成输出目标
+ * 列表,构造 UPPERREL_SETOP 关系并创建 RecursiveUnion 路径。非 ALL 时需
+ * 求分组去重,只支持哈希实现(要求列类型可哈希)。
+ *
+ * 【设计思想】
+ * - RecursiveUnion 执行时先输出来自左分支的"基础行",再反复迭代右分支
+ *   直至工作表不再增长;右分支里的"递归引用"由 wt_param_id 标识的工作表
+ *   提供,规划期通过 root->non_recursive_path 让右分支知道其行数/宽度;
+ * - 分组去重时 groupList 由 generate_setop_grouplist 生成;行数估计采用
+ *   悲观上界 lpath->rows + rpath->rows * 10(可递归次数未知时的启发式);
+ * - 递归 UNION 没有"排序去重"实现,因此可排序但不可哈希的列类型直接报
+ *   FEATURE_NOT_SUPPORTED 错误。
+ *
+ * 【参数】
+ *   setOp         —— SETOP_UNION 类型的递归节点;
+ *   root          —— PlannerInfo(要求 wt_param_id >= 0);
+ *   refnames_tlist —— 取列名的目标列表;
+ *   pTargetList   —— 输出:RecursiveUnion 的输出目标列表。
+ * 【返回值】承载 RecursiveUnion 路径的 RelOptInfo。
+ */
 static RelOptInfo *
 generate_recursion_path(SetOperationStmt *setOp, PlannerInfo *root,
 						List *refnames_tlist,
@@ -484,6 +604,41 @@ generate_recursion_path(SetOperationStmt *setOp, PlannerInfo *root,
  * pathkeys, sorting any unsorted paths as required.
  * *pNumGroups: if not NULL, we estimate the number of distinct groups
  * in the result, and store it there.
+ */
+/*
+ * build_setop_child_paths - (中文)为集合运算的 RTE_SUBQUERY 子关系构建
+ * SubqueryScan 路径
+ *
+ * 【作用】rel 是 RTE_SUBQUERY 关系,其子查询已在 subroot 中规划完成。本函数
+ * 遍历子查询 final_rel 的路径,为其中"有用的"路径生成外层 SubqueryScan
+ * 路径加入 rel->pathlist:最便宜的输入路径原样纳入(供无需排序的集合运算
+ * 实现),若 interesting_pathkeys 非空则额外纳入满足该排序的路径(必要时用
+ * Sort / IncrementalSort 排序);若子关系支持并行,再添加一条基于子查询
+ * partial 路径的 partial 路径。可选的 *pNumGroups 返回子查询输出的去重组
+ * 数估计。
+ *
+ * 【设计思想】
+ * - 排序需求由调用者通过 interesting_pathkeys 传递(如去重 UNION 的
+ *   union_pathkeys、INTERSECT/EXCEPT 的 nonunion_pathkeys),排序在子查询
+ *   层完成再外包 SubqueryScan,可避免外层再做一次全排序;
+ * - pathkey 需用 convert_subquery_pathkeys 从子查询编号空间转换到外层;
+ * - 排序取舍:presorted_keys == 0 用 Sort,否则用 IncrementalSort(除非
+ *   enable_incremental_sort 关闭);只对 cheapest 路径与已部分排序的路径
+ *   考虑,避免生成过多候选;
+ * - setop 子关系被标记 dummy(is_dummy_rel)时传播到本层;
+ * - 组数估计:子查询若自身有分组/聚合/DISTINCT/HAVING,其输出基本唯一,
+ *   直接用 cheapest 路径的行数;否则用 estimate_num_groups 做统计估计
+ *   (用 subroot->parse 的原始目标列表,避免 varno 0 的 Var 干扰)。
+ *
+ * 【参数】
+ *   root               —— 外层 PlannerInfo;
+ *   rel                —— 待填充路径的 RTE_SUBQUERY 子关系;
+ *   trivial_tlist      —— 子 tlist 是否平凡(类型无需转换),影响 SubqueryScan
+ *                         是否需要投影;
+ *   child_tlist        —— 子查询输出 tlist;
+ *   interesting_pathkeys —— 若非 NIL,额外生成符合该排序的路径;
+ *   pNumGroups         —— 输出:去重组数估计(可为 NULL 表示不关心)。
+ * 【返回值】无。
  */
 static void
 build_setop_child_paths(PlannerInfo *root, RelOptInfo *rel,
@@ -686,6 +841,37 @@ build_setop_child_paths(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * Generate paths for a UNION or UNION ALL node
+ */
+/*
+ * generate_union_paths - (中文)为 UNION / UNION ALL 节点生成路径
+ *
+ * 【作用】递归合并同构的 UNION 子树(plan_union_children 可把多个 UNION
+ * 合并成一棵 N 路),用 generate_append_tlist 生成 Append 的目标列表;若为
+ * 去重 UNION(!op->all)且可排序,构造 union_pathkeys 并让各子关系生成
+ * 排序路径;随后基于各子关系的最便宜路径生成 Append 路径(以及并行
+ * Append + Gather 路径),并在 !op->all 时在其上叠加 HashAgg / Sort+Unique
+ * 去重路径,有排序路径时再生成 MergeAppend+Unique 路径;UNION ALL 则直接
+ * 采用 Append / Gather 路径。
+ *
+ * 【设计思想】
+ * - 去重行数估计:dNumChildGroups 累加各非 dummy 子关系的组数,利用
+ *   distinct(A ∪ B) ≤ distinct(A) + distinct(B) 作为上界;
+ * - 排序优先(先制 union_pathkeys)是为了:① 让子查询产出排序路径,从而
+ *   可能用 MergeAppend+Unique 免去全局排序;② root->query_pathkeys 同步,
+ *   上层 ORDER BY 若恰好匹配即可省去排序;
+ * - 并行路径只在所有子关系都 consider_parallel 且有 partial 路径时有效;
+ *   parallel_workers 取各子路径的最大值,并按 enable_parallel_append 用
+ *   log2(子关系数) 提高下限;
+ * - 若某子关系无法产出排序路径(常见于类型转换后 tlist 不再匹配),放弃
+ *   try_sorted 整体回退;
+ * - 所有 UNION 子关系都是 dummy(空)时,结果关系也标记为 dummy。
+ *
+ * 【参数】
+ *   op            —— SETOP_UNION 节点;
+ *   root          —— PlannerInfo;
+ *   refnames_tlist —— 取列名的目标列表;
+ *   pTargetList   —— 输出:Append 的输出目标列表。
+ * 【返回值】承载路径的 UPPERREL_SETOP RelOptInfo。
  */
 static RelOptInfo *
 generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
@@ -1040,6 +1226,35 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 /*
  * Generate paths for an INTERSECT, INTERSECT ALL, EXCEPT, or EXCEPT ALL node
  */
+/*
+ * generate_nonunion_paths - (中文)为 INTERSECT / EXCEPT 节点生成路径
+ *
+ * 【作用】递归规划左右两个输入(强制 tuple_fraction = 0 让子查询取全部
+ * 行),用 generate_setop_tlist 构造 SetOp 的目标列表与分组列表;判断分组
+ * 语义可用哈希/排序;EXCEPT 保持左输入在左,INTERSECT 则把组数较少的一侧
+ * 放到左边(利于哈希表大小与空输入快速路径);处理"输入可证明为空"的短路
+ * 情形(EXCEPT 左空→结果空、右空→直接扫描左;INTERSECT 任一空→结果空);
+ * 然后按可用性生成 HashSetOp 路径与 SortSetOp 路径(SortSetOp 需要两个
+ * 输入按相同分组键排序,必要时在子查询层排序)。
+ *
+ * 【设计思想】
+ * - SetOp 分组计数语义:EXCEPT 需要知道左输入的每个组计数、右输入每个组
+ *   的计数,ALL 与去重版本输出规则不同,由 SetOpCmd 编码;
+ * - 行数估计:哈希表条目数取 EXCEPT 的左组数、INTERSECT 的较小侧组数;
+ *   输出行数在 ALL 时取左行数(EXCEPT)或较小行数(INTERSECT),去重时
+ *   等于组数(均为保守上界);
+ * - 左右输入的交换(INTERSECT)会影响 relids 并集、宽度估计,因此 tlist、
+ *   组数、RelOptInfo 都要一起换;
+ * - 排序实现:先看 cheapest 路径是否已满足排序,否则从子关系路径中找
+ *   nonunion_pathkeys 对应路径,再退化为在最便宜路径上加 Sort。
+ *
+ * 【参数】
+ *   op            —— SETOP_INTERSECT 或 SETOP_EXCEPT 节点;
+ *   root          —— PlannerInfo;
+ *   refnames_tlist —— 取列名的目标列表;
+ *   pTargetList   —— 输出:SetOp 的输出目标列表。
+ * 【返回值】承载路径的 UPPERREL_SETOP RelOptInfo。
+ */
 static RelOptInfo *
 generate_nonunion_paths(SetOperationStmt *op, PlannerInfo *root,
 						List *refnames_tlist,
@@ -1389,6 +1604,32 @@ generate_nonunion_paths(SetOperationStmt *op, PlannerInfo *root,
  * NOTE: we can also pull a UNION ALL up into a UNION, since the distinct
  * output rows will be lost anyway.
  */
+/*
+ * plan_union_children - (中文)把同构的 UNION 子树合并上提,并规划 N 路
+ * UNION 下的各查询
+ *
+ * 【作用】用一个 pending 栈对集合运算树做宽度优先展开:凡是与顶层 UNION
+ * "同构"(op 相同,且 all 标志相同或子节点为 UNION ALL,且列类型与排序
+ * 规则相同)的 UNION 子树,都把自己的两个输入压栈继续展开;非同构的节点
+ * 作为独立的子关系,交给 recurse_set_operations 规划。返回所有子关系
+ * RelOptInfo 的列表,并平行地返回它们的 tlist 与平凡 tlist 标志。
+ *
+ * 【设计思想】
+ * - 合并同构 UNION 的理由:多个连续 UNION 可以共用一个 Append / MergeAppend
+ *   与一次去重,而不是各自生成 Append+Unique 再层层嵌套;
+ * - 允许把 UNION ALL 上提到 UNION 中(op->all == true 且 top 为去重 UNION):
+ *   去重操作会丢掉重复行,UNION ALL 子树的重复行反正会被滤掉,语义不变;
+ * - 非 UNION ALL 的顶层(op->all == false)时,把 top_union 作为 parentOp
+ *   传给子节点,鼓励它们生成排序输出,便于后续 MergeAppend 去重。
+ *
+ * 【参数】
+ *   root             —— PlannerInfo;
+ *   top_union        —— 顶层 UNION 节点;
+ *   refnames_tlist   —— 取列名的目标列表;
+ *   tlist_list       —— 输出:各子关系 tlist 的平行列表;
+ *   istrivial_tlist  —— 输出:各子关系平凡 tlist 标志的平行列表。
+ * 【返回值】子关系 RelOptInfo 列表(每个叶子子查询或非同构 setop 一项)。
+ */
 static List *
 plan_union_children(PlannerInfo *root,
 					SetOperationStmt *top_union,
@@ -1451,6 +1692,21 @@ plan_union_children(PlannerInfo *root,
 /*
  * postprocess_setop_rel - perform steps required after adding paths
  */
+/*
+ * postprocess_setop_rel - (中文)集合运算关系添加路径后的收尾处理
+ *
+ * 【作用】对刚填充完路径的 UPPERREL_SETOP 关系:先调用 create_upper_paths_hook
+ * 扩展点(允许扩展/FDW 贡献额外路径),再调用 set_cheapest 选出总代价最小
+ * (以及启动代价最小)的路径,供上层引用。
+ *
+ * 【设计思想】是各集合运算路径生成函数的公共收尾步骤,集中避免重复代码。
+ * set_cheapest 会同时设置 cheapest_total_path 与 cheapest_startup_path。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 已生成路径的 UPPERREL_SETOP 关系。
+ * 【返回值】无。
+ */
 static void
 postprocess_setop_rel(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -1476,6 +1732,35 @@ postprocess_setop_rel(PlannerInfo *root, RelOptInfo *rel)
  * input_tlist: targetlist of this node's input node
  * refnames_tlist: targetlist to take column names from
  * trivial_tlist: output parameter, set to true if targetlist is trivial
+ */
+/*
+ * generate_setop_tlist - (中文)为集合运算计划节点生成输出目标列表
+ *
+ * 【作用】对集合运算结果的每一列,生成一个 TLE:通常是一个引用输入列
+ * (input_tlist)的 Var(varno 由参数给出);若 hack_constants 且输入是常量,
+ * 则直接上提该常量(见设计思想);类型与结果列不一致时用 coerce_to_common_type
+ * 强制转换,排序规则不一致时用 RelabelType 修正;列名取自 refnames_tlist;
+ * 所有输出列统一设置 ressortgroupref = resno。*trivial_tlist 指示生成的
+ * tlist 是否"平凡"(无需转换)。
+ *
+ * 【设计思想】
+ * - hack_constants 上提常量主要是为了 UNKNOWN 常量在强制转换时得到正确
+ *   结果,但只在最底层 SubqueryScan 处做,避免上层出现伪造常量;
+ * - collation 必须显式正确,因为 plan_set_operations 用一组 SortGroupClause
+ *   描述输出排序,而它们不带 collation 只引用 tlist 项,错则上层规划会
+ *   出错;用 RelabelType 而非 CollateExpr,保证到达执行器时无需再处理;
+ * - ressortgroupref = resno 是贯穿本文件的约定,使上层可直接用列号引用
+ *   排序/分组属性。
+ *
+ * 【参数】
+ *   colTypes        —— 结果列类型列表;
+ *   colCollations   —— 结果列排序规则列表;
+ *   varno           —— 生成 Var 所用的 varno(0 表示占位);
+ *   hack_constants  —— true 时把输入常量原样上提;
+ *   input_tlist     —— 本节点输入的目标列表;
+ *   refnames_tlist  —— 取列名的目标列表;
+ *   trivial_tlist   —— 输出:是否平凡(类型与排序规则无需任何转换)。
+ * 【返回值】生成的目标列表。
  */
 static List *
 generate_setop_tlist(List *colTypes, List *colCollations,
@@ -1605,6 +1890,29 @@ generate_setop_tlist(List *colTypes, List *colCollations,
  * cannot figure out a realistic width for the tlist we make here.  But we
  * ought to refactor this code to produce a PathTarget directly, anyway.
  */
+/*
+ * generate_append_tlist - (中文)为集合运算的 Append 节点生成目标列表
+ *
+ * 【作用】为 Append(UNION 的合并器)生成输出目标列表:每列是一个 varno 为
+ * 0 的简单 Var,类型为集合运算结果列类型,typmod 取"各输入子 tlist 一致
+ * 时该 typmod,否则 -1",排序规则取结果列 collation,列名取自
+ * refnames_tlist;同样设置 ressortgroupref = resno。
+ *
+ * 【设计思想】
+ * - Append 本身不消费目标列表(各子计划各自投影),但必须让它"看起来像真
+ *   的",供上层计划阶段使用;统一 varno 0 的简单 Var 便于 setrefs.c 处理;
+ * - typmod 协商:遍历所有子 tlist,若某列各子类型与 typmod 都一致则沿用
+ *   (避免无谓的类型重排),否则用 -1(让类型系统按"通用 typmod"处理);
+ * - 注:set_pathtarget_cost_width 无法从 varno 0 的 Var 得到真实宽度,因此
+ *   create_setop_pathtarget 事后会手工修正宽度。
+ *
+ * 【参数】
+ *   colTypes        —— 结果列类型列表;
+ *   colCollations   —— 结果列排序规则列表;
+ *   input_tlists    —— 各子计划的 tlist 列表(Append 的子计划);
+ *   refnames_tlist  —— 取列名的目标列表。
+ * 【返回值】Append 节点的输出目标列表。
+ */
 static List *
 generate_append_tlist(List *colTypes, List *colCollations,
 					  List *input_tlists,
@@ -1714,6 +2022,25 @@ generate_append_tlist(List *colTypes, List *colCollations,
  * setop.  So what we need to do here is copy that list and install
  * proper sortgrouprefs into it (copying those from the targetlist).
  */
+/*
+ * generate_setop_grouplist - (中文)构建描述集合运算输出列排序/分组性质的
+ * SortGroupClause 列表
+ *
+ * 【作用】解析器已为集合运算确定每列的排序/分组属性并生成 groupClauses,
+ * 但其条目的 tleSortGroupRef 为 0(解析器输出表示里每个 setop 没有独立
+ * tlist)。本函数复制该列表,并按目标列表中每列的顺序,把 tleSortGroupRef
+ * 填成对应列的 ressortgroupref(即其 resno)。
+ *
+ * 【设计思想】集合运算树输出列的 sortgroupref 统一等于 resno(见
+ * generate_setop_tlist),因此这里只需把 SortGroupClause 的引用号与列号
+ * 对齐。之后该列表即可用于 make_pathkeys_for_sortclauses 生成排序 pathkey
+ * 或供 HashSetOp / SortSetOp / RecursiveUnion 做去重。
+ *
+ * 【参数】
+ *   op        —— 集合运算节点(提供 groupClauses);
+ *   targetlist —— 该节点已生成的输出目标列表。
+ * 【返回值】填充好 tleSortGroupRef 的 SortGroupClause 列表(新的拷贝)。
+ */
 static List *
 generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
 {
@@ -1753,6 +2080,24 @@ generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
  * Note: This is required because set op target lists use varno==0, which
  * results in a type default width estimate rather than one that's based on
  * statistics of the columns from the set op children.
+ */
+/*
+ * create_setop_pathtarget - (中文)为集合运算关系创建 PathTarget,并按子
+ * 路径的行数加权修正宽度
+ *
+ * 【作用】先调用 create_pathtarget 做常规转换,然后把 reltarget->width 覆盖
+ * 为"各子路径的 reltarget 宽度按各自行数加权平均"。
+ *
+ * 【设计思想】集合运算 tlist 用 varno == 0 的占位 Var,create_pathtarget
+ * 只能给它们类型默认宽度(与真实统计无关);而宽度影响排序/哈希代价估算,
+ * 因此这里用子路径的真实宽度加权平均替换,得到更准确的估计。parent_rows
+ * 为 0(无子路径)时保持默认宽度。
+ *
+ * 【参数】
+ *   root           —— PlannerInfo;
+ *   tlist          —— 集合运算输出目标列表;
+ *   child_pathlist —— 参与该集合运算的子路径列表。
+ * 【返回值】宽度已修正的 PathTarget。
  */
 static PathTarget *
 create_setop_pathtarget(PlannerInfo *root, List *tlist, List *child_pathlist)

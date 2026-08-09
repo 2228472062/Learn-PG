@@ -28,6 +28,40 @@
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * 【模块总览(中文)】
+ * 本文件是 PostgreSQL 优化器"预处理器"(prep 模块)的成员,负责预处理查询
+ * 树的目标列表(targetlist),即"输出哪些列、按什么顺序、以什么形式提供给
+ * 上层"。它是"生成计划之前重写查询树"的一部分。
+ *
+ * 【本模块的职责】
+ * - preprocess_targetlist():主入口。根据命令类型补齐/调整目标列表:
+ *   INSERT 必须为结果关系的每个用户属性都生成条目(缺失的属性补 NULL);
+ *   UPDATE 提取被更新列编号列表并重排 resno 为连续编号;为 UPDATE/DELETE/
+ *   MERGE 增加定位行所需的 "junk"(垃圾)列(如 ctid);为 FOR UPDATE/SHARE
+ *   的行锁与 EvalPlanQual 重检增加行标识列(ctid / wholerow / tableoid);
+ *   为 RETURNING 和 MERGE 动作中引用的外部关系 Var 增加 junk 条目;
+ * - expand_insert_targetlist():INSERT 专用的目标列表展开(补列、排序);
+ * - extract_update_targetlist_colnos():把 UPDATE 目标列表里的列编号抽取成
+ *   独立列表并把 resno 改成连续编号;
+ * - get_plan_rowmark():在行锁标记列表中按 RT 索引查找 PlanRowMark。
+ *
+ * 【设计思想】
+ * - "junk" 列的约定:标记 resjunk = true 的目标条目不对外输出,只供执行器
+ *   内部使用(定位待更新/删除的行、行锁、RETURNING 计算等),这样既不打乱
+ *   用户可见列的顺序,又能把执行所需的隐藏数据一路传递到计划节点;
+ * - 与重写器的分工:rewriteTargetListIU 已经处理了大部分 SQL 语义层面的
+ *   目标列表工作,本文件处理"物理访问表"层面的内容(补齐 INSERT 缺列、
+ *   增加行身份列),两者历史地互补;
+ * - INSERT 补齐列时的三个特例:已删除列(dropped)补 INT4 型 NULL、生成列
+ *   (generated)补基类型 NULL 以跳过域约束、普通列补带域约束检查的 NULL
+ *   (coerce_null_to_domain 可捕获域 NOT NULL 违规)。
+ *
+ * 【函数关系】
+ * preprocess_targetlist(入口,由 planner.c 在 preprocess_expression 之前
+ * 调用)在 INSERT 时调 expand_insert_targetlist,在 UPDATE 时调
+ * extract_update_targetlist_colnos;结果存回 root->processed_tlist(及
+ * root->update_colnos);get_plan_rowmark 是通用的行锁标记查找工具。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/prep/preptlist.c
  *
@@ -61,6 +95,36 @@ static List *expand_insert_targetlist(PlannerInfo *root, List *tlist,
  * Also, if this is an UPDATE, we return a list of target column numbers
  * in root->update_colnos.  (Resnos in processed_tlist will be consecutive,
  * so do not look at that to find out which columns are targets!)
+ */
+/*
+ * preprocess_targetlist - (中文)目标列表预处理的总驱动
+ *
+ * 【作用】由 planner.c 在规划早期对每个查询调用。完成:INSERT 用
+ * expand_insert_targetlist 补齐缺失属性并把非 junk 列排成表属性顺序;
+ * UPDATE 用 extract_update_targetlist_colnos 提取列编号并重排 resno;
+ * 非继承的 UPDATE/DELETE/MERGE 用 add_row_identity_columns 增加行身份
+ * (junk)列;MERGE 对每个动作做同样的 tlist 处理并收集动作/连接条件中
+ * 引用的外部 Var;为 FOR UPDATE/SHARE 的行锁与 EvalPlanQual 增加
+ * ctid/wholerow/tableoid junk 列;为 RETURNING 引用的其他关系 Var 增加
+ * junk 条目。结果存入 root->processed_tlist(UPDATE 还设置
+ * root->update_colnos)。
+ *
+ * 【设计思想】
+ * - 结果关系(结果表的 RTE)在前期已被加锁,这里用 NoLock 打开 relcache 即
+ *   可;结果关系必须是普通表(RTE_RELATION),否则解析器/重写器有误;
+ * - INSERT 的 tlist 约定是"与表属性顺序一致、缺列补 NULL";UPDATE 的
+ *   约定则是"resno = 被更新列编号",因此必须抽取成 update_colnos 并把
+ *   processed_tlist 重新编号为连续,此后不要再依赖 resno 找目标列;
+ * - 继承情况:行身份列的添加推迟到 expand_inherited_rtentry() 处理叶子
+ *   关系时,这里只为非继承情况直接添加;
+ * - 行锁 juk 列只对"父 RT"(rti == prti)添加,子关系复用父关系的;需要
+ *   TID 时加 ctid,需要整行复制时加 wholerow,继承父表另加 tableoid;
+ * - RETURNING / MERGE 引用的非结果关系 Var 若不在 tlist 中,补 resjunk
+ *   条目,使执行器能拿到这些值;结果关系自身的 Var 不需要(直接引用堆元组)。
+ *
+ * 【参数】root —— PlannerInfo,其 parse / rowMarks 等字段被读写,处理结果
+ * 写入 root->processed_tlist 与 root->update_colnos。
+ * 【返回值】无。
  */
 void
 preprocess_targetlist(PlannerInfo *root)
@@ -346,6 +410,25 @@ preprocess_targetlist(PlannerInfo *root)
  * This is also applied to the tlist associated with INSERT ... ON CONFLICT
  * ... UPDATE, although not till much later in planning.
  */
+/*
+ * extract_update_targetlist_colnos - (中文)抽取 UPDATE 目标列表中被更新列
+ * 的编号并重排 resno
+ *
+ * 【作用】解析器/重写器约定:UPDATE 的非 junk TLE 的 resno 就是"要赋值给
+ * 的目标表列号"。本函数遍历目标列表,把非 junk 条目的 resno 按顺序收集成
+ * 一个整型列表返回,同时把每个条目的 resno 改成 1..N 的连续编号(其他所有
+ * 查询类型都采用这一约定,便于执行器按输出顺序访问)。它也在规划后期被
+ * 用于处理 INSERT ... ON CONFLICT ... UPDATE 的目标列表。
+ *
+ * 【设计思想】把"目标列是谁"与"输出顺序是什么"两件事解耦:列编号列表
+ * (update_colnos)供执行器知道每列写入表的哪个属性,连续的 resno 让上层
+ * 规划代码可以用下标直接访问。junk 条目保留其 resjunk 属性,只参与编号
+ * 但不进入 update_colnos。
+ *
+ * 【参数】tlist —— UPDATE 的目标列表(TargetEntry 列表)。
+ * 【返回值】被更新列编号列表(List of int,与 tlist 中非 junk 条目的原
+ * resno 顺序一致)。
+ */
 List *
 extract_update_targetlist_colnos(List *tlist)
 {
@@ -379,6 +462,34 @@ extract_update_targetlist_colnos(List *tlist)
  *
  * Once upon a time we also did more or less this with UPDATE targetlists,
  * but now this code is only applied to INSERT targetlists.
+ */
+/*
+ * expand_insert_targetlist - (中文)展开 INSERT 的目标列表:补齐缺失属性并
+ * 保证属性顺序正确
+ *
+ * 【作用】给定解析器生成的 INSERT 目标列表与结果关系,生成新的目标列表:
+ * 按表的属性顺序(1..numattrs)逐列检查——已有对应 TLE 则沿用,否则构造
+ * 一个新 TLE(通常为 NULL 常量);最后把剩余 resjunk 条目追加到末尾并校正
+ * 其 resno,使它们都排在真实属性之后。
+ *
+ * 【设计思想】
+ * - 重写器应已保证 TLE 顺序正确,这里只需为"未提及的属性"补条目;
+ * - 补列的表达式有三类特例:
+ *   1) 已删除列(attisdropped):补 INT4 型 NULL——不能用已不存在的列类型,
+ *      而 NULL 的表示与类型无关;
+ *   2) 生成列(attgenerated):补基类型(去掉域包装后的类型)NULL,且不做域
+ *      约束检查——生成值会被忽略,不能让域 NOT NULL 误报错;
+ *   3) 普通列:coerce_null_to_domain 生成带域约束的 NULL,以捕获域 NOT NULL
+ *      等约束违规;若非 Const(可能产生了转换表达式),再跑一遍
+ *      eval_const_expressions 做常量折叠;
+ * - 追加 resjunk 时若 resno 与连续编号不一致,用 flatCopyTargetEntry 复制
+ *   一份再改(避免共享节点被多处修改);非 junk 出现在末尾说明顺序错了,报错。
+ *
+ * 【参数】
+ *   root —— PlannerInfo(用于 eval_const_expressions 等);
+ *   tlist —— 解析器生成的 INSERT 目标列表;
+ *   rel  —— 结果关系,提供属性元数据(rd_att)。
+ * 【返回值】展开后的新目标列表。
  */
 static List *
 expand_insert_targetlist(PlannerInfo *root, List *tlist, Relation rel)
@@ -523,6 +634,21 @@ expand_insert_targetlist(PlannerInfo *root, List *tlist, Relation rel)
  * Locate PlanRowMark for given RT index, or return NULL if none
  *
  * This probably ought to be elsewhere, but there's no very good place
+ */
+/*
+ * get_plan_rowmark - (中文)按 RT 索引查找 PlanRowMark
+ *
+ * 【作用】在给定的行锁标记列表(rowMarks)中线性查找 rti 等于指定值的
+ * PlanRowMark,找到返回其指针,找不到返回 NULL。
+ *
+ * 【设计思想】纯查找工具,放在本文件属历史原因(没有更合适的归属)。执行
+ * 器与规划器多处需要根据关系索引获取其行锁标记(例如 EPQ 检查与 FOR
+ * UPDATE 处理时)。
+ *
+ * 【参数】
+ *   rowmarks —— PlanRowMark 列表;
+ *   rtindex  —— 要查找的关系 RT 索引。
+ * 【返回值】匹配的 PlanRowMark 指针;未找到返回 NULL。
  */
 PlanRowMark *
 get_plan_rowmark(List *rowmarks, Index rtindex)

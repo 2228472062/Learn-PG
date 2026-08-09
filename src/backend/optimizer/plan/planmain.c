@@ -13,6 +13,56 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件是"单查询计划"的核心编排代码,负责为一条基本查询(只含简单连接,
+ * 不含子查询、继承、聚合、分组等复杂特性——那些由 planner.c 的
+ * subquery_planner 处理)生成路径(Path,即"简化计划")。注意顶层入口其实
+ * 在 planner.c,文件名容易让人误以为这里是规划器入口;这里规划的是"基本
+ * 连接操作"的主体。
+ *
+ * 【本模块在优化器中的职责】
+ * query_planner() 是唯一公开入口,它按固定顺序完成一整套预处理:
+ *   1. 初始化 PlannerInfo 中的各种列表(join_rel_list、等价类相关、外连接
+ *      子句列表等),并建立 simple_rel_array / simple_rte_array 访问数组;
+ *   2. 特殊情况优化:FROM 子句只有一个 RTE_RESULT 关系时(如
+ *      "SELECT 表达式"、"INSERT ... VALUES()"),直接构造单关系路径返回,
+ *      绕过全部常规流程;
+ *   3. 常规流程:先收集所有参与查询的 base 关系,再分析目标列表与连接树,
+ *      把 Var 引用加入各 baserel 的 targetlist、生成 PlaceHolderInfo、把
+ *      限制/连接子句归类、建立等价类(EquivalenceClass)与
+ *      SpecialJoinInfo,并调用 qp_callback 在等价类合并完成后计算
+ *      query_pathkeys;
+ *   4. 做连接消除与简化(去除无用外连接、把内关系唯一确定的半连接降级为
+ *      内连接、去除唯一列上的自连接),把占位符分发到 base 关系,扩展
+ *      appendrel(分区/UNION ALL 子关系),分发 UPDATE/DELETE/MERGE 的行
+ *      标识列;
+ *   5. 最后调用 make_one_rel() 生成顶层连接关系的全部候选路径,返回该
+ *      关系的 RelOptInfo。
+ *
+ * 【核心数据结构】
+ * - PlannerInfo(root):贯穿整个规划过程的核心上下文,记录 join_rel_list、
+ *   等价类(eq_classes)、join_info_list(外连接信息)、placeholder_list、
+ *   processed_tlist 等;
+ * - RelOptInfo:某个(base/join/upper)关系的路径集合容器;
+ * - Path:一种可能的执行方案(顺序扫描、索引扫描、各种连接方式);
+ * - joinlist:由 deconstruct_jointree() 得到的待规划连接树(嵌套 List,
+ *   叶节点是 RangeTblRef)。
+ *
+ * 【主要函数关系】
+ * query_planner() 内部按固定顺序调用:setup_simple_rel_arrays →
+ * add_base_rels_to_query → remove_useless_groupby_columns →
+ * build_base_rel_tlists → find_placeholders_in_jointree →
+ * find_lateral_references → deconstruct_jointree →
+ * reconsider_outer_join_clauses → generate_base_implied_equalities →
+ * (*qp_callback) → fix_placeholder_input_needed_levels → remove_useless_joins
+ * → reduce_unique_semijoins → remove_useless_self_joins →
+ * add_placeholders_to_base_rels → create_lateral_join_info →
+ * match_foreign_keys_to_quals → extract_restriction_or_clauses →
+ * setup_eager_aggregation → add_other_rels_to_query →
+ * distribute_row_identity_vars → make_one_rel。其中 remove_useless_joins /
+ * reduce_unique_semijoins / remove_useless_self_joins 均实现在
+ * analyzejoins.c 中;generate_implied_equalities 系列在 initsplan.c。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/plan/planmain.c
  *
@@ -49,6 +99,42 @@
  * plan.  This value is *not* available at call time, but is computed by
  * qp_callback once we have completed merging the query's equivalence classes.
  * (We cannot construct canonical pathkeys until that's done.)
+ */
+/*
+ * query_planner - (中文)为一条基本查询生成路径,返回顶层连接关系的 RelOptInfo
+ *
+ * 【作用】这是"基本查询规划"的主流程。调用者通常是 grouping_planner()(位于
+ * planner.c),在本函数返回后由它根据 query_pathkeys 等约束在 final_rel 的
+ * 路径集合中挑选最优路径并生成最终计划。本函数只负责把查询分析到
+ * make_one_rel() 这一步:返回顶层连接(或单关系)的 RelOptInfo,里面已装好
+ * 所有候选路径。
+ *
+ * 【设计思想】
+ * - 阶段划分:本函数按依赖关系分阶段执行,前一个阶段产生的数据结构是后
+ *   一阶段的输入。例如等价类(EC)合并必须先完成才能调用 qp_callback 计算
+ *   query_pathkeys,因为 canonical pathkeys 依赖 EC 的最终形态;
+ * - RTE_RESULT 特例:当 FROM 子句只有一个 RTE_RESULT 关系(如无 FROM 的
+ *   SELECT 常量、"INSERT ... VALUES()"),直接构造一个 RelOptInfo 并把查询
+ *   限定条件塞进一个 GroupResultPath(借用退化分组语义),然后设置
+ *   ec_merging_done = true 假装 EC 合并已完成,再调用一次 qp_callback 以便
+ *   正确处理 "SELECT 2+2 ORDER BY 1" 这类情况。这是刻意为之的快速路径;
+ * - 并行安全判定:只有 parallelModeOK 且(在子查询层或 debug_parallel_query
+ *   打开)时才检查 quals 是否 parallel-restricted,因为顶层纯 Result 计划
+ *   通常不值得并行化;
+ * - 延迟扩展 appendrel:把 add_other_rels_to_query() 放到最后,使每个
+ *   baserel 在扩展子关系前已拥有尽可能完整的信息(全部限制子句),这样可
+ *   以裁剪不满足限制子句的分区。
+ *
+ * 【参数】
+ *   root        —— PlannerInfo,描述待规划的查询;内含 parse(Query)、glob
+ *                  (PlannerGlobal)等。其中的 query_pathkeys 字段在调用时
+ *                  尚不可用,必须由 qp_callback 计算;
+ *   qp_callback —— 回调函数,在等价类合并完成后被调用,用于计算
+ *                  query_pathkeys、sort_pathkeys 等路径键字段(对常规调用
+ *                  者即 grouping_planner 的 grouping_planner_callback);
+ *   qp_extra    —— 传给 qp_callback 的可选附加数据,本函数原样透传。
+ * 【返回值】顶层连接关系(或唯一的 base 关系)的 RelOptInfo;若无法构造至少
+ * 一个可用路径会直接 elog(ERROR)。
  */
 RelOptInfo *
 query_planner(PlannerInfo *root,

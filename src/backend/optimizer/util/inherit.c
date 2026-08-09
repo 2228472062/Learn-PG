@@ -7,6 +7,33 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件处理继承树 / 分区表中的"子关系集合":把带有 inh 标志的 range
+ * table 项展开成全部相关子表(或分区、或 UNION ALL 子查询)的 RTE、
+ * RelOptInfo、AppendRelInfo,并把父关系上的条件(quals)、行标记(FOR
+ * UPDATE/SHARE 的 PlanRowMark)、列权限、被更新列等翻译并分发到各子表。
+ * 由此生成"appendrel"(Append 路径的输入集合),供路径生成阶段做 UNION
+ * ALL 式连接或分区裁剪。
+ *
+ * 【两种 appendrel 来源】
+ * - 继承 / 分区:RTE 的 relkind 为普通表/分区表,展开后为每个叶子(以及
+ *   每个中间分区)建 RTE + AppendRelInfo + RelOptInfo;分区表递归展开
+ *   (每一级分区套一层 AppendRelInfo),并利用父关系上的约束做分区裁剪
+ *   (prune_append_rel_partitions),被剪掉的叶子不建任何对象;
+ * - UNION ALL 子查询:subquery_planner 已把子查询展平并把 RTE/AppendRelInfo
+ *   造好,这里只需为各子查询建 RelOptInfo(expand_appendrel_subquery)。
+ *
+ * 【主要函数关系】
+ * expand_inherited_rtentry 是总入口,按 relkind 分流到
+ * expand_partitioned_rtentry(分区,递归)或 find_all_inheritors 遍历
+ * (传统继承),每个叶子交给 expand_single_inheritance_child 生成 RTE、
+ * AppendRelInfo 与 PlanRowMark;随后把新出现的行标记需要的 TID / wholerow
+ * / tableoid 等 junk 列追加进 processed_tlist。get_rel_all_updated_cols 取
+ * UPDATE 涉及的全部列(经 translate_col_privs / translate_col_privs_multilevel
+ * 做列号翻译,再并入依赖的生成列);apply_child_basequals 把父关系的
+ * baserestrictinfo 翻译成子关系自身的限制条件,并把常量假/空条件识别出来
+ * 以把子表标记为 dummy(这是约束排除能生效的关键)。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/util/inherit.c
  *
@@ -83,6 +110,33 @@ static void expand_appendrel_subquery(PlannerInfo *root, RelOptInfo *rel,
  * which is treated as an appendrel similarly to inheritance cases; however,
  * we already made RTEs and AppendRelInfos for the subqueries.  We only need
  * to build RelOptInfos for them, which is done by expand_appendrel_subquery.
+ */
+/*
+ * expand_inherited_rtentry - (中文)展开带 inh 标志的 range table 项
+ *
+ * 【作用】把查询里"表示整个继承/分区集合"的一个 RTE(rel, rti)展开成
+ * 全部子关系:为每个子表建 RTE、AppendRelInfo、RelOptInfo,必要时建
+ * PlanRowMark,并把行标记需要的 junk 列(TID / wholerow / tableoid)加入
+ * 顶层 processed_tlist。由 subquery_planner / preprocess 阶段对每个 rel 调用。
+ *
+ * 【设计思想】按 relkind 分流:
+ * - 分区表 → expand_partitioned_rtentry 递归展开(分区表本身无数据、不被
+ *   扫描,不生成表示自身的子 RTE,且会先做分区裁剪);
+ * - 普通表 → find_all_inheritors 找出整个继承集合(含父表自身,第一个元素
+ *   即父表),逐个调用 expand_single_inheritance_child;其中属于其他会话的
+ *   临时表会被静默跳过。传统继承下父表自身也会生成一个 inh=false 的 RTE,
+ *   充当集合中的普通成员。
+ * 行标记方面:父 RTE 若被 FOR UPDATE/SHARE,先把父 PlanRowMark 的 isParent
+ * 置 true,再为每个子表生成子 PlanRowMark;所有子表的 markType 会累积进
+ * 父表 allMarkTypes。展开结束后,若累积出的 mark 类型比展开前多了,就把
+ * 对应 junk 列(TID 需要 ROW_MARK 非 COPY 类、整行需要 ROW_MARK_COPY、
+ * tableoid 在父表此前未被标记时需要)追加进 processed_tlist 并补进父表
+ * reltarget——与 preprocess_targetlist 早先针对父表本应添加的列保持一致。
+ *
+ * 【参数】
+ *   root —— 规划上下文;rel —— 表示该继承集合的 RelOptInfo;
+ *   rte  —— 带 inh 标志的 RTE;rti —— 它的 RTE 下标。
+ * 【返回值】无。
  */
 void
 expand_inherited_rtentry(PlannerInfo *root, RelOptInfo *rel,
@@ -316,6 +370,35 @@ expand_inherited_rtentry(PlannerInfo *root, RelOptInfo *rel,
  * expand_partitioned_rtentry
  *		Recursively expand an RTE for a partitioned table.
  */
+/*
+ * expand_partitioned_rtentry - (中文)递归展开分区表 RTE
+ *
+ * 【作用】对单个分区表:取出分区描述,用父表限制条件做分区裁剪,然后为
+ * 每个存活分区建 RTE、AppendRelInfo、RelOptInfo;若分区自身仍是分区表,
+ * 递归展开它。同时维护父 RelOptInfo 的 part_rels 数组与 all_partrels 位图。
+ *
+ * 【设计思想】逐层展开(level-by-level):每个分区都与其直接父分区构成
+ * 一条 AppendRelInfo 映射,中间层分区同时是"子"与"父"。分区裁剪
+ * (prune_append_rel_partitions)先把不需要的叶子砍掉,存活的以 PartitionDesc
+ * 下标记录在 relinfo->live_parts;part_rels 用 palloc0 分配,被剪掉的下标
+ * 槽位保持 NULL。对每个存活分区:
+ * - try_table_open 打开(刚被 DETACH+DROP 的分区会打开失败,视为被剪掉);
+ * - 其他会话的临时分区直接报错(定义时本就不允许);
+ * - expand_single_inheritance_child 建 RTE/AppendRelInfo/PlanRowMark,
+ *   build_simple_rel 建 RelOptInfo 并填入 part_rels、并入 all_partrels;
+ * - 若是分区表,用 translate_col_privs 把父的 updatedCols 翻译成本分区的
+ *   列号后递归。updatedCols 沿继承链逐层翻译,是后续 get_rel_all_updated_cols
+ *   的数据来源。递归用 check_stack_depth 防止深分区层级爆栈。
+ *
+ * 【参数】
+ *   root             —— 规划上下文;relinfo —— 父分区关系的 RelOptInfo;
+ *   parentrte / parentRTindex —— 父分区 RTE 及其下标;
+ *   parentrel        —— 已打开的父分区关系;
+ *   parent_updatedCols —— 父的更新列位图(将翻译给子分区);
+ *   top_parentrc     —— 顶层结果的 PlanRowMark(若有);
+ *   lockmode         —— 给子分区加锁的模式。
+ * 【返回值】无。
+ */
 static void
 expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 						   RangeTblEntry *parentrte,
@@ -448,6 +531,34 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
  *
  * The child RangeTblEntry and its RTI are returned in "childrte_p" and
  * "childRTindex_p" resp.
+ */
+/*
+ * expand_single_inheritance_child - (中文)为单个子关系建 RTE/AppendRelInfo/PlanRowMark
+ *
+ * 【作用】为给定的父子关系对构建完整的三件套:child RTE(挂入 parse->rtable)、
+ * AppendRelInfo(挂入 append_rel_list 与 append_rel_array)、以及在父被 FOR
+ * UPDATE/SHARE 时的子 PlanRowMark(挂入 root->rowMarks)。同时维护
+ * all_result_relids / leaf_result_relids,并注册目标子表所需的行标识列。
+ *
+ * 【设计思想】子 RTE 用"平拷贝父 RTE + 替换关键字段"生成:relid、relkind、
+ * inh(仅当子仍是分区表时为 true,以便上层继续展开)、securityQuals 清空
+ * (RLS 只按父的语义应用,父的限制条件会随 base quals 分发下去)、
+ * perminfoindex 置 0(子 RTE 不参与权限检查,权限由父统一负责)。列的别名
+ * (alias/eref)根据 parent_colnos 反向映射逐列从父的列名复制,EXPLAIN 才能
+ * 打印出正确的子表列名。若该子表被标记 FOR UPDATE/SHARE,子 PlanRowMark
+ * 的 markType 按子表 relkind 重新选择,partitioned 子表标记 isParent(executor
+ * 忽略它,只借它完成加锁);各子表 markType 累积进顶层父的 allMarkTypes。
+ * 对 UPDATE/DELETE/MERGE 的目标集合:把本子表加入 all_result_relids(叶子则
+ * 再加进 leaf_result_relids),并为非分区叶子注册 tableoid 与所需行标识列
+ * (add_row_identity_var / add_row_identity_columns)。
+ *
+ * 【参数】
+ *   root           —— 规划上下文;parentrte / parentRTindex —— 直接父 RTE 及下标;
+ *   parentrel      —— 直接父关系;childrel —— 已打开的子关系;
+ *   top_parentrc   —— 顶层父的 PlanRowMark(可能为 NULL);
+ *   childrte_p     —— 输出参数:生成的子 RTE;
+ *   childRTindex_p —— 输出参数:子 RTE 下标。
+ * 【返回值】无(通过输出参数返回)。
  */
 static void
 expand_single_inheritance_child(PlannerInfo *root, RangeTblEntry *parentrte,
@@ -650,6 +761,24 @@ expand_single_inheritance_child(PlannerInfo *root, RangeTblEntry *parentrte,
  * 		Returns the set of columns of a given "simple" relation that are
  * 		updated by this query.
  */
+/*
+ * get_rel_all_updated_cols - (中文)返回某关系被本查询更新的全部列集合
+ *
+ * 【作用】仅用于 UPDATE 查询:返回关系 rel(必须是简单关系)中被本查询
+ * 更新(含其依赖的生成列)的全部列号位图。供权限检查、行约束处理等处使用。
+ *
+ * 【设计思想】updatedCols 的权威来源是 resultRelation 对应 RTEPermissionInfo
+ * 的 updatedCols 位图(记录查询直接 SET 的列)。若 rel 不是 resultRelation
+ * (即某个继承叶子),则用 translate_col_privs_multilevel 把该位图逐级翻译
+ * 到 rel 的列号(translate_col_privs 会把父的整行引用展开为全部继承列)。
+ * 最后用 get_dependent_generated_columns 查出依赖于这些列的计算列,并并入
+ * 结果。注意列号位图以 FirstLowInvalidHeapAttributeNumber 作偏移,系统列
+ * 也在其中。
+ *
+ * 【参数】
+ *   root —— 规划上下文;rel —— 目标"简单"关系(基表或其它关系)。
+ * 【返回值】被更新列号位图(含依赖的生成列)。
+ */
 Bitmapset *
 get_rel_all_updated_cols(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -704,6 +833,26 @@ get_rel_all_updated_cols(PlannerInfo *root, RelOptInfo *rel)
  * query is really only going to reference the inherited columns.  Instead
  * we set the per-column bits for all inherited columns.
  */
+/*
+ * translate_col_privs - (中文)把父表的列权限位图翻译成子表的列权限位图
+ *
+ * 【作用】将父关系上的"按列权限/更新列"位图(parent_privs,列号按
+ * FirstLowInvalidHeapAttributeNumber 偏移)按 translated_vars 翻译成子表的
+ * 对应位图。系统列号在父子表中一致,直接透传;普通列按 Var 的 varattno
+ * 映射;父表的整行引用不翻译为子表的整行引用(那会要求对所有子列都有权限,
+ * 过于严格),而是展开为全部继承列的逐列位。
+ *
+ * 【设计思想】系统列先原样复制(attno 负值段,列号相等即权限相等);然后
+ * 检查父表是否有整行引用(InvalidAttrNumber 位)。对 translated_vars 逐项
+ * 遍历:跳过 NULL(父表已删列,无权限语义);若父位图含整行位或含该父列位,
+ * 就把子表对应列的位(mapped varattno)加入结果。子表多出的列(父列号为 0
+ * 的翻译项)不可能出现在结果中,因为它们没有对应父列。
+ *
+ * 【参数】
+ *   parent_privs   —— 父表的列权限位图;
+ *   translated_vars —— 该父子对的翻译列表(AppendRelInfo.translated_vars)。
+ * 【返回值】翻译后的子表列权限位图。
+ */
 static Bitmapset *
 translate_col_privs(const Bitmapset *parent_privs,
 					List *translated_vars)
@@ -754,6 +903,21 @@ translate_col_privs(const Bitmapset *parent_privs,
  * a whole-row reference into all inherited columns.  This is not an issue
  * for current usages, but beware.
  */
+/*
+ * translate_col_privs_multilevel - (中文)跨多级继承翻译列号位图
+ *
+ * 【作用】把顶层父表上的列号位图(parent_cols)翻译到后代关系 rel 的列号。
+ * 沿 rel->parent 链自底向上递归,逐级调用 translate_col_privs。
+ *
+ * 【设计思想】与其它 multilevel 翻译函数同样的递归模式:rel 的立即父不是
+ * 顶层父时,先递归把位图翻译到立即父,再用该层的 AppendRelInfo 翻译到 rel。
+ * parent_cols 为空时快速返回 NULL。
+ *
+ * 【参数】
+ *   root        —— 规划上下文;rel —— 目标后代关系;
+ *   parent_rel  —— 顶层父关系;parent_cols —— 顶层父表的列号位图。
+ * 【返回值】翻译到 rel 的列号位图。
+ */
 static Bitmapset *
 translate_col_privs_multilevel(PlannerInfo *root, RelOptInfo *rel,
 							   RelOptInfo *parent_rel,
@@ -792,6 +956,24 @@ translate_col_privs_multilevel(PlannerInfo *root, RelOptInfo *rel,
  * is a UNION ALL subquery that's been flattened into an appendrel, with
  * child subqueries listed in root->append_rel_list.  We need to build
  * a RelOptInfo for each child relation so that we can plan scans on them.
+ */
+/*
+ * expand_appendrel_subquery - (中文)为被展平的 UNION ALL 子查询建 RelOptInfo
+ *
+ * 【作用】当 rel 是一个带 inh 标志的子查询 RTE(即 UNION ALL 集合的父)时,
+ * 为它的每个子查询(其 RTE 与 AppendRelInfo 已在 subquery_planner 阶段造好)
+ * 构建 RelOptInfo,以便后续可对每个子查询规划扫描路径。
+ *
+ * 【设计思想】父与子的关系已由 root->append_rel_list 中的 AppendRelInfo
+ * 表达(并非本函数创建),这里只需遍历该列表、筛出 parent_relid == rti 的
+ * 条目,用 build_simple_rel 为 child_relid 建 RelOptInfo。子查询自身仍可能
+ * 是继承/分区的 UNION ALL 成员(childrte->inh),此时递归调用
+ * expand_inherited_rtentry 继续展开。
+ *
+ * 【参数】
+ *   root —— 规划上下文;rel —— 父(子查询)RelOptInfo;
+ *   rte  —— 父 RTE;rti —— 父 RTE 下标。
+ * 【返回值】无。
  */
 static void
 expand_appendrel_subquery(PlannerInfo *root, RelOptInfo *rel,
@@ -834,6 +1016,33 @@ expand_appendrel_subquery(PlannerInfo *root, RelOptInfo *rel,
  * return false and don't apply any quals.  Caller should mark the relation as
  * a dummy rel in this case, since it doesn't need to be scanned.  Constant
  * true quals are ignored.
+ */
+/*
+ * apply_child_basequals - (中文)把父关系的限制条件翻译分发到子关系
+ *
+ * 【作用】把父关系 parentrel 的 baserestrictinfo 中每个限制条件用
+ * appendrel 翻译成子关系版本,并做常量折叠,得到子关系的 baserestrictinfo。
+ * 任一条件折叠成常量 false 或 NULL(即子表不可能有满足条件的行)时立即返回
+ * false,调用方据此把该子表标记为 dummy(不需要扫描)——这正是约束排除/
+ * 分区裁剪的逻辑基础。常量 true 条件被丢弃。
+ *
+ * 【设计思想】逐条 RestrictInfo 独立处理,原因有二:其一,子表 reltarget
+ * 可能含非 Var 表达式,翻译后的条件可能暴露出常量折叠或伪常量子句的机会,
+ * 必须分别变换求值;其二,要保持每个条件的 security_level 以便排序。每条
+ * 条件流程:adjust_appendrel_attrs 翻译 → eval_const_expressions 折叠 →
+ * 常量判定(假/空 → 整体失败;真 → 跳过)→ make_ands_implicit 展开 AND
+ * → 逐个子句判伪常量(无 Var 且无易变函数,若有则置 root->hasPseudoConstantQuals
+ * 让 createplan 生成 gating quals)→ make_restrictinfo 重建(继承父条件的
+ * is_pushed_down / has_clone / is_clone / security_level)。另外,子表 RTE
+ * 自身的 securityQuals(目前仅 UNION ALL 子查询会有)也要并入,安全等级从
+ * 0 递增分配。最后把结果与最小安全等级写入 childrel。
+ *
+ * 【参数】
+ *   root      —— 规划上下文;parentrel —— 父(appendrel 父)关系;
+ *   childrel  —— 待填充的子关系;childRTE —— 子关系的 RTE;
+ *   appinfo   —— 该父子对的 AppendRelInfo。
+ * 【返回值】true 表示成功应用了子表限制条件;false 表示有条件是常量假/空,
+ * 调用方应把子关系标记为 dummy。
  */
 bool
 apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,

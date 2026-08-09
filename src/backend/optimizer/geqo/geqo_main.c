@@ -439,6 +439,21 @@ gimme_pool_size(int nr_rel)
  * sure that less-fit individuals get pushed out of the breeding
  * population before the run finishes.
  */
+/*
+ * gimme_number_generations - (中文)确定遗传算法的世代数
+ *
+ * 【作用】返回演化循环要执行的世代数:用户配置了 Geqo_generations > 0 则
+ * 直接采用,否则默认取池规模。由 geqo() 调用。
+ *
+ * 【设计思想】默认世代数 = 池规模是有意的:演化过程每代淘汰一个最差个体
+ * 并可能插入更好的个体,需要足够的世代数才能保证"不理想的个体在运行结束
+ * 前被淘汰出繁殖种群",使最终池中最优个体足够可信。世代数过大浪费时间,
+ * 过小则收敛不充分;取池规模是一个简洁且经验上可靠的折中。若要调整
+ * 搜索强度,可显式配置 Geqo_generations。
+ *
+ * 【参数】pool_size —— 由 gimme_pool_size 得出的池规模。
+ * 【返回值】世代数(> 0)。
+ */
 static int
 gimme_number_generations(int pool_size)
 {

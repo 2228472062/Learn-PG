@@ -31,6 +31,30 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件负责为基表识别可用的 TID 条件,并据此生成 TidPath(直接按元组
+ * 标识符取行的路径)与 TidRangePath(TID 范围扫描路径)。TID 是物理定位
+ * 符,命中时能以最少的页访问直达目标元组,是特定场景下的高效路径。
+ *
+ * 【设计思想】识别三类可用条件:
+ * - 等值类:TidPath 支持 CTID = 伪常量、CTID = ANY(伪常量数组)、多个
+ *   等值条件的 OR 组合,以及 CurrentOfExpr("WHERE CURRENT OF 游标",
+ *   运行时才知 TID,保持专有节点到执行期);
+ * - 范围类:TidRangePath 支持 CTID <op> 伪常量(op 为 >、>=、<、<=)及
+ *   这类条件的 AND 组合;
+ * - 参数化:TID 等值条件可引用查询中其他关系的 Var(只要不含易变函数),
+ *   从而生成带 required_outer 的参数化 TidPath。
+ * "伪常量"的定义与索引扫描一致:不含易变函数、不含本关系 Var。
+ *
+ * 【主要函数关系】
+ * 判定层:IsCTIDVar(是否为 CTID Var)、IsBinaryTidClause(二元 TID 子句
+ * 基类)、IsTidEqualClause / IsTidRangeClause / IsTidEqualAnyClause /
+ * IsCurrentOfClause、RestrictInfoIsTidQual(综合判定);提取层:
+ * TidQualFromRestrictInfoList / TidRangeQualFromRestrictInfoList(从条件
+ * 列表递归提取);路径生成:create_tidscan_paths 是唯一对外入口,内部经
+ * BuildParameterizedTidPaths 生成参数化路径(含基于等价类 EC 的隐含等值
+ * 条件,回调 ec_member_matches_ctid)。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/path/tidpath.c
  *
@@ -52,6 +76,22 @@
 /*
  * Does this Var represent the CTID column of the specified baserel?
  */
+/*
+ * IsCTIDVar - (中文)判断该 Var 是否是指定基表的 CTID 列
+ *
+ * 【作用】判定层的基础谓词:检查 var 是否表示 rel 的 ctid 系统列。被
+ * IsBinaryTidClause / IsTidEqualAnyClause / ec_member_matches_ctid 复用。
+ *
+ * 【设计思想】要求 varattno 为 SelfItemPointerAttributeNumber(-1,即 ctid
+ * 系统列)、类型为 TIDOID、varno 等于 rel->relid、未被任何外连接置空
+ * (varnullingrels 为空)、层级为 0(本层)。类型检查只是保险(vartype 是
+ * 严格的,防止来自其他来源的同名系统列)。
+ *
+ * 【参数】
+ *   var —— 待检查的 Var;
+ *   rel —— 目标基表。
+ * 【返回值】true:var 是 rel 的 CTID Var;false:不是。
+ */
 static inline bool
 IsCTIDVar(Var *var, RelOptInfo *rel)
 {
@@ -72,6 +112,24 @@ IsCTIDVar(Var *var, RelOptInfo *rel)
  *		pseudoconstant OP CTID
  * where OP is a binary operation, the CTID Var belongs to relation "rel",
  * and nothing on the other side of the clause does.
+ */
+/*
+ * IsBinaryTidClause - (中文)判断 RestrictInfo 是否为"CTID OP 伪常量"形式
+ * 的二元子句
+ *
+ * 【作用】识别 CTID 位于二元操作符任一侧、另一侧不引用 rel 的伪常量、
+ * 且整个子句不含易变函数的 OpExpr。是等值与范围两类 TID 子句的共同
+ * 基类判定。
+ *
+ * 【设计思想】先确认是二元 OpExpr;再在左右参数中找 CTID(任一位置均可,
+ * 后续实际算子判断交由上层决定),记录"另一侧"及其 relids;最后要求
+ * 另一侧不含 rel 的 relid 且不含易变函数——这正是"伪常量"的定义。返回
+ * true 只保证形式合格,算子是否为 = 或范围操作符由上层分别判定。
+ *
+ * 【参数】
+ *   rinfo —— 待判定的连接/限制条件;
+ *   rel   —— 目标基表。
+ * 【返回值】true:形式为 CTID OP 伪常量;false:不是。
  */
 static bool
 IsBinaryTidClause(RestrictInfo *rinfo, RelOptInfo *rel)
@@ -127,6 +185,20 @@ IsBinaryTidClause(RestrictInfo *rinfo, RelOptInfo *rel)
  * where the CTID Var belongs to relation "rel", and nothing on the
  * other side of the clause does.
  */
+/*
+ * IsTidEqualClause - (中文)判断是否"CTID = 伪常量"形式的 TID 等值子句
+ *
+ * 【作用】在 IsBinaryTidClause 成立的基础上,进一步要求操作符是
+ * TIDEqualOperator(tideq),即精确匹配单一 TID。
+ *
+ * 【设计思想】直接复用二元基类判定再查算子 OID,保持两个判定的职责单一
+ * 清晰。
+ *
+ * 【参数】
+ *   rinfo —— 待判定条件;
+ *   rel   —— 目标基表。
+ * 【返回值】true:CTID = 伪常量;false:不是。
+ */
 static bool
 IsTidEqualClause(RestrictInfo *rinfo, RelOptInfo *rel)
 {
@@ -146,6 +218,21 @@ IsTidEqualClause(RestrictInfo *rinfo, RelOptInfo *rel)
  *		pseudoconstant OP CTID
  * where OP is a range operator such as <, <=, >, or >=, the CTID Var belongs
  * to relation "rel", and nothing on the other side of the clause does.
+ */
+/*
+ * IsTidRangeClause - (中文)判断是否"CTID <op> 伪常量"形式的 TID 范围
+ * 子句
+ *
+ * 【作用】在 IsBinaryTidClause 成立的基础上,要求操作符是 <、<=、> 或 >=
+ * 四个 TID 范围比较操作符之一,用于 TidRangePath。
+ *
+ * 【设计思想】同样复用二元基类判定,再查操作符 OID 集合。范围条件可多条
+ * AND 组合(由 TidRangeQualFromRestrictInfoList 收集)。
+ *
+ * 【参数】
+ *   rinfo —— 待判定条件;
+ *   rel   —— 目标基表。
+ * 【返回值】true:CTID <op> 伪常量(范围比较);false:不是。
  */
 static bool
 IsTidRangeClause(RestrictInfo *rinfo, RelOptInfo *rel)
@@ -168,6 +255,24 @@ IsTidRangeClause(RestrictInfo *rinfo, RelOptInfo *rel)
  *		CTID = ANY (pseudoconstant_array)
  * where the CTID Var belongs to relation "rel", and nothing on the
  * other side of the clause does.
+ */
+/*
+ * IsTidEqualAnyClause - (中文)判断是否"CTID = ANY(伪常量数组)"形式的
+ * TID 等值子句
+ *
+ * 【作用】识别 ScalarArrayOpExpr 形式的 TID 等值:操作符为 tideq、useOr
+ * 为 true(即 ANY)、CTID 必须是第一个参数、数组参数不含 rel 的 Var 且无
+ * 易变函数。它支撑 WHERE ctid IN (tid1, tid2, ...) 这类写法。
+ *
+ * 【设计思想】单独识别 ScalarArrayOpExpr 而非把它展开成多个等值,是为
+ * 了保留数组形式、方便执行器一次取多个 TID。CTID 固定要求在第一参数
+ * (数组在第二参数)。
+ *
+ * 【参数】
+ *   root  —— 规划上下文,用于 pull_varnos;
+ *   rinfo —— 待判定条件;
+ *   rel   —— 目标基表。
+ * 【返回值】true:CTID = ANY(伪常量数组);false:不是。
  */
 static bool
 IsTidEqualAnyClause(PlannerInfo *root, RestrictInfo *rinfo, RelOptInfo *rel)
@@ -208,6 +313,21 @@ IsTidEqualAnyClause(PlannerInfo *root, RestrictInfo *rinfo, RelOptInfo *rel)
 /*
  * Check to see if a RestrictInfo is a CurrentOfExpr referencing "rel".
  */
+/*
+ * IsCurrentOfClause - (中文)判断 RestrictInfo 是否为引用 rel 的
+ * CurrentOfExpr
+ *
+ * 【作用】识别 "WHERE CURRENT OF 游标" 条件:它是"CTID = 运行时确定的
+ * TID"的抽象,保持专有节点直到执行期由游标位置解析实际 TID。
+ *
+ * 【设计思想】CurrentOfExpr 的 cvarno 记录目标关系的 varno,与 rel->relid
+ * 相等即为本关系的 CURRENT OF 条件。
+ *
+ * 【参数】
+ *   rinfo —— 待判定条件;
+ *   rel   —— 目标基表。
+ * 【返回值】true:是引用 rel 的 CURRENT OF 条件;false:不是。
+ */
 static bool
 IsCurrentOfClause(RestrictInfo *rinfo, RelOptInfo *rel)
 {
@@ -230,6 +350,25 @@ IsCurrentOfClause(RestrictInfo *rinfo, RelOptInfo *rel)
  *
  * This function considers only base cases; AND/OR combination is handled
  * below.
+ */
+/*
+ * RestrictInfoIsTidQual - (中文)综合判断单个 RestrictInfo 能否用作 rel
+ * 的 CTID 限定条件
+ *
+ * 【作用】基表(单子句)级判定,只处理基础情形;AND/OR 组合由上层
+ * TidQualFromRestrictInfoList 负责。是 TidPath 条件筛选的核心闸门。
+ *
+ * 【设计思想】依次排除:伪常量子句(不含 Var,不可能命中)、不能安全提前
+ * 求值的子句(restriction_is_securely_promotable,即可能被更低安全等级
+ * 条件延迟);再依次尝试等值、=ANY、CURRENT OF 三类基础形式,任一命中即
+ * 通过。注意范围条件不属于 TidPath 的限定(它属于 TidRangePath,不走此
+ * 函数)。
+ *
+ * 【参数】
+ *   root  —— 规划上下文;
+ *   rinfo —— 待判定条件;
+ *   rel   —— 目标基表。
+ * 【返回值】true:可作为 rel 的 CTID 限定条件;false:不可。
  */
 static bool
 RestrictInfoIsTidQual(PlannerInfo *root, RestrictInfo *rinfo, RelOptInfo *rel)
@@ -276,6 +415,27 @@ RestrictInfoIsTidQual(PlannerInfo *root, RestrictInfo *rinfo, RelOptInfo *rel)
  * we have to do that, we also apply some very-trivial preference rules about
  * which of the other possibilities should be chosen, in the unlikely event
  * that there's more than one choice.
+ */
+/*
+ * TidQualFromRestrictInfoList - (中文)从隐式 AND 的条件列表中提取 CTID
+ * 限定条件集合
+ *
+ * 【作用】从 rel 的限制/连接条件列表(rlist)中提取可用的 TID 限定条件,
+ * 返回一个"列表内隐含 OR 语义"的 CTID 条件列表,无可用时返回 NIL。对
+ * AND 内嵌的 OR 条件,要求 OR 的每个分支都能提取出至少一个 CTID 子句。
+ *
+ * 【设计思想】特殊规则:CURRENT OF 条件一旦存在,必须"只返回它"——否则
+ * 执行器无法工作。正常情况下 CURRENT OF 因语法限制总是孤立,但 RLS 条件
+ * 可能以 AND 形式与它并存,甚至 RLS 条件也可能是 CTID 条件,故必须扫描
+ * 整个 rlist 先确认有无 CurrentOfExpr。顺带实现两条极简偏好:普通单子句
+ * 优先于 OR 组合;多个可用 OR 组合时取较短者。
+ *
+ * 【参数】
+ *   root        —— 规划上下文;
+ *   rlist       —— 隐式 AND 的 RestrictInfo 列表;
+ *   rel         —— 目标基表;
+ *   isCurrentOf —— 输出:是否命中了 CURRENT OF 条件。
+ * 【返回值】CTID 限定条件(RestrictInfo)列表,隐含 OR 语义;无则 NIL。
  */
 static List *
 TidQualFromRestrictInfoList(PlannerInfo *root, List *rlist, RelOptInfo *rel,
@@ -394,6 +554,23 @@ TidQualFromRestrictInfoList(PlannerInfo *root, List *rlist, RelOptInfo *rel,
  * usable range conditions or if the rel's table AM does not support TID range
  * scans.
  */
+/*
+ * TidRangeQualFromRestrictInfoList - (中文)从隐式 AND 条件列表提取 CTID
+ * 范围条件集合
+ *
+ * 【作用】收集 rlist 中所有 IsTidRangeClause 命中的范围条件,返回"隐含
+ * AND 语义"的列表;若关系表 AM 不支持 TID 范围扫描(rel->amflags 无
+ * AMFLAG_HAS_TID_RANGE)则直接返回 NIL。
+ *
+ * 【设计思想】与 TidQualFromRestrictInfoList 不同,这里不做 AND/OR 递归
+ * 组合——范围条件只按简单的"每条都收"处理,多条条件之间的 AND 语义由
+ * 执行器合并。
+ *
+ * 【参数】
+ *   rlist —— 隐式 AND 的 RestrictInfo 列表;
+ *   rel   —— 目标基表。
+ * 【返回值】CTID 范围条件(RestrictInfo)列表;无则 NIL。
+ */
 static List *
 TidRangeQualFromRestrictInfoList(List *rlist, RelOptInfo *rel)
 {
@@ -421,6 +598,28 @@ TidRangeQualFromRestrictInfoList(List *rlist, RelOptInfo *rel)
  * In principle we could combine clauses that reference the same outer rels,
  * but it doesn't seem like such cases would arise often enough to be worth
  * troubling over.
+ */
+/*
+ * BuildParameterizedTidPaths - (中文)为每条可用的 TID 等值连接条件生成
+ * 参数化 TidPath
+ *
+ * 【作用】遍历给定连接条件列表(clauses,可能来自等价类推导或 joininfo),
+ * 为每个符合条件的 TID 等值子句生成一个带 required_outer 的 TidPath 并
+ * 加入 rel 的路径列表。
+ *
+ * 【设计思想】虽然理论可把引用相同外层关系的多个子句合并成一条路径,但
+ * 此类情形罕见,不值得为它复杂化。筛选步骤:跳过伪常量、不可安全提前、
+ * 非 IsTidEqualClause 的子句;再用 join_clause_is_movable_to 确认可移到
+ * rel(对 EC 推导出的子句这步基本冗余,但对"松散"连接子句是必要的)。
+ * required_outer = (子句 required_relids ∪ rel 的 lateral_relids) 去掉
+ * rel 自身。参数化 TID 扫描只考虑等值子句:SAOP 与 CURRENT OF 不会在此
+ * 出现,故不调用综合判定 RestrictInfoIsTidQual,但其余规则须与其保持一致。
+ *
+ * 【参数】
+ *   root    —— 规划上下文;
+ *   rel     —— 目标基表;
+ *   clauses —— 候选连接条件(RestrictInfo)列表。
+ * 【返回值】无(路径经 add_path 加入 rel)。
  */
 static void
 BuildParameterizedTidPaths(PlannerInfo *root, RelOptInfo *rel, List *clauses)
@@ -477,6 +676,24 @@ BuildParameterizedTidPaths(PlannerInfo *root, RelOptInfo *rel, List *clauses)
  *
  * This is a callback for use by generate_implied_equalities_for_column.
  */
+/*
+ * ec_member_matches_ctid - (中文)等价类成员匹配 rel 的 CTID Var 的回调
+ *
+ * 【作用】作为 generate_implied_equalities_for_column 的回调使用:判断
+ * 等价类成员 em 的表达式是否就是 rel 的 CTID Var,是则返回 true,触发
+ * 该等价类为 CTID 列生成隐含等值条件。
+ *
+ * 【设计思想】把 IsCTIDVar 包装成回调协议(em->em_expr 必须是 Var 且
+ * 是 CTID),与路径生成的其余部分解耦,便于复用通用 EC 工具。
+ *
+ * 【参数】
+ *   root —— 规划上下文;
+ *   rel  —— 目标基表;
+ *   ec   —— 当前等价类(本函数不使用,符合回调协议);
+ *   em   —— 待检查的等价类成员;
+ *   arg  —— 额外参数(本函数不使用)。
+ * 【返回值】true:em 即 rel 的 CTID Var;false:不是。
+ */
 static bool
 ec_member_matches_ctid(PlannerInfo *root, RelOptInfo *rel,
 					   EquivalenceClass *ec, EquivalenceMember *em,
@@ -492,6 +709,33 @@ ec_member_matches_ctid(PlannerInfo *root, RelOptInfo *rel,
  * create_tidscan_paths
  *	  Create paths corresponding to direct TID scans of the given rel and add
  *	  them to the corresponding path list via add_path or add_partial_path.
+ */
+/*
+ * create_tidscan_paths - (中文)为给定基表创建 TID 扫描路径并加入路径列表
+ *
+ * 【作用】TID 路径生成的唯一对外入口(由 set_base_rel_pathlists 等调
+ * 用):为 rel 生成普通 TidPath、TidRangePath(含并行版本)以及参数化
+ * TidPath,并通过 add_path / add_partial_path 加入 rel 的路径集合。
+ *
+ * 【设计思想】执行流程:
+ * - 先看基表限制条件里能否提取 CTID 限定条件;若命中,在 TID 扫描启用
+ *   或命中 CURRENT OF 时生成普通 TidPath。CURRENT OF 时返回 true,告知
+ *   调用方"该路径是执行器唯一能处理的,别再添加其他路径";
+ * - TID 扫描禁用则到此为止(返回 false);
+ * - 提取范围条件生成 TidRangePath;若关系可并行且无外部参数,再计算
+ *   并行 worker 数生成并行部分路径;
+ * - 有等价类连接时,经 generate_implied_equalities_for_column + 回调
+ *   ec_member_matches_ctid 推导隐含等值条件,为每条生成参数化 TidPath
+ *   ("t1.ctid = t2.ctid" 这类条件会变成 EC,此处保证它们仍能催生 TID
+ *   路径);
+ * - 最后对 joininfo 中的"松散"连接条件同样尝试参数化 TidPath。
+ * 注意 pgs_mask 的 PGS_TIDSCAN 是启用开关(来自测试钩子等)。
+ *
+ * 【参数】
+ *   root —— 规划上下文;
+ *   rel  —— 目标基表。
+ * 【返回值】true:仅生成了 CURRENT OF 路径(调用方不应再添加其他路径);
+ *          false:正常情况。
  */
 bool
 create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
