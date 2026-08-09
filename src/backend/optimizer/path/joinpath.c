@@ -7,6 +7,46 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本模块(joinpath.c)负责为"给定的两个输入关系(outer/inner)"生成各种
+ * 连接路径(JoinPath),是规划器自底向上构建连接计划的关键一环。它被
+ * joinrels.c 的 populate_joinrel_with_paths() 调用,把生成好的路径加入
+ * joinrel 的 pathlist / partial_pathlist(经由 add_path /
+ * add_partial_path 的去劣后筛选)。
+ *
+ * 【职责】
+ * - 对一对输入关系尝试四种主要连接方法:嵌套循环(NestLoop)、归并连接
+ *   (MergeJoin)、哈希连接(HashJoin),以及(通过 FDW / hook)外部连接;
+ * - 每种方法内再细分变体:普通/带物化(Materialize)/带 Memoize 的嵌套
+ *   循环,需要显式排序的双边归并、外层已有序/内层已预排序的单边归并,
+ *   以及并行(partial)版本;
+ * - 评估参数化路径(parameterized path):决定哪些外层关系可以作为内层
+ *   路径的参数来源(param_source_rels 启发式,以及星型模式
+ *   allow_star_schema_join 特例);
+ * - 为 semi/anti 连接计算代价修正因子(semifactors);
+ * - 对外部表连接调用 FDW 的 GetForeignJoinPaths,并对扩展开放两个钩子
+ *   (join_path_setup_hook、set_join_pathlist_hook)。
+ *
+ * 【设计思想】
+ * 入口 add_paths_to_joinrel() 在收集齐"连接子句候选列表
+ * (mergeclause_list)"后,依次调用:
+ *   1. sort_inner_and_outer():双侧都显式排序的归并连接;
+ *   2. match_unsorted_outer():外层免排序的嵌套循环 + 单边归并(外层
+ *      已有序),并尝试物化/Memoize 内层;
+ *   3. hash_inner_and_outer():哈希连接;
+ *   4. FDW 连接下推与扩展钩子。
+ * 每种路径在创建前先用 initial_cost_* 求代价下界,再经 add_path_precheck
+ * 快速淘汰明显劣势者,最后才构造完整 Path 结构交给 add_path 做精确去劣。
+ * 归并连接还利用 EquivalenceClass 机制(p 外部文件 pathkeys.c)把连接子句
+ * 换算成规范排序键,从而枚举多种有意义的排序顺序。
+ *
+ * 【核心数据结构】JoinPathExtraData:在一次 add_paths_to_joinrel() 调用
+ * 内传递 restrictlist、mergeclause_list、sjinfo、param_source_rels、
+ * semifactors、inner_unique、pgs_mask 等上下文信息。
+ *
+ * 本文件与 joinrels.c(连接关系构建)、pathkeys.c(路径键)、costsize.c
+ * (代价估算)以及 pathnode.c(Path 节点构造)紧密配合。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/path/joinpath.c
  *
@@ -118,6 +158,46 @@ static void generate_mergejoin_paths(PlannerInfo *root,
  * estimation code, as well as match_unsorted_outer, may need to recognize that
  * it's dealing with such a case --- the combination of nominal jointype INNER
  * with sjinfo->jointype == JOIN_SEMI indicates that.
+ */
+/*
+ * add_paths_to_joinrel - (中文)为给定一对输入关系生成并加入所有可行的连接路径
+ *
+ * 【作用】给定一个连接关系 joinrel 及其两个组成部分 outerrel、innerrel,
+ * 考虑所有把二者分别作为外/内关系使用的连接路径,把存活下来的路径加入
+ * joinrel 的 pathlist(同时剔除被支配的旧路径)。这是 joinpath.c 的顶层
+ * 入口,由 joinrels.c 的 populate_joinrel_with_paths() 为每个可行的
+ * (rel1, rel2) 顺序调用一次。它修改 joinrel->pathlist。
+ *
+ * 【设计思想】
+ * - 先把上下文打包进 JoinPathExtraData extra,随后各生成子过程都读它;
+ * - 调 join_path_setup_hook 让扩展可改 pgs_mask/其它字段(此后一律用
+ *   extra.pgs_mask 而非 rel->pgs_mask);
+ * - 用 innerrel_is_unique() 证明内层对当前外层的唯一性(JOIN_SEMI/
+ *   UNIQUE_* 有专门分支),结果放入 extra.inner_unique,供 Memoize 及
+ *   半连接代价修正使用;
+ * - JOIN_UNIQUE_OUTER/INNER 会被规约为普通内连接(jointype 改 JOIN_INNER),
+ *   但其语义通过 sjinfo->jointype == JOIN_SEMI 传达给代价估算;
+ * - 若启用归并连接(或 FULL 连接——归并连接是 FULL 的唯一实现),调用
+ *   select_mergejoin_clauses() 收集可归并子句;
+ * - semi/anti/inner_unique 时计算半连接代价修正因子;
+ * - 按"外层连接约束"推导 param_source_rels:与某个 SpecialJoinInfo 的
+ *   RHS 部分重叠、但尚未并入其 LHS 时,该 SJ 之外的所有基表都可能成为
+ *   参数来源,据此过滤参数化路径的数量;随后并入 LATERAL 剩余依赖
+ *   (joinrel->lateral_relids);
+ * - 依序调用 sort_inner_and_outer()、match_unsorted_outer()、
+ *   hash_inner_and_outer(),最后是 FDW 的 GetForeignJoinPaths 与
+ *   set_join_pathlist_hook。
+ *
+ * 【参数】
+ *   root        —— PlannerInfo;
+ *   joinrel     —— 目标连接关系(路径加入其 pathlist);
+ *   outerrel    —— 外部输入关系;
+ *   innerrel    —— 内部输入关系;
+ *   jointype    —— 本次连接类型(可能与 sjinfo->jointype 不同,例如把
+ *                  输入翻转后的变体);
+ *   sjinfo      —— 连接上下文(SpecialJoinInfo);
+ *   restrictlist —— 应用于本次连接的限制/连接子句列表。
+ * 【返回值】无。
  */
 void
 add_paths_to_joinrel(PlannerInfo *root,
