@@ -101,48 +101,47 @@ static List *get_generated_columns(Relation rel, int rt_index, bool include_stor
 
 
 /*
- * AcquireRewriteLocks -
- *	  Acquire suitable locks on all the relations mentioned in the Query.
- *	  These locks will ensure that the relation schemas don't change under us
- *	  while we are rewriting, planning, and executing the query.
+ * ============================================================================
+ * 【中文注释】AcquireRewriteLocks —— 在查询涉及的所有关系上获取合适锁并修正 JOIN 的已删除列
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在重写、规划和执行整个查询期间，先对查询树里所有被引用的关系加锁，防止
+ *   这些关系的模式（schema）中途被其他会话修改。同时它还会顺带修正 JOIN RTE
+ *   中对已删除列的引用（见"设计思想"第 3 点）。这是改写器、规划器和执行器能
+ *   安全使用查询树的前置保证。
  *
- * Caution: this may modify the querytree, therefore caller should usually
- * have done a copyObject() to make a writable copy of the querytree in the
- * current memory context.
+ * 参数：
+ *   parsetree           - 待加锁的查询树（Query），本函数可能就地修改它。
+ *   forExecute          - 是否即将执行该查询。为 true 时按各 RTE 的 rellockmode
+ *                         字段指定的锁模式加锁；为 false 时一律加 AccessShareLock
+ *                         （该模式适合 ruleutils.c 等只需要模式稳定、不真正修改
+ *                         数据的场景）。
+ *   forUpdatePushedDown - 是否已有下推的 FOR [KEY] UPDATE/SHARE 作用于当前子查询，
+ *                         此时所有关系至少需要 RowShareLock，并会相应提高 RTE 的
+ *                         rellockmode 字段。顶层递归调用该参数恒为 false；当
+ *                         forExecute 为 false 时该参数被忽略。
  *
- * forExecute indicates that the query is about to be executed.  If so,
- * we'll acquire the lock modes specified in the RTE rellockmode fields.
- * If forExecute is false, AccessShareLock is acquired on all relations.
- * This case is suitable for ruleutils.c, for example, where we only need
- * schema stability and we don't intend to actually modify any relations.
+ * 返回值：
+ *   无（就地修改 parsetree）。
  *
- * forUpdatePushedDown indicates that a pushed-down FOR [KEY] UPDATE/SHARE
- * applies to the current subquery, requiring all rels to be opened with at
- * least RowShareLock.  This should always be false at the top of the
- * recursion.  When it is true, we adjust RTE rellockmode fields to reflect
- * the higher lock level.  This flag is ignored if forExecute is false.
- *
- * A secondary purpose of this routine is to fix up JOIN RTE references to
- * dropped columns (see details below).  Such RTEs are modified in-place.
- *
- * This processing can, and for efficiency's sake should, be skipped when the
- * querytree has just been built by the parser: parse analysis already got
- * all the same locks we'd get here, and the parser will have omitted dropped
- * columns from JOINs to begin with.  But we must do this whenever we are
- * dealing with a querytree produced earlier than the current command.
- *
- * About JOINs and dropped columns: although the parser never includes an
- * already-dropped column in a JOIN RTE's alias var list, it is possible for
- * such a list in a stored rule to include references to dropped columns.
- * (If the column is not explicitly referenced anywhere else in the query,
- * the dependency mechanism won't consider it used by the rule and so won't
- * prevent the column drop.)  To support get_rte_attribute_is_dropped(), we
- * replace join alias vars that reference dropped columns with null pointers.
- *
- * (In PostgreSQL 8.0, we did not do this processing but instead had
- * get_rte_attribute_is_dropped() recurse to detect dropped columns in joins.
- * That approach had horrible performance unfortunately; in particular
- * construction of a nested join was O(N^2) in the nesting depth.)
+ * 设计思想：
+ *   1. 遍历当前查询层的整个 rtable：对 RTE_RELATION / RTE_GRAPH_TABLE 直接以相应
+ *      锁模式打开关系（且不释放，一直持有到事务结束）；对 RTE_SUBQUERY 递归处理
+ *      其内部子查询；对 RTE_JOIN 处理别名列；其余 RTE 类型忽略。
+ *   2. 加锁顺序与视图展开顺序一致（先外层后内层），避免规则/视图展开过程中反复
+ *      获取锁而造成死锁。
+ *   3. 处理 JOIN 的已删除列：存储在规则里的 JOIN RTE 别名变量列表可能引用已删除
+ *      的列（若该列未被查询其他位置显式引用，依赖机制不会认为它被规则使用，从而
+ *      允许删除它）。为了让 get_rte_attribute_is_dropped() 正常工作，这里把引用
+ *      已删除列的别名项替换为 NULL 指针。通过 strip_implicit_coercions 剥掉隐式
+ *      强转、并用 curinputrte 缓存当前输入 RTE，避免重复取，从而规避 8.0 时代对
+ *      嵌套 JOIN 递归检测造成的 O(N^2) 性能问题。
+ *   4. 除 rtable 外，还会递归处理 cteList（WITH 子句）和表达式中的 SubLink 子查询
+ *      （通过 acquireLocksOnSubLinks 遍历），但对后者不再深入 Query 节点，因为
+ *      AcquireRewriteLocks 已经处理过其内部的子查询了。
+ *   5. 该处理可能修改查询树，因此调用方通常应先对查询树做 copyObject() 得到当前
+ *      内存上下文中的可写副本。
+ * ============================================================================
  */
 void
 AcquireRewriteLocks(Query *parsetree,
@@ -305,7 +304,32 @@ AcquireRewriteLocks(Query *parsetree,
 }
 
 /*
- * Walker to find sublink subqueries for AcquireRewriteLocks
+ * ============================================================================
+ * 【中文注释】acquireLocksOnSubLinks —— 遍历表达式树为 SubLink 子查询加锁
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   作为 expression_tree_walker 的回调，在查询表达式中找到所有 SubLink 节点，
+ *   并对每个 SubLink 内部的子查询调用 AcquireRewriteLocks 加锁。这是
+ *   AcquireRewriteLocks 在 rtable 与 cteList 之外，对表达式（如 WHERE 条件、
+ *   targetList）中出现的子链接子查询所做的补充处理。
+ *
+ * 参数：
+ *   node    - 当前遍历到的节点；NULL 表示结束遍历（返回 false）。
+ *   context - acquireLocksOnSubLinks_context，携带 AcquireRewriteLocks 的
+ *             forExecute 参数，用于决定以何种锁模式加锁。
+ *
+ * 返回值：
+ *   bool - 若返回 true 则终止遍历（本回调始终返回 false，即继续遍历）。
+ *
+ * 设计思想：
+ *   1. 遇到 SubLink 节点时，先对其 subselect（子查询 Query）调用
+ *      AcquireRewriteLocks，然后再继续遍历 SubLink 的 lefthand 参数表达式。
+ *   2. 关键设计：刻意**不**递归进入 Query 节点，因为子查询内部的进一步处理已由
+ *      那次对 AcquireRewriteLocks 的递归调用完成，若再进入会造成重复加锁或死锁
+ *      误判。这一约定与 fireRIRonSubLink 的处理方式保持一致。
+ *   3. 该函数也会被 rewriteRuleAction、CopyAndAddInvertedQual 以及 fireRIRrules
+ *      中处理 RLS 条件时直接调用，用于对这些后加入的表达式补做加锁。
+ * ============================================================================
  */
 static bool
 acquireLocksOnSubLinks(Node *node, acquireLocksOnSubLinks_context *context)
@@ -332,21 +356,52 @@ acquireLocksOnSubLinks(Node *node, acquireLocksOnSubLinks_context *context)
 
 
 /*
- * rewriteRuleAction -
- *	  Rewrite the rule action with appropriate qualifiers (taken from
- *	  the triggering query).
+ * ============================================================================
+ * 【中文注释】rewriteRuleAction —— 将规则动作与触发查询的限定条件合并并重写
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把一条规则的动作（rule_action，一个查询）改造为可以在触发查询（parsetree）
+ *   的上下文中实际执行的查询：复制动作与限定条件、调整变量编号（varno）、合并
+ *   rtable、拼接 JOIN 树、附加触发查询的限定条件、用触发查询的 targetList 替换
+ *   动作中的 NEW 引用，并按需处理 RETURNING 子句。
  *
- * Input arguments:
- *	parsetree - original query
- *	rule_action - one action (query) of a rule
- *	rule_qual - WHERE condition of rule, or NULL if unconditional
- *	rt_index - RT index of result relation in original query
- *	event - type of rule event
- * Output arguments:
- *	*returning_flag - set true if we rewrite RETURNING clause in rule_action
- *					(must be initialized to false)
- * Return value:
- *	rewritten form of rule_action
+ * 参数：
+ *   parsetree     - 触发规则的原始查询（只读使用，其 rtable 等会被复制后合并进
+ *                   动作）。
+ *   rule_action   - 规则的一个动作（Query），来自 relcache，是只读的，故本函数
+ *                   先 copyObject。
+ *   rule_qual     - 规则的 WHERE 条件；无条件规则为 NULL。
+ *   rt_index      - 原始查询中结果关系（被规则命中的关系）在 rtable 中的下标。
+ *   event         - 规则事件类型（CMD_INSERT/CMD_UPDATE/CMD_DELETE 等）。
+ *   returning_flag- 输出参数：若本动作重写了 RETURNING 子句则置为 true（调用方
+ *                   必须初始化为 false；若多个规则动作都带 RETURNING 会报错）。
+ *
+ * 返回值：
+ *   Query * - 重写后的规则动作查询，可加入最终要执行的查询列表。
+ *
+ * 设计思想：
+ *   1. 所有从 relcache 的拷贝都发生在当前内存上下文，且对 rtable、perminfos、
+ *      CTE、jointree 等一律做深拷贝，保证最终查询树与主查询、与 relcache 不共享
+ *      任何结构（规划器会破坏性地修改这些列表）。
+ *   2. 变量编号调整是核心：用 OffsetVarNodes 把动作和条件的 varno 偏移 rt_length，
+ *      使其能并入主查询 rtable；再把对 OLD（PRS2_OLD_VARNO）的引用改回 rt_index。
+ *      若动作是 INSERT...SELECT，则要作用在 SELECT 部分（sub_action）而非顶层。
+ *   3. 对动作中的子查询 RTE，若其包含引用本层（NEW/OLD）的 Var，自动打上 LATERAL
+ *      标记，因为引用 NEW/OLD 的子查询本质上是横向（lateral）依赖。
+ *   4. 合并 rtable 时把主查询的 rtable 放在动作 rtable 之前（RewriteQuery 依赖
+ *      此顺序），同时合并 RTEPermissionInfo；INSTEAD 规则必须保留原查询的权限
+ *      检查信息，以便对视图等做正确的权限校验。
+ *   5. jointree 的合并规则：动作自身的 jointree 之前拼接主查询的 FROM 列表；当
+ *      动作不使用 OLD、而规则条件或用户查询条件需要引用 OLD 时保留原 rt_index，
+ *      否则去掉它，避免同一条目被 JOIN 两次。若动作是集合操作（setOperations）
+ *      则无法拼接，报"conditional UNION/INTERSECT/EXCEPT"不支持错误。
+ *   6. 处理 INSERT/UPDATE 时，先用触发查询的 targetList（以及为生成列构建的表达
+ *      式）替换动作中的 new.attribute 引用——这要求生成列表达式本身先被重写一遍，
+ *      因为它们内部也引用 new.attribute。
+ *   7. RETURNING 的处理：触发查询没有 RETURNING 则丢弃动作的 RETURNING；否则用
+ *      ReplaceVarsFromTargetList 把动作的 RETURNING 结果映射到触发查询期望的列，
+ *      并把 OLD/NEW 别名替换为触发查询的别名。
+ * ============================================================================
  */
 static Query *
 rewriteRuleAction(Query *parsetree,
@@ -750,12 +805,29 @@ rewriteRuleAction(Query *parsetree,
 }
 
 /*
- * Copy the query's jointree list, and optionally attempt to remove any
- * occurrence of the given rt_index as a top-level join item (we do not look
- * for it within join items; this is OK because we are only expecting to find
- * it as an UPDATE or DELETE target relation, which will be at the top level
- * of the join).  Returns modified jointree list --- this is a separate copy
- * sharing no nodes with the original.
+ * ============================================================================
+ * 【中文注释】adjustJoinTreeList —— 复制 FROM 列表并可选地移除指定结果关系条目
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   深拷贝主查询 jointree 的 fromlist，供规则动作使用；并可选地从副本中删除
+ *   指定的 rt_index（作为顶层 Join 项出现时）。这样规则动作就拥有一个独立的
+ *   FROM 列表，同时避免把被替换的原关系再次 JOIN 进来。
+ *
+ * 参数：
+ *   parsetree - 原始查询，取其 jointree->fromlist 作为拷贝来源。
+ *   removert  - 是否尝试移除给定 rt_index 对应的顶层 RangeTblRef。
+ *   rt_index  - 需要从 fromlist 中移除的 rtable 下标。
+ *
+ * 返回值：
+ *   List * - 与原始列表不共享任何节点的新 fromlist。
+ *
+ * 设计思想：
+ *   1. 只用 copyObject 复制顶层列表并做深拷贝，保证与主查询完全隔离（规则动作
+ *      需要独立、可被规划器随意修改的 jointree）。
+ *   2. 只检查顶层项（IsA RangeTblRef）而不深入 JOIN 内部：因为期望被移除的是
+ *      UPDATE/DELETE 的目标关系，它只会以顶层 FROM 项的形式出现。
+ *   3. 若从列表中删除了一个项则立即 break，因为目标关系在 FROM 中只出现一次。
+ * ============================================================================
  */
 static List *
 adjustJoinTreeList(Query *parsetree, bool removert, int rt_index)
@@ -782,42 +854,51 @@ adjustJoinTreeList(Query *parsetree, bool removert, int rt_index)
 
 
 /*
- * rewriteTargetListIU - rewrite INSERT/UPDATE targetlist into standard form
+ * ============================================================================
+ * 【中文注释】rewriteTargetListIU —— 把 INSERT/UPDATE 的 targetList 重写为标准形式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对 INSERT/UPDATE（以及 MERGE 中各动作、ON CONFLICT 的辅助 UPDATE）的目标列表
+ *   做标准化处理，主要职责有四：
+ *     (1) 为 INSERT 中未赋值的列补充默认值表达式（无默认值的列不补，留给规划器
+ *         填 NULL），并把显式的 DEFAULT 占位符替换为真正的默认值表达式；
+ *     (2) 把对同一列的多重赋值（如数组/记录的子字段更新）合并为单个赋值表达式；
+ *     (3) 按 resno 对非 junk 项排序、junk 项排在最后，并重新编号；
+ *     (4) 校验并处理 identity（自增）列与生成列（generated）的特殊约束。
  *
- * This has the following responsibilities:
+ * 参数：
+ *   targetList           - 待重写的目标列表（INSERT 主 targetList、ON CONFLICT
+ *                          辅助列表或 MERGE 动作 targetList 之一）。
+ *   commandType          - CMD_INSERT 或 CMD_UPDATE（决定默认值/NULL 的处理策略）。
+ *   override             - OVERRIDING 子句类型（OVERRIDING USER/SYSTEM VALUE），
+ *                          仅对 identity 列的默认值处理有影响。
+ *   target_relation      - 目标关系的 Relation 描述符（用于读取列属性、默认值）。
+ *   values_rte           - 多行 INSERT 时承载 VALUES 列表的 RTE，否则为 NULL。
+ *   values_rte_index     - values_rte 在 rtable 中的下标（无则忽略）。
+ *   unused_values_attrnos- 输出参数：被默认值表达式替代后不再使用的 VALUES 列
+ *                          的编号集合（Bitmapset），供 rewriteValuesRTE 把其中
+ *                          残留的 DEFAULT 项改成 NULL；调用方需初始化为 NULL。
  *
- * 1. For an INSERT, add tlist entries to compute default values for any
- * attributes that have defaults and are not assigned to in the given tlist.
- * (We do not insert anything for default-less attributes, however.  The
- * planner will later insert NULLs for them, but there's no reason to slow
- * down rewriter processing with extra tlist nodes.)  Also, for both INSERT
- * and UPDATE, replace explicit DEFAULT specifications with column default
- * expressions.
+ * 返回值：
+ *   List * - 重写后的目标列表。
  *
- * 2. Merge multiple entries for the same target attribute, or declare error
- * if we can't.  Multiple entries are only allowed for INSERT/UPDATE of
- * portions of an array or record field, for example
- *			UPDATE table SET foo[2] = 42, foo[4] = 43;
- * We can merge such operations into a single assignment op.  Essentially,
- * the expression we want to produce in this case is like
- *		foo = array_set_element(array_set_element(foo, 2, 42), 4, 43)
- *
- * 3. Sort the tlist into standard order: non-junk fields in order by resno,
- * then junk fields (these in no particular order).
- *
- * We must do items 1 and 2 before firing rewrite rules, else rewritten
- * references to NEW.foo will produce wrong or incomplete results.  Item 3
- * is not needed for rewriting, but it is helpful for the planner, and we
- * can do it essentially for free while handling the other items.
- *
- * If values_rte is non-NULL (i.e., we are doing a multi-row INSERT using
- * values from a VALUES RTE), we populate *unused_values_attrnos with the
- * attribute numbers of any unused columns from the VALUES RTE.  This can
- * happen for identity and generated columns whose targetlist entries are
- * replaced with generated expressions (if INSERT ... OVERRIDING USER VALUE is
- * used, or all the values to be inserted are DEFAULT).  This information is
- * required by rewriteValuesRTE() to handle any DEFAULT items in the unused
- * columns.  The caller must have initialized *unused_values_attrnos to NULL.
+ * 设计思想：
+ *   1. 性能优化：先把非 junk 的 TLE 按 resno 存进数组 new_tles[]，再按属性号顺序
+ *      扫描生成输出列表，避免对大列数表做 O(N^2) 处理；junk 项在第一次扫描时
+ *      单独收集、重新编号后拼在输出列表末尾。
+ *   2. 已删除的属性（attisdropped）一律跳过，保证重写结果不引用已删除列。
+ *   3. 默认值判定：INSERT 且无对应 TLE，或 TLE 表达式是 SetToDefault 占位符时，
+ *      需要生成默认值表达式。对 GENERATED ALWAYS 的 identity 列与生成列，非默认
+ *      值插入会被禁止；若其值来自 VALUES RTE，则用 findDefaultOnlyColumns 检查该
+ *      列是否全为 DEFAULT，是则允许默认。UPDATE 不允许 OVERRIDING 子句，对
+ *      identity/生成列只允许显式设默认。
+ *   4. 生成列：virtual 生成列存 NULL 值、stored 生成列由执行器随后计算，因此这里
+ *      一律不为其保留 TLE（new_tle = NULL）。
+ *   5. 无默认值时：INSERT 直接省略 TLE（规划器自会补 NULL）；UPDATE 则必须显式
+ *      构造 NULL（经 coerce_null_to_domain 处理域约束）。
+ *   6. 该函数必须在触发规则之前完成，否则规则对 NEW.foo 的引用会得到错误或不完整
+ *      的替换结果；排序本身对改写不是必须的，但能让规划器受益，且几乎零成本。
+ * ============================================================================
  */
 static List *
 rewriteTargetListIU(List *targetList,
@@ -1088,10 +1169,38 @@ rewriteTargetListIU(List *targetList,
 
 
 /*
- * Convert a matched TLE from the original tlist into a correct new TLE.
+ * ============================================================================
+ * 【中文注释】process_matched_tle —— 把同一列的多个赋值 TLE 合并成一个赋值表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   当目标列表对同一目标属性出现多个赋值时（如 UPDATE 中对数组下标或记录字段
+ *   的多处赋值），把这些赋值合并为单个嵌套的 FieldStore / SubscriptingRef 表达
+ *   式，保证赋值按书写顺序自左向右生效；若无法合并则报错。
  *
- * This routine detects and handles multiple assignments to the same target
- * attribute.  (The attribute name is needed only for error messages.)
+ * 参数：
+ *   src_tle   - 新遇到的赋值 TLE（较新的赋值）。
+ *   prior_tle - 之前已为该属性合并出的 TLE；NULL 表示这是首次赋值。
+ *   attrName  - 目标属性名，仅用于错误信息。
+ *
+ * 返回值：
+ *   TargetEntry * - 合并后的 TLE（若 prior_tle 为 NULL 则原样返回 src_tle）。
+ *
+ * 设计思想：
+ *   1. 首次赋值直接返回 src_tle；多次赋值才需要合并。
+ *   2. 允许合并的条件：两个表达式都是 FieldStore 或 SubscriptingRef 赋值操作。
+ *      例如 "UPDATE tab SET col.f1 = x, col.f2 = y" 可合并为
+ *      FieldStore(FieldStore(col, f1, x), f2, y)，左起表达式放在最内层以保持
+ *      从左到右的语义。对两个 FieldStore 可以合并成单个含多个字段的 FieldStore，
+ *      涉及 SubscriptingRef 时则必须嵌套。
+ *   3. 若目标列是域（domain）类型，每个赋值外层会包一层 CoerceToDomain（两侧
+ *      resulttype 必须一致才可合并）；合并时先剥离 CoerceToDomain、组合完内部
+ *      表达式后再重新套上，这样域的检查只需在所有子字段更新完成后做一次。
+ *   4. 合并前用 get_assignment_input 取得各赋值的"底层输入"，要求二者完全相同
+ *      （即引用的原始 Var 一致），否则说明赋值对象不是同一列，报
+ *      "multiple assignments to same column" 错误。
+ *   5. prior 可能是多次合并后的嵌套结构，因此循环剥到最底层再与 src 的输入比较。
+ *   6. 结果通过 flatCopyTargetEntry 拷贝 src_tle 的结构、仅替换其 expr。
+ * ============================================================================
  */
 static TargetEntry *
 process_matched_tle(TargetEntry *src_tle,
@@ -1244,7 +1353,28 @@ process_matched_tle(TargetEntry *src_tle,
 }
 
 /*
- * If node is an assignment node, return its input; else return NULL
+ * ============================================================================
+ * 【中文注释】get_assignment_input —— 取赋值节点的输入表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判断给定节点是否为"赋值操作"节点（FieldStore 或带赋值下标的 SubscriptingRef），
+ *   若是则返回其输入（被赋值的底层表达式），否则返回 NULL。它是 process_matched_tle
+ *   合并多重赋值时的核心辅助工具。
+ *
+ * 参数：
+ *   node - 待检查的表达式节点。
+ *
+ * 返回值：
+ *   Node * - FieldStore 返回其 arg；带 refassgnexpr 的 SubscriptingRef 返回其
+ *            refexpr；其他情况（含无赋值的 SubscriptingRef）返回 NULL。
+ *
+ * 设计思想：
+ *   1. FieldStore（记录字段赋值）直接返回 fstore->arg 作为输入。
+ *   2. SubscriptingRef 只有在其 refassgnexpr 非空（确属赋值语义）时才视为赋值
+ *      操作并返回 refexpr，否则返回 NULL，避免把普通下标读取误判为赋值。
+ *   3. 通过"返回 NULL"与"返回表达式"两种结果区分叶子（原始 Var 引用）与可继续
+ *      下钻的嵌套赋值，供 process_matched_tle 循环剥离嵌套。
+ * ============================================================================
  */
 static Node *
 get_assignment_input(Node *node)
@@ -1271,9 +1401,33 @@ get_assignment_input(Node *node)
 }
 
 /*
- * Make an expression tree for the default value for a column.
+ * ============================================================================
+ * 【中文注释】build_column_default —— 构造某列的默认值表达式树
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为指定关系列的默认值构造表达式树：依次考虑 identity 列、列级 DEFAULT、类型级
+ *   默认值，并做必要的类型强制转换（coerce）。若该列没有任何默认值则返回 NULL。
  *
- * If there is no default, return a NULL instead.
+ * 参数：
+ *   rel    - 目标关系的 Relation 描述符。
+ *   attrno - 目标属性号（从 1 开始）。
+ *
+ * 返回值：
+ *   Node * - 默认值表达式；无默认值时返回 NULL。
+ *
+ * 设计思想：
+ *   1. 优先处理 identity 列（attidentity 非 0）：构造一个 NextValueExpr 节点，
+ *      内含对应序列的 OID（由 getIdentitySequence 求得），执行时从序列取下一个值。
+ *   2. 其次取列级 DEFAULT（atthasdef 置位时通过 TupleDescGetDefault 从 pg_attrdef
+ *      取已解析的表达式）；没有列级默认时再取类型级默认（get_typdefault），但
+ *      生成列（attgenerated）不享受类型级默认。
+ *   3. 取到表达式后调用 coerce_to_target_type 强制转换到目标列类型（含 typmod），
+ *      因为域类型的默认值可能存在类型不完全匹配的边角情况；此处理与解析器对普通
+ *      赋值表达式的处理（transformAssignedExpr）保持一致。转换失败时报类型不匹配
+ *      错误。
+ *   4. 找不到任何默认值时返回 NULL，调用方（如 rewriteTargetListIU）据此决定是
+ *      省略 TLE（INSERT）还是显式补 NULL（UPDATE）。
+ * ============================================================================
  */
 Node *
 build_column_default(Relation rel, int attrno)
@@ -1345,7 +1499,26 @@ build_column_default(Relation rel, int attrno)
 }
 
 
-/* Does VALUES RTE contain any SetToDefault items? */
+/*
+ * ============================================================================
+ * 【中文注释】searchForDefault —— 判断 VALUES RTE 中是否含有 DEFAULT 项
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   扫描 VALUES RTE 的所有 VALUES 行（values_lists），若任一单元格是
+ *   SetToDefault 占位符（表示该处显式写了 DEFAULT）则返回 true。用于 rewriteValuesRTE
+ *   预先判断是否有必要重建整个 VALUES 列表，避免对大 VALUES 列表做无谓开销。
+ *
+ * 参数：
+ *   rte - RTE_VALUES 类型的 RangeTblEntry。
+ *
+ * 返回值：
+ *   bool - 存在任何 SetToDefault 项返回 true，否则返回 false。
+ *
+ * 设计思想：
+ *   重建所有 VALUES 列表在数据量大时开销较高，因此先做一次只读扫描；若整个
+ *   VALUES RTE 中没有 DEFAULT 项，rewriteValuesRTE 可以直接返回、不做任何修改。
+ * ============================================================================
+ */
 static bool
 searchForDefault(RangeTblEntry *rte)
 {
@@ -1369,8 +1542,27 @@ searchForDefault(RangeTblEntry *rte)
 
 
 /*
- * Search a VALUES RTE for columns that contain only SetToDefault items,
- * returning a Bitmapset containing the attribute numbers of any such columns.
+ * ============================================================================
+ * 【中文注释】findDefaultOnlyColumns —— 找出 VALUES RTE 中"全为 DEFAULT"的列
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在 VALUES RTE 的每一行中，找出所有单元格都写 DEFAULT（SetToDefault）的那些
+ *   列，以 Bitmapset（键为列号，从 1 开始）返回这些列的编号。供 rewriteTargetListIU
+ *   判断 identity/生成列的值是否全部来自 DEFAULT，从而决定是否允许插入。
+ *
+ * 参数：
+ *   rte - RTE_VALUES 类型的 RangeTblEntry。
+ *
+ * 返回值：
+ *   Bitmapset * - 全为 DEFAULT 的列的编号集合。
+ *
+ * 设计思想：
+ *   1. 用首行初始化结果集合（首行中凡 DEFAULT 的列都加入），随后每一行只做集合
+ *      收缩：某列出现非 DEFAULT 值就从集合中移除。
+ *   2. 一旦结果集合为空即可提前终止（没有任何列能保持"全 DEFAULT"）。
+ *   3. 该函数把多行扫描成本摊销到一次遍历，因为 VALUES 列表可能非常大，
+ *      rewriteTargetListIU 中刻意只在需要时才调用它（default_only_cols 延迟计算）。
+ * ============================================================================
  */
 static Bitmapset *
 findDefaultOnlyColumns(RangeTblEntry *rte)
@@ -1424,41 +1616,41 @@ findDefaultOnlyColumns(RangeTblEntry *rte)
 
 
 /*
- * When processing INSERT ... VALUES with a VALUES RTE (ie, multiple VALUES
- * lists), we have to replace any DEFAULT items in the VALUES lists with
- * the appropriate default expressions.  The other aspects of targetlist
- * rewriting need be applied only to the query's targetlist proper.
+ * ============================================================================
+ * 【中文注释】rewriteValuesRTE —— 替换 INSERT ... VALUES 中 VALUES RTE 的 DEFAULT 项
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   处理多行 INSERT ... VALUES（带 VALUES RTE）时，把 VALUES 列表中的
+ *   SetToDefault（DEFAULT）占位符替换为合适的默认值表达式。目标列表自身的重写
+ *   由 rewriteTargetListIU 完成，本函数只负责 VALUES 表达式列表内部的替换。
  *
- * For an auto-updatable view, each DEFAULT item in the VALUES list is
- * replaced with the default from the view, if it has one.  Otherwise it is
- * left untouched so that the underlying base relation's default can be
- * applied instead (when we later recurse to here after rewriting the query
- * to refer to the base relation instead of the view).
+ * 参数：
+ *   parsetree      - 正在改写的 INSERT 查询。
+ *   rte             - VALUES RTE（将被就地修改其 values_lists）。
+ *   rti             - VALUES RTE 在 rtable 中的下标。
+ *   target_relation - 插入目标关系的描述符（读取列默认值）。
+ *   unused_cols     - 已被目标列表默认值表达式取代、不再使用的 VALUES 列号集合
+ *                     （Bitmapset），这些列中残留的 DEFAULT 一律改为 NULL。
  *
- * For other types of relation, including rule- and trigger-updatable views,
- * all DEFAULT items are replaced, and if the target relation doesn't have a
- * default, the value is explicitly set to NULL.
+ * 返回值：
+ *   bool - 是否所有 DEFAULT 项都被替换：返回 true 表示全部替换完，false 表示有的
+ *          DEFAULT 项被保留（发生在可自动更新视图且视图无默认值的情况）。
  *
- * Also, if a DEFAULT item is found in a column mentioned in unused_cols,
- * it is explicitly set to NULL.  This happens for columns in the VALUES RTE
- * whose corresponding targetlist entries have already been replaced with the
- * relation's default expressions, so that any values in those columns of the
- * VALUES RTE are no longer used.  This can happen for identity and generated
- * columns (if INSERT ... OVERRIDING USER VALUE is used, or all the values to
- * be inserted are DEFAULT).  In principle we could replace all entries in
- * such a column with NULL, whether DEFAULT or not; but it doesn't seem worth
- * the trouble.
- *
- * Note that we may have subscripted or field assignment targetlist entries,
- * as well as more complex expressions from already-replaced DEFAULT items if
- * we have recursed to here for an auto-updatable view. However, it ought to
- * be impossible for such entries to have DEFAULTs assigned to them, except
- * for unused columns, as described above --- we should only have to replace
- * DEFAULT items for targetlist entries that contain simple Vars referencing
- * the VALUES RTE, or which are no longer referred to by the targetlist.
- *
- * Returns true if all DEFAULT items were replaced, and false if some were
- * left untouched.
+ * 设计思想：
+ *   1. 先通过 searchForDefault 检查是否存在 DEFAULT，避免无谓重建大 VALUES 列表。
+ *   2. 扫描目标列表找出引用 VALUES RTE 的简单 Var，建立"VALUES 列号 → 目标属性号"
+ *      的映射数组 attrnos（attrno == 0 表示该 VALUES 列不再被目标列表使用）。
+ *   3. 三种替换策略：
+ *      - 未使用的列（在 unused_cols 中）：DEFAULT 直接替换为 NULL 常量；
+ *      - 可自动更新视图（isAutoUpdatableView）：若视图列无默认值则保留 DEFAULT
+ *        原样不动，等递归改写到基表时再用基表的默认值；此时返回 false；
+ *      - 其他情形：用 build_column_default 求默认值，无默认则显式构造 NULL
+ *        （经 coerce_null_to_domain 处理域），保证列语义正确。
+ *   4. isAutoUpdatableView 的判定：目标为视图、无 INSTEAD OF 触发器、且没有无条件
+ *      DO INSTEAD 规则时才假定可自动更新（若其实不可更新，rewriteTargetView 会
+ *      抛错兜底）。
+ *   5. 重建整个 values_lists 列表（newValues）后写回 rte->values_lists。
+ * ============================================================================
  */
 static bool
 rewriteValuesRTE(Query *parsetree, RangeTblEntry *rte, int rti,
@@ -1636,14 +1828,26 @@ rewriteValuesRTE(Query *parsetree, RangeTblEntry *rte, int rti,
 }
 
 /*
- * Mop up any remaining DEFAULT items in the given VALUES RTE by
- * replacing them with NULL constants.
+ * ============================================================================
+ * 【中文注释】rewriteValuesRTEToNulls —— 把 VALUES RTE 中残留的 DEFAULT 全部改为 NULL
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把给定 VALUES RTE 中所有残留的 SetToDefault 项替换为同类型的 NULL 常量。
+ *   用于自动更新视图产生的 DO ALSO 规则产品查询：这类查询没有（也不必有）可依赖
+ *   的目标关系，无法求默认值，因此按规则可更新视图的方式把 DEFAULT 一律置为 NULL。
  *
- * This is used for the product queries generated by DO ALSO rules attached to
- * an auto-updatable view.  The action can't depend on the "target relation"
- * since the product query might not have one (it needn't be an INSERT).
- * Essentially, such queries are treated as being attached to a rule-updatable
- * view.
+ * 参数：
+ *   parsetree - 所在查询（当前实现未直接使用，仅保留签名一致性）。
+ *   rte       - 待处理的 VALUES RTE（就地修改其 values_lists）。
+ *
+ * 返回值：
+ *   无。
+ *
+ * 设计思想：
+ *   与 rewriteValuesRTE 不同，这里没有"保留 DEFAULT 交给基表"的分支，因为产品
+ *   查询可能不是 INSERT、不一定有目标关系。直接把所有 DEFAULT 用 makeNullConst
+ *   转成 NULL 常量最安全，等价于"该列无默认值"的 INSERT 语义。
+ * ============================================================================
  */
 static void
 rewriteValuesRTEToNulls(Query *parsetree, RangeTblEntry *rte)
@@ -1680,8 +1884,37 @@ rewriteValuesRTEToNulls(Query *parsetree, RangeTblEntry *rte)
 
 
 /*
- * matchLocks -
- *	  match a relation's list of locks and returns the matching rules
+ * ============================================================================
+ * 【中文注释】matchLocks —— 从关系的规则集中挑出与当前事件匹配的规则
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   扫描关系的规则集（rd_rules），返回与当前命令事件类型匹配、且按会话复制角色
+ *   （replication role）应当触发的规则列表；同时顺带报告该关系是否存在 UPDATE
+ *   事件规则。这是 RewriteQuery 触发 INSERT/UPDATE/DELETE 规则的第一步。
+ *
+ * 参数：
+ *   event     - 要匹配的事件类型（CMD_INSERT/CMD_UPDATE/CMD_DELETE 等）。
+ *   relation  - 被查询结果关系引用、持有规则集的关系。
+ *   varno     - 该关系在查询 rtable 中的下标。
+ *   parsetree - 触发查询。
+ *   hasUpdate - 输出参数：若关系上存在事件为 CMD_UPDATE 的规则则置 true
+ *               （用于决定 ON CONFLICT 是否被禁止）。
+ *
+ * 返回值：
+ *   List * - 匹配到的 RewriteRule 列表；无匹配或关系无规则时为空列表 NIL。
+ *
+ * 设计思想：
+ *   1. 非 SELECT 命令要求 varno 恰好等于 parsetree->resultRelation，即规则只针对
+ *      结果关系触发；SELECT 命令则要求该关系在查询中被实际引用
+ *      （rangeTableEntry_used），否则不触发。
+ *   2. 复制角色过滤：ON SELECT 规则无论如何都会应用（保证视图即使在 LOCAL/REPLICA
+ *      角色下也正常工作）；非 SELECT 规则按 enabled 标志与当前 SessionReplicationRole
+ *      的匹配决定是否跳过（RULE_FIRES_ON_REPLICA / RULE_DISABLED 等）。
+ *   3. 对 MERGE 命令，禁止任何非 SELECT 规则（报 FEATURE_NOT_SUPPORTED），因为
+ *      MERGE 与规则系统不兼容。
+ *   4. 把发现的 UPDATE 规则事件写入 *hasUpdate，供 RewriteQuery 检查 INSERT ON
+ *      CONFLICT 与规则共存时的限制。
+ * ============================================================================
  */
 static List *
 matchLocks(CmdType event,
@@ -1756,7 +1989,42 @@ matchLocks(CmdType event,
 
 
 /*
- * ApplyRetrieveRule - expand an ON SELECT rule
+ * ============================================================================
+ * 【中文注释】ApplyRetrieveRule —— 展开视图：把 ON SELECT 规则动作作为子查询接入
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把一条 ON SELECT（RIR）规则对应的视图查询展开进触发查询：复制视图定义查询、
+ *   递归展开其内部视图、必要时把 FOR [KEY] UPDATE/SHARE 下推给视图中引用的表，
+ *   最终把原视图对应的 RTE 从 RTE_RELATION 改写为引用展开后子查询的 RTE_SUBQUERY。
+ *
+ * 参数：
+ *   parsetree  - 正在处理的查询（会被就地修改并返回）。
+ *   rule       - 要应用的 ON SELECT 规则（必须恰好一个动作、无条件）。
+ *   rt_index   - 视图在 parsetree->rtable 中的下标。
+ *   relation   - 视图关系本身（用于取安全屏障标记、relkind 等）。
+ *   activeRIRs - 正在展开的视图 OID 列表，用于检测递归（递归检测已在 fireRIRrules
+ *                中完成）。
+ *
+ * 返回值：
+ *   Query * - 展开后的查询。
+ *
+ * 设计思想：
+ *   1. 若视图恰好是查询的结果关系且尚无规则改写它：INSERT 直接沿用原 RTE（留给
+ *      INSTEAD OF 触发器处理）；UPDATE/DELETE/MERGE 则复制一份视图 RTE 追加到
+ *      rtable 作为新结果关系，同时保留原 RTE 供源数据使用，并在 targetList 尾部
+ *      加一个 resjunk 整行 Var，供执行器计算原始视图行传给 INSTEAD OF 触发器。
+ *   2. 视图查询取自 relcache，必须深拷贝后使用；对其中引用的关系用
+ *      AcquireRewriteLocks 加锁（若本视图有 FOR [KEY] UPDATE/SHARE，则强制这些
+ *      关系至少 RowShareLock），再递归调用 fireRIRrules 展开嵌套视图。
+ *   3. 若该视图被 FOR [KEY] UPDATE/SHARE 锁定（rc != NULL），调用 markQueryForLocking
+ *      把锁定语义传播到视图引用的所有表，与解析器显式内联视图定义时行为一致。
+ *   4. 把原 RTE 改为 RTE_SUBQUERY 挂上展开后的子查询，并按需设置 security_barrier
+ *      （安全屏障视图）；保留 relid/relkind/rellockmode/perminfoindex 以便执行前
+ *      加锁与权限检查；清理 tablesample、关闭 inh 标记。
+ *   5. 兼容 CREATE OR REPLACE VIEW 加列的情形：若子查询输出列多于 RTE 原有
+ *      colnames，补 "?column?" 占位名，保证 eref->colnames 与子查询非 junk 输出
+ *      列数一致。
+ * ============================================================================
  */
 static Query *
 ApplyRetrieveRule(Query *parsetree,
@@ -1927,16 +2195,34 @@ ApplyRetrieveRule(Query *parsetree,
 }
 
 /*
- * Recursively mark all relations used by a view as FOR [KEY] UPDATE/SHARE.
+ * ============================================================================
+ * 【中文注释】markQueryForLocking —— 递归为视图引用的所有关系打上 FOR UPDATE/SHARE 标记
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在视图展开后，把原本施加于视图的 FOR [KEY] UPDATE/SHARE 语义递归下推到视图
+ *   定义引用的所有普通表（及嵌套子查询内部的关系），为其添加行级锁定子句。
  *
- * This may generate an invalid query, eg if some sub-query uses an
- * aggregate.  We leave it to the planner to detect that.
+ * 参数：
+ *   qry        - 待处理的查询。
+ *   jtnode     - 当前要扫描的 jointree 节点（RangeTblRef/FromExpr/JoinExpr）。
+ *   strength   - 锁强度（LockClauseStrength，FOR UPDATE/SHARE/KEY UPDATE 等）。
+ *   waitPolicy - 等待策略（LockWaitPolicy，如 NOWAIT/SKIP LOCKED）。
+ *   pushedDown - 该锁定是否为下推（从上层查询传播而来），沿用解析器语义。
  *
- * NB: this must agree with the parser's transformLockingClause() routine.
- * However, we used to have to avoid marking a view's OLD and NEW rels for
- * updating, which motivated scanning the jointree to determine which rels
- * are used.  Possibly that could now be simplified into just scanning the
- * rangetable as the parser does.
+ * 返回值：
+ *   无。
+ *
+ * 设计思想：
+ *   1. 只沿 jointree 遍历（而非整个 rtable），这是历史遗留：当初需要避免给视图的
+ *      OLD/NEW 相关关系打标记，仅给实际使用的关系打。逻辑必须与解析器的
+ *      transformLockingClause 保持一致，否则语义会分叉。
+ *   2. RangeTblRef：若是普通关系，调用 applyLockingClause 加行锁，并把权限位
+ *      ACL_SELECT_FOR_UPDATE 并入其 RTEPermissionInfo；若是子查询，同样加锁并递归
+ *      进入其内部 jointree（标记 pushedDown = true）。其他 RTE 类型不受影响。
+ *   3. FromExpr / JoinExpr 分别递归左右两侧。
+ *   4. 注意：这可能产生非法查询（如对含聚合的子查询加 FOR UPDATE），但交给规划器
+ *      去报错，本函数不做校验。
+ * ============================================================================
  */
 static void
 markQueryForLocking(Query *qry, Node *jtnode,
@@ -1990,17 +2276,31 @@ markQueryForLocking(Query *qry, Node *jtnode,
 
 
 /*
- * fireRIRonSubLink -
- *	Apply fireRIRrules() to each SubLink (subselect in expression) found
- *	in the given tree.
+ * ============================================================================
+ * 【中文注释】fireRIRonSubLink —— 对表达式树中的每个 SubLink 应用视图展开
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   作为 expression_tree_walker 的回调，遍历表达式树，对每个 SubLink 节点调用
+ *   fireRIRrules 展开其子查询中的视图引用，并把展开后的子查询写回 sub->subselect；
+ *   同时汇总各子查询是否启用了行级安全（hasRowSecurity）。
  *
- * NOTE: although this has the form of a walker, we cheat and modify the
- * SubLink nodes in-place.  It is caller's responsibility to ensure that
- * no unwanted side-effects occur!
+ * 参数：
+ *   node    - 当前遍历节点；NULL 结束遍历（返回 false）。
+ *   context - fireRIRonSubLink_context：携带 activeRIRs（递归检测用视图 OID 列表）
+ *             和 hasRowSecurity（累加标记）。
  *
- * This is unlike most of the other routines that recurse into subselects,
- * because we must take control at the SubLink node in order to replace
- * the SubLink's subselect link with the possibly-rewritten subquery.
+ * 返回值：
+ *   bool - 终止遍历标志（本回调恒返回 false）。
+ *
+ * 设计思想：
+ *   1. 与其他递归例程不同，本函数必须"接管"SubLink 节点本身：直接改写
+ *      sub->subselect 指针，因为 fireRIRrules 返回的是可能被替换的新子查询树。
+ *   2. 与 acquireLocksOnSubLinks 相同：不递归进入 Query 节点，因为子查询内部的
+ *      展开已由那次 fireRIRrules 递归完成；配合 QTW_IGNORE_RC_SUBQUERIES 保证
+ *      query_tree_walker 不会重复进入。
+ *   3. 会就地修改 SubLink 节点（在调用方持有的可写副本上），调用方须确保没有
+ *      意外副作用。
+ * ============================================================================
  */
 static bool
 fireRIRonSubLink(Node *node, fireRIRonSubLink_context *context)
@@ -2032,11 +2332,47 @@ fireRIRonSubLink(Node *node, fireRIRonSubLink_context *context)
 
 
 /*
- * fireRIRrules -
- *	Apply all RIR rules on each rangetable entry in the given query
+ * ============================================================================
+ * 【中文注释】fireRIRrules —— 对查询中每个 RTE 应用所有 Retrieve-Instead-Retrieve 规则
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   递归地把查询中所有视图（拥有 ON SELECT 规则的普通关系）展开为底层查询：遍历
+ *   rtable 中的每个条目，对含 RIR 规则的关系调用 ApplyRetrieveRule 展开，并递归
+ *   处理子查询 RTE、WITH 子句、表达式中的 SubLink；最后为各表应用行级安全（RLS）
+ *   策略。这是视图展开的核心枢纽。
  *
- * activeRIRs is a list of the OIDs of views we're already processing RIR
- * rules for, used to detect/reject recursion.
+ * 参数：
+ *   parsetree - 待展开的查询（可能被就地修改或替换，返回处理后的版本）。
+ *   activeRIRs- 当前正在展开的视图 OID 列表，用于检测"视图递归引用自己"造成的
+ *               无限循环（顶层调用方 QueryRewrite 传入 NIL）。
+ *
+ * 返回值：
+ *   Query * - 视图全部展开后的查询。
+ *
+ * 设计思想：
+ *   1. 先顺手展开 CTE 中的 SEARCH / CYCLE 子句（rewriteSearchAndCycle），因为
+ *      这里能看到每个 Query。
+ *   2. rtable 遍历用 while 循环而非 foreach：ApplyRetrieveRule 会向 rtable 追加
+ *      条目（结果关系副本、子查询等），列表长度随展开动态增长。
+ *   3. RTE 分类处理：
+ *      - RTE_GRAPH_TABLE：先经 rewriteGraphTable 转换为子查询；
+ *      - RTE_SUBQUERY：递归展开其内部，并汇总 hasRowSecurity；
+ *      - 其他非关系类型（JOIN 等）：忽略；
+ *      - RTE_RELATION：跳过物化视图（MATVIEW）、ON CONFLICT 的 EXCLUDED 伪关系、
+ *        未被查询引用的关系（rangeTableEntry_used 为假）以及 ApplyRetrieveRule
+ *        新引入的结果关系，然后打开关系、收集其 CMD_SELECT 规则并逐个应用。
+ *   4. 应用规则前用 list_member_oid(activeRIRs) 检测递归，若发现同一视图正在展开
+ *      则报 "infinite recursion detected in rules" 错误；应用完把该视图 OID 从
+ *      activeRIRs 移除（配合 ApplyRetrieveRule 内部对新展开视图的再次调用形成
+ *      调用栈式递归检测）。
+ *   5. 展开完 rtable 与 CTE 后，通过 query_tree_walker + fireRIRonSubLink 处理
+ *      表达式（含 JOIN 条件、安全限定等）中的 SubLink 子查询。
+ *   6. 最后为每个普通表/分区表调用 get_row_security_policies 获取 RLS 安全限定与
+ *      WITH CHECK OPTION；新限定若有子查询，需先加锁（acquireLocksOnSubLinks）
+ *      再展开（fireRIRonSubLink），并同样做递归检测。安全限定放在 RTE
+ *      securityQuals 最前面（先于视图的安全屏障条件），并同步维护
+ *      hasRowSecurity / hasSubLinks 标记。
+ * ============================================================================
  */
 static Query *
 fireRIRrules(Query *parsetree, List *activeRIRs)
@@ -2365,17 +2701,36 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 
 
 /*
- * Modify the given query by adding 'AND rule_qual IS NOT TRUE' to its
- * qualification.  This is used to generate suitable "else clauses" for
- * conditional INSTEAD rules.  (Unfortunately we must use "x IS NOT TRUE",
- * not just "NOT x" which the planner is much smarter about, else we will
- * do the wrong thing when the qual evaluates to NULL.)
+ * ============================================================================
+ * 【中文注释】CopyAndAddInvertedQual —— 向查询追加"规则条件为假"的反向限定条件
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   生成条件型 INSTEAD 规则的"else 分支"：把规则的 WHERE 条件取反后并入查询的
+ *   WHERE（AddInvertedQual），使原查询只在规则条件不成立时才执行，从而与带条件
+ *   的 INSTEAD 规则动作形成"case 分支"语义。
  *
- * The rule_qual may contain references to OLD or NEW.  OLD references are
- * replaced by references to the specified rt_index (the relation that the
- * rule applies to).  NEW references are only possible for INSERT and UPDATE
- * queries on the relation itself, and so they should be replaced by copies
- * of the related entries in the query's own targetlist.
+ * 参数：
+ *   parsetree - 待修改的查询（会被就地修改并返回）。
+ *   rule_qual - 规则的 WHERE 条件（来自 relcache，只读，故先深拷贝）。
+ *   rt_index  - 规则作用的关系在查询 rtable 中的下标（用于替换 OLD 引用）。
+ *   event     - 规则事件类型（INSERT/UPDATE 时还需处理 NEW 引用）。
+ *
+ * 返回值：
+ *   Query * - 追加了反向条件的查询。
+ *
+ * 设计思想：
+ *   1. 必须用 "x IS NOT TRUE" 而非 "NOT x"：当条件求值为 NULL 时前者才符合直觉
+ *      语义（NULL 视为不满足规则条件，原查询应执行），后者会错误地阻止原查询。
+ *      规划器虽然更擅长处理 NOT，但此处语义优先。
+ *   2. 条件中 OLD 引用被 ChangeVarNodes 改为指向 rt_index；INSERT/UPDATE 时 NEW
+ *      引用必须用查询自身 targetList 中的对应表达式替换（用
+ *      ReplaceVarsFromTargetList），生成列表达式同样需要先重写（否则 new.gen_col
+ *      在条件中无法正确解析）。
+ *   3. 处理前对条件内的子查询补加锁（acquireLocksOnSubLinks），与 rewriteRuleAction
+ *      中的处理呼应，但此处是独立路径（注释建议未来合并，只处理一次限定条件）。
+ *   4. 在 fireRules 中，多个条件型 INSTEAD 规则的反向条件会被 AND 到同一个
+ *      *qual_product 查询上，最终由 RewriteQuery 决定是否执行它。
+ * ============================================================================
  */
 static Query *
 CopyAndAddInvertedQual(Query *parsetree,
@@ -2453,32 +2808,41 @@ CopyAndAddInvertedQual(Query *parsetree,
 
 
 /*
- *	fireRules -
- *	   Iterate through rule locks applying rules.
+ * ============================================================================
+ * 【中文注释】fireRules —— 逐一触发规则锁，产出改写后的动作查询列表
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对匹配到的规则列表逐个处理：对条件型 INSTEAD 规则生成"反向条件"分支查询
+ *   （*qual_product），对每条规则的每个动作调用 rewriteRuleAction 改写并收集到
+ *   结果列表；同时通过输出参数汇报是否有无条件 INSTEAD 规则、是否有动作重写了
+ *   RETURNING。
  *
- * Input arguments:
- *	parsetree - original query
- *	rt_index - RT index of result relation in original query
- *	event - type of rule event
- *	locks - list of rules to fire
- * Output arguments:
- *	*instead_flag - set true if any unqualified INSTEAD rule is found
- *					(must be initialized to false)
- *	*returning_flag - set true if we rewrite RETURNING clause in any rule
- *					(must be initialized to false)
- *	*qual_product - filled with modified original query if any qualified
- *					INSTEAD rule is found (must be initialized to NULL)
- * Return value:
- *	list of rule actions adjusted for use with this query
+ * 参数：
+ *   parsetree     - 触发查询（用于改写动作时的上下文）。
+ *   rt_index      - 结果关系在 rtable 中的下标。
+ *   event         - 规则事件类型。
+ *   locks         - 由 matchLocks 挑选出的、本次要触发的规则列表。
+ *   instead_flag  - 输出参数：发现任意无条件 INSTEAD 规则则置 true（初始 false）。
+ *   returning_flag- 输出参数：发现任意规则动作改写 RETURNING 则置 true（初始 false）。
+ *   qual_product  - 输出参数：若存在条件型 INSTEAD 规则，指向"追加了所有反向条件"
+ *                   的原始查询副本（初始为 NULL，首次需要时用 copyObject 创建）。
  *
- * Qualified INSTEAD rules generate their action with the qualification
- * condition added.  They also generate a modified version of the original
- * query with the negated qualification added, so that it will run only for
- * rows that the qualified action doesn't act on.  (If there are multiple
- * qualified INSTEAD rules, we AND all the negated quals onto a single
- * modified original query.)  We won't execute the original, unmodified
- * query if we find either qualified or unqualified INSTEAD rules.  If
- * we find both, the modified original query is discarded too.
+ * 返回值：
+ *   List * - 所有改写后的规则动作查询；无动作（CMD_NOTHING）会被跳过。
+ *
+ * 设计思想：
+ *   1. 按规则类型给动作打 QuerySource 标记：QSRC_INSTEAD_RULE（无条件 INSTEAD）、
+ *      QSRC_QUAL_INSTEAD_RULE（条件 INSTEAD）、QSRC_NON_INSTEAD_RULE（非 INSTEAD，
+ *      即 DO ALSO）。所有动作的 canSetTag 先置 false（是否允许设置命令标签由
+ *      QueryRewrite 最后统一决定）。
+ *   2. 条件型 INSTEAD 规则的语义是 case 分支：只要存在条件 INSTEAD 规则，原查询
+ *      仍要执行，但必须叠加所有规则条件的取反，使其只在所有条件都不成立时生效；
+ *      多个条件规则的反向条件 AND 到同一个 *qual_product 上。若已存在无条件
+ *      INSTEAD 规则，*qual_product 将不会被使用，于是跳过构建以省开销。
+ *   3. 每个动作若 commandType 为 CMD_NOTHING（DO NOTHING）则直接跳过。
+ *   4. 调用 rewriteRuleAction 时传入规则条件与事件类型，动作内部会完成 NEW/OLD
+ *      变量替换、rtable 合并与 RETURNING 处理。
+ * ============================================================================
  */
 static List *
 fireRules(Query *parsetree,
@@ -2563,13 +2927,27 @@ fireRules(Query *parsetree,
 
 
 /*
- * get_view_query - get the Query from a view's _RETURN rule.
+ * ============================================================================
+ * 【中文注释】get_view_query —— 取出视图 _RETURN 规则对应的定义查询
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从视图关系的规则集中找到事件为 CMD_SELECT 的规则（即 _RETURN 规则），返回其
+ *   唯一动作（该动作就是视图定义对应的 Query）。
  *
- * Caller should have verified that the relation is a view, and therefore
- * we should find an ON SELECT action.
+ * 参数：
+ *   view - 视图关系（调用方需已确认其 relkind 为 RELKIND_VIEW）。
  *
- * Note that the pointer returned is into the relcache and therefore must
- * be treated as read-only to the caller and not modified or scribbled on.
+ * 返回值：
+ *   Query * - 视图的定义查询。注意返回的是指向 relcache 的指针，调用方必须视为
+ *             只读，不得修改。
+ *
+ * 设计思想：
+ *   1. 直接遍历 view->rd_rules 的规则数组，找到 CMD_SELECT 规则；_RETURN 规则
+ *      约定只有恰好一个动作，若动作数不是 1 说明目录数据异常，elog 报错。
+ *   2. 找不到时同样 elog 报错（说明视图定义不完整），NULL 只是为满足编译器。
+ *   3. 视图的 _RETURN 规则由 DefineQueryRewrite 在创建视图时生成，其动作 Query
+ *      缓存在 relcache 中；调用方需要可写副本时必须自行 copyObject。
+ * ============================================================================
  */
 Query *
 get_view_query(Relation view)
@@ -2598,17 +2976,33 @@ get_view_query(Relation view)
 
 
 /*
- * view_has_instead_trigger - does view have an INSTEAD OF trigger for event?
+ * ============================================================================
+ * 【中文注释】view_has_instead_trigger —— 判断视图是否具备相应事件的 INSTEAD OF 触发器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查视图是否配置了处理指定命令事件的 INSTEAD OF 行级触发器。若有，则该视图
+ *   走"触发器可更新"路径而非"自动更新"路径。对 MERGE 命令，要求 mergeActionList
+ *   中每个数据修改动作都有对应的 INSTEAD OF 触发器才返回 true。
  *
- * If it does, we don't want to treat it as auto-updatable.  This test can't
- * be folded into view_query_is_auto_updatable because it's not an error
- * condition.
+ * 参数：
+ *   view            - 视图关系。
+ *   event           - 命令事件（CMD_INSERT/CMD_UPDATE/CMD_DELETE/CMD_MERGE）。
+ *   mergeActionList - 仅 MERGE 时使用：各动作的类型列表，逐个核对触发器。
  *
- * For MERGE, this will return true if there is an INSTEAD OF trigger for
- * every action in mergeActionList, and false if there are any actions that
- * lack an INSTEAD OF trigger.  If there are no data-modifying MERGE actions
- * (only DO NOTHING actions), true is returned so that the view is treated
- * as trigger-updatable, rather than erroring out if it's not auto-updatable.
+ * 返回值：
+ *   bool - 有（MERGE 时对所有动作都有）INSTEAD OF 触发器返回 true。
+ *
+ * 设计思想：
+ *   1. 通过 TriggerDesc 中的预计算标志（trig_insert_instead_row 等）判断，O(1)
+ *      检查，无需扫描触发器表。
+ *   2. 该检查与"是否可自动更新"（view_query_is_auto_updatable）分离，因为它是
+ *      事实性判断而非错误条件：有 INSTEAD OF 触发器时视图就不是自动可更新的。
+ *   3. MERGE 特例：所有数据修改动作（INSERT/UPDATE/DELETE）都必须有触发器才视为
+ *      触发器可更新；若只有 DO NOTHING 动作则返回 true，让视图按触发器可更新
+ *      处理而非误报不可自动更新。
+ *   4. 不能把"部分动作有触发器"的视图当自动更新处理，那正是 error_view_not_updatable
+ *      在 rewriteTargetView 中针对 MERGE 要额外检查的情形。
+ * ============================================================================
  */
 bool
 view_has_instead_trigger(Relation view, CmdType event, List *mergeActionList)
@@ -2664,15 +3058,32 @@ view_has_instead_trigger(Relation view, CmdType event, List *mergeActionList)
 
 
 /*
- * view_col_is_auto_updatable - test whether the specified column of a view
- * is auto-updatable. Returns NULL (if the column can be updated) or a message
- * string giving the reason that it cannot be.
+ * ============================================================================
+ * 【中文注释】view_col_is_auto_updatable —— 判断视图某列是否可自动更新
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查视图 targetList 中的单个输出列是否可直接映射到底层基表的用户列，从而
+ *   支持自动更新。返回值 NULL 表示可更新，否则为说明不可更新原因的消息串。
  *
- * The returned string has not been translated; if it is shown as an error
- * message, the caller should apply _() to translate it.
+ * 参数：
+ *   rtr - 指向视图唯一基表的 RangeTblRef（用于核对 Var 的 varno）。
+ *   tle - 待检查的视图输出列（TargetEntry）。
  *
- * Note that the checks performed here are local to this view. We do not check
- * whether the referenced column of the underlying base relation is updatable.
+ * 返回值：
+ *   const char * - NULL 表示可更新；否则为未翻译的原因字符串（调用方若用于错误
+ *                  信息需自行 _() 翻译）。
+ *
+ * 设计思想：
+ *   1. 可更新的唯一标准：该列是引用本视图唯一基表、levelsup 为 0 的普通用户列
+ *      Var（resno 为正，排除系统列与整行引用）。
+ *   2. 各类不可更新情形分别返回语义化消息：junk 列、非基表列 Var（表达式列）、
+ *      系统列、整行引用。
+ *   3. 只做"本层"检查：不递归验证底层基表是否可更新（那是 relation_is_updatable
+ *      与递归改写的职责）。
+ *   4. 该检查对视图每个输出列调用一次，供 view_query_is_auto_updatable 判断
+ *      "是否存在至少一个可更新列"，以及供 view_cols_are_auto_updatable 校验指定
+ *      列集合是否都可更新。
+ * ============================================================================
  */
 static const char *
 view_col_is_auto_updatable(RangeTblRef *rtr, TargetEntry *tle)
@@ -2707,20 +3118,37 @@ view_col_is_auto_updatable(RangeTblRef *rtr, TargetEntry *tle)
 
 
 /*
- * view_query_is_auto_updatable - test whether the specified view definition
- * represents an auto-updatable view. Returns NULL (if the view can be updated)
- * or a message string giving the reason that it cannot be.
+ * ============================================================================
+ * 【中文注释】view_query_is_auto_updatable —— 判断视图定义是否"可自动更新"
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   按 SQL-92 及 PostgreSQL 扩充规则检查视图的定义查询，判断该视图能否被自动
+ *   更新（即对视图的 INSERT/UPDATE/DELETE 能否直接映射到底表）。可更新返回 NULL，
+ *   否则返回说明原因的消息串。
  *
- * The returned string has not been translated; if it is shown as an error
- * message, the caller should apply _() to translate it.
+ * 参数：
+ *   viewquery - 视图的定义查询（来自 get_view_query，只读使用）。
+ *   check_cols- 为 true 时额外要求视图至少有一个可更新列（INSERT/UPDATE 需要）；
+ *               为 false 时不做列检查（DELETE 不需要）。
  *
- * If check_cols is true, the view is required to have at least one updatable
- * column (necessary for INSERT/UPDATE). Otherwise the view's columns are not
- * checked for updatability. See also view_cols_are_auto_updatable.
+ * 返回值：
+ *   const char * - NULL 表示可自动更新；否则为未翻译的原因字符串。
  *
- * Note that the checks performed here are only based on the view definition.
- * We do not check whether any base relations referred to by the view are
- * updatable.
+ * 设计思想：
+ *   1. 逐条检查 SQL-92 约束：无 DISTINCT、无 GROUP BY/HAVING、无集合操作
+ *      （UNION/INTERSECT/EXCEPT）、无 CTE、无 LIMIT/OFFSET、无聚合/窗口函数/
+ *      集合返回函数；FROM 中恰好一个基表（普通表、外键表、视图或分区表），且该
+ *      RTE 是 RTE_RELATION 类型。
+ *   2. 有意的放宽：标准要求 WHERE 中不得有引用目标表的子查询，这里不强制，因为
+ *      基于 MVCC 快照，这样的子查询反正看不到外层更新，无实际危害。
+ *   3. 额外约束（PostgreSQL 扩展）：不支持 TABLESAMPLE；TLE 中不得有系统列或
+ *      整行引用、窗口函数、集合返回函数。
+ *   4. check_cols 为 true 时遍历 targetList 用 view_col_is_auto_updatable 寻找
+ *      至少一个可更新列，一个都没有则判定不可更新。
+ *   5. 只在"本层"检查，不递归展开视图；若基表本身是视图，后续递归处理。
+ *   6. 返回值采用 gettext_noop 未翻译字符串，便于调用方区分"视图整体不可更新"
+ *      与"指定列不可更新"两类错误。
+ * ============================================================================
  */
 const char *
 view_query_is_auto_updatable(Query *viewquery, bool check_cols)
@@ -2848,27 +3276,34 @@ view_query_is_auto_updatable(Query *viewquery, bool check_cols)
 
 
 /*
- * view_cols_are_auto_updatable - test whether all of the required columns of
- * an auto-updatable view are actually updatable. Returns NULL (if all the
- * required columns can be updated) or a message string giving the reason that
- * they cannot be.
+ * ============================================================================
+ * 【中文注释】view_cols_are_auto_updatable —— 校验指定视图列集合是否全部可自动更新
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历视图 targetList，确认 required_cols 指定的列都是可更新的（即都是引用基表
+ *   普通列的 Var）。若全部满足返回 NULL；否则返回未翻译的原因串，并可通过输出
+ *   参数给出第一个违规列的名字。
  *
- * The returned string has not been translated; if it is shown as an error
- * message, the caller should apply _() to translate it.
+ * 参数：
+ *   viewquery         - 视图定义查询（调用方须已用 view_query_is_auto_updatable
+ *                       确认其可自动更新）。
+ *   required_cols     - 本次操作需要更新的列集合（Bitmapset，位号为列号加偏移）。
+ *                       其中的列不可更新时即判定失败。
+ *   updatable_cols    - 输出参数（可为 NULL）：返回视图所有可更新列的集合。
+ *   non_updatable_col - 输出参数（可为 NULL）：若失败，置为第一个违规列的列名。
  *
- * This should be used for INSERT/UPDATE to ensure that we don't attempt to
- * assign to any non-updatable columns.
+ * 返回值：
+ *   const char * - NULL 表示要求的列都可更新；否则为未翻译的原因字符串。
  *
- * Additionally it may be used to retrieve the set of updatable columns in the
- * view, or if one or more of the required columns is not updatable, the name
- * of the first offending non-updatable column.
- *
- * The caller must have already verified that this is an auto-updatable view
- * using view_query_is_auto_updatable.
- *
- * Note that the checks performed here are only based on the view definition.
- * We do not check whether the referenced columns of the base relation are
- * updatable.
+ * 设计思想：
+ *   1. 通过 col 计数器把视图输出列按序号映射为"列号 + FirstLowInvalidHeapAttributeNumber"
+ *      位号，与权限系统使用的位图编码一致（列号可为负，如系统列）。
+ *   2. 对每个输出列调用 view_col_is_auto_updatable：可更新则加入 *updatable_cols；
+ *      不可更新且属于 required_cols 则记录列名并立即返回原因。
+ *   3. 只依赖视图定义本身，不递归检查基表列的可更新性。
+ *   4. 用于 INSERT/UPDATE 前校验被修改列集合（rewriteTargetView），也用于
+ *      relation_is_updatable 收集视图的可更新列。
+ * ============================================================================
  */
 static const char *
 view_cols_are_auto_updatable(Query *viewquery,
@@ -2923,35 +3358,42 @@ view_cols_are_auto_updatable(Query *viewquery,
 
 
 /*
- * relation_is_updatable - determine which update events the specified
- * relation supports.
+ * ============================================================================
+ * 【中文注释】relation_is_updatable —— 确定关系支持的更新事件集合
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   递归判定一个关系支持哪些 DML 事件（INSERT/UPDATE/DELETE），返回事件位掩码。
+ *   这是信息模式（information_schema.views 等）判定"updatable / trigger_updatable"
+ *   的依据，也可用于判断数据修改 SQL 是否可行。
  *
- * Note that views may contain a mix of updatable and non-updatable columns.
- * For a view to support INSERT/UPDATE it must have at least one updatable
- * column, but there is no such restriction for DELETE. If include_cols is
- * non-NULL, then only the specified columns are considered when testing for
- * updatability.
+ * 参数：
+ *   reloid          - 待检查关系的 OID。
+ *   outer_reloids   - 递归路径上已检查过的外层关系 OID 列表（递归检测用；外部
+ *                     调用方传 NIL）。
+ *   include_triggers- 为 true 时把 INSTEAD OF 触发器提供的可更新能力也计入结果；
+ *                     为 false（信息模式语义）则只计规则/自动更新能力。
+ *   include_cols    - 非 NULL 时只考虑指定列集合，用于视图级权限或列级检查。
  *
- * Unlike the preceding functions, this does recurse to look at a view's
- * base relations, so it needs to detect recursion.  To do that, we pass
- * a list of currently-considered outer relations.  External callers need
- * only pass NIL.
+ * 返回值：
+ *   int - 位掩码，(1 << CMD_INSERT) | (1 << CMD_UPDATE) | (1 << CMD_DELETE)
+ *         中对应支持事件位置位。
  *
- * This is used for the information_schema views, which have separate concepts
- * of "updatable" and "trigger updatable".  A relation is "updatable" if it
- * can be updated without the need for triggers (either because it has a
- * suitable RULE, or because it is simple enough to be automatically updated).
- * A relation is "trigger updatable" if it has a suitable INSTEAD OF trigger.
- * The SQL standard regards this as not necessarily updatable, presumably
- * because there is no way of knowing what the trigger will actually do.
- * The information_schema views therefore call this function with
- * include_triggers = false.  However, other callers might only care whether
- * data-modifying SQL will work, so they can pass include_triggers = true
- * to have trigger updatability included in the result.
- *
- * The return value is a bitmask of rule event numbers indicating which of
- * the INSERT, UPDATE and DELETE operations are supported.  (We do it this way
- * so that we can test for UPDATE plus DELETE support in a single call.)
+ * 设计思想：
+ *   1. 递归前先 check_stack_depth 防栈溢出；用 try_relation_open 打开关系，若已
+ *      不存在（MVCC 下信息模式扫描可能引用到已删除表）则返回 0 而非报错。
+ *   2. 递归检测：若 reloid 已在 outer_reloids 中（视图循环引用自身）返回 0。
+ *   3. 普通表/分区表无条件支持全部事件。
+ *   4. 规则贡献：所有无条件 DO INSTEAD 规则对应的（INSERT/UPDATE/DELETE）事件
+ *      计入；一旦已集齐全部事件即可提前返回。
+ *   5. 触发器贡献（include_triggers 时）：三种 INSTEAD OF 行触发器各计一事件，
+ *      集齐即返回。
+ *   6. 外键表：优先用 FDW 提供的 IsForeignRelUpdatable；缺失时按是否存在
+ *      ExecForeignInsert/Update/Delete 回调推断。
+ *   7. 视图：若可自动更新，先由 view_cols_are_auto_updatable 求可更新列集合
+ *      （与 include_cols 求交集），空则只可能支持 DELETE；否则可能支持全部事件。
+ *      基表若又是非普通表，则把视图的可更新列映射到底表列（adjust_view_column_set）
+ *      后递归检查底表，得到的结果做按位与，即"两端都必须支持"。
+ * ============================================================================
  */
 int
 relation_is_updatable(Oid reloid,
@@ -3127,12 +3569,34 @@ relation_is_updatable(Oid reloid,
 
 
 /*
- * adjust_view_column_set - map a set of column numbers according to targetlist
+ * ============================================================================
+ * 【中文注释】adjust_view_column_set —— 把视图列号集合映射到底表列号集合
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   依据视图 targetList，把"视图列号"的集合（如权限检查的 insertedCols/
+ *   updatedCols）映射为"底层基表列号"的集合。视图的可更新列都是引用基表普通列
+ *   的 Var，因此可以用 targetList 做一一映射。
  *
- * This is used with simply-updatable views to map column-permissions sets for
- * the view columns onto the matching columns in the underlying base relation.
- * Relevant entries in the targetlist must be plain Vars of the underlying
- * relation (as per the checks above in view_query_is_auto_updatable).
+ * 参数：
+ *   cols       - 待映射的视图列号集合（Bitmapset，位号已加
+ *                FirstLowInvalidHeapAttributeNumber 偏移）。
+ *   targetlist - 视图的定义 targetList。
+ *
+ * 返回值：
+ *   Bitmapset * - 映射后的基表列号集合。
+ *
+ * 设计思想：
+ *   1. 普通列：位号还原为 attno 后用 get_tle_by_resno 找到对应视图输出列，取其
+ *      表达式（须为引用基表的 Var）的 varattno 加入结果集合；找不到或非 Var 则
+ *      elog 报错（调用方应已保证视图可自动更新）。
+ *   2. 整行引用（attno == InvalidAttrNumber，即视图整行）：权限上视为引用了视图
+ *      输出的每一列，但**不**转换成对基表的整行引用——因为视图可能只使用基表的
+ *      部分列，整行引用会错误扩大权限需求。
+ *   3. 位号统一使用"列号 - FirstLowInvalidHeapAttributeNumber"的编码，与权限位图
+ *      （RTEPermissionInfo）的编码一致。
+ *   4. 用于 rewriteTargetView 把对视图列的写权限映射到底表列，也用于
+ *      relation_is_updatable 递归检查底表列。
+ * ============================================================================
  */
 static Bitmapset *
 adjust_view_column_set(Bitmapset *cols, List *targetlist)
@@ -3196,17 +3660,35 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 
 
 /*
- * error_view_not_updatable -
- *	  Report an error due to an attempt to update a non-updatable view.
+ * ============================================================================
+ * 【中文注释】error_view_not_updatable —— 报出"视图不可更新"的错误
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   针对对不可更新视图的 INSERT/UPDATE/DELETE/MERGE 操作抛出带详细提示的错误，
+ *   提示用户提供 INSTEAD OF 触发器或无条件的 ON ... DO INSTEAD 规则（MERGE 仅
+ *   触发器）。
  *
- * Generally this is expected to be called from the rewriter, with suitable
- * error detail explaining why the view is not updatable.  Note, however, that
- * the executor also performs a just-in-case check that the target view is
- * updatable.  That check is expected to never fail, but if it does, it will
- * call this function with NULL error detail --- see CheckValidResultRel().
+ * 参数：
+ *   view            - 目标视图关系（用于错误信息中的视图名与触发器描述）。
+ *   command         - 被尝试的命令事件。
+ *   mergeActionList - 仅 MERGE：逐个动作检查，对缺 INSTEAD OF 触发器的动作报错。
+ *   detail          - 附加的错误细节（如不可更新的具体原因，来自
+ *                     view_query_is_auto_updatable 的返回值）；为 NULL 时省略。
  *
- * Note: for MERGE, at least one of the actions in mergeActionList is expected
- * to lack a suitable INSTEAD OF trigger --- see view_has_instead_trigger().
+ * 返回值：
+ *   无（总是抛出 ERROR）。
+ *
+ * 设计思想：
+ *   1. 每条消息都带 errhint 给出修复路径，detail 用 errdetail_internal 并 _()
+ *      翻译（detail 本身是 gettext_noop 的未翻译串）。
+ *   2. 主要调用点是 rewriteTargetView（重写器内，有详细原因），但执行器的
+ *      CheckValidResultRel 也会在"理论不该失败"的兜底检查中调用本函数，此时
+ *      detail 为 NULL。
+ *   3. MERGE 分支特殊：错误提示只能指向 INSTEAD OF 触发器（MERGE 不支持规则），
+ *      且必须逐个动作检查——因为调用方（rewriteTargetView）已经保证不存在完整的
+ *      触发器集合，这里只需要对缺失触发器的具体动作报错。
+ *   4. 错误码统一为 ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE。
+ * ============================================================================
  */
 void
 error_view_not_updatable(Relation view,
@@ -3295,13 +3777,52 @@ error_view_not_updatable(Relation view,
 
 
 /*
- * rewriteTargetView -
- *	  Attempt to rewrite a query where the target relation is a view, so that
- *	  the view's base relation becomes the target relation.
+ * ============================================================================
+ * 【中文注释】rewriteTargetView —— 把目标为视图的查询改写为直接作用于基表
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   实现"自动可更新视图"：当 INSERT/UPDATE/DELETE/MERGE 的目标关系是视图时，
+ *   把视图定义查询内联展开，把对视图列的赋值映射到基表列，将视图 WHERE 限定
+ *   合并进查询（含安全屏障/WITH CHECK OPTION 处理），最终使基表成为新的结果关系，
+ *   再交给 RewriteQuery 递归改写。
  *
- * Note that the base relation here may itself be a view, which may or may not
- * have INSTEAD OF triggers or rules to handle the update.  That is handled by
- * the recursion in RewriteQuery.
+ * 参数：
+ *   parsetree - 目标为视图的查询（就地修改，返回改写后的版本）。
+ *   view      - 目标视图关系。
+ *
+ * 返回值：
+ *   Query * - 改写后的查询（结果关系已变成视图的基表）。
+ *
+ * 设计思想：
+ *   1. 前置校验：从 relcache 深拷贝视图定义查询（get_view_query 只读），先确认
+ *      "整体可自动更新"（view_query_is_auto_updatable），失败即 error_view_not_updatable；
+ *      INSERT/UPDATE（含 MERGE 内相应动作）还要计算被修改列集合
+ *      （view_perminfo 的 insertedCols/updatedCols 并上 targetList 与 ON CONFLICT
+ *      及 MERGE 动作的 resno），确认这些列都可更新，否则按列报错。
+ *   2. FOR PORTION OF 的区间列同样要验证可更新（对 DELETE 也生效）。
+ *   3. 基表尚未被加锁，先以 RowExclusiveLock 打开（后续递归 RewriteQuery 会假定
+ *      已有合适锁），并刷新 base_rte->relkind。
+ *   4. 把基表 RTE 追加到外层 rtable 末尾作为新目标（new_rt_index），INSERT 关闭
+ *      inh，UPDATE/DELETE/MERGE 沿用视图查询的继承标志；把视图 targetList 的
+ *      varno 从 base_rt_index 改为 new_rt_index，得到替换表达式（view_targetlist）。
+ *   5. 权限处理：给基表建立新的 RTEPermissionInfo，关系级所需权限继承视图的
+ *      requiredPerms（去掉 SELECT 位）；列级把视图的 insertedCols/updatedCols
+ *      经 adjust_view_column_set 映射为基表列；selectedCols 保留视图定义中使用的
+ *      基表列（视图属主必须对视图定义引用的所有列有读权限）。security_invoker
+ *      视图按查询调用者检查（checkAsUser = InvalidOid），否则按视图属主检查。
+ *   6. 用 ReplaceVarsFromTargetList 把外层查询中所有引用视图的 Var 替换为基表列
+ *      表达式（REPORT_ERROR 保证视图列都能映射）；再用 ChangeVarNodes 把
+ *      resultRelation 等 RTE 下标引用改为 new_rt_index。
+ *   7. 对 INSERT/UPDATE 的 targetList、MERGE 动作 targetList、ON CONFLICT 辅助
+ *      列表与 EXCLUDED 伪关系、FOR PORTION OF 的目标列表逐一按视图列号映射重排
+ *      resno（视图列顺序可能不同于基表列顺序）；ON CONFLICT 需重建 EXCLUDED RTE
+ *      （基于基表列）并重写相关 Var。
+ *   8. 视图 WHERE 限定：非 INSERT 时拉入外层查询（安全屏障视图则作为新 RTE 的
+ *      securityQuals 排在既有屏障条件之前）；INSERT/UPDATE 且带 WITH CHECK OPTION
+ *      时构造 WCO_VIEW_CHECK 检查项加入 withCheckOptions 列表（CASCADED 需级联
+ *      下传，LOCAL 且无自身限定时可省略），保证写入行满足视图定义。
+ *   9. 基表若本身是视图，则交给 RewriteQuery 的递归继续改写；本函数只做一层映射。
+ * ============================================================================
  */
 static Query *
 rewriteTargetView(Query *parsetree, Relation view)
@@ -4027,18 +4548,59 @@ rewriteTargetView(Query *parsetree, Relation view)
 
 
 /*
- * RewriteQuery -
- *	  rewrites the query and apply the rules again on the queries rewritten
+ * ============================================================================
+ * 【中文注释】RewriteQuery —— 对单个查询应用所有规则并递归改写生成的产品查询
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   查询重写的核心：对一个查询（SELECT 之外的 INSERT/UPDATE/DELETE/MERGE）先
+ *   重写其目标列表，再匹配并触发该关系上的规则（fireRules），对可自动更新视图
+ *   执行 rewriteTargetView，随后把所有产品查询（规则动作、改写后的视图查询）
+ *   递归重写，最后按语义决定原查询是否保留/以何形式保留，返回最终要执行的
+ *   查询列表。
  *
- * rewrite_events is a list of open query-rewrite actions, so we can detect
- * infinite recursion.
+ * 参数：
+ *   parsetree         - 待重写的查询。
+ *   rewrite_events    - 当前已打开的重写动作（relation, event）列表，用于检测
+ *                       无限递归。
+ *   orig_rt_length    - 源查询 rtable 的长度：对 fireRules 产生的产品查询传源值，
+ *                       用于跳过其中已处理的 VALUES RTE；否则为 0。
+ *   num_ctes_processed- 已重写过的、位于 cteList 末尾的 CTE 数（避免重复改写 CTE
+ *                       导致生成列表达式被展开两次而报错）。
  *
- * orig_rt_length is the length of the originating query's rtable, for product
- * queries created by fireRules(), and 0 otherwise.  This is used to skip any
- * already-processed VALUES RTEs from the original query.
+ * 返回值：
+ *   List * - 重写后的查询列表（0 个或多个 Query）。
  *
- * num_ctes_processed is the number of CTEs at the end of the query's cteList
- * that have already been rewritten, and must not be rewritten again.
+ * 设计思想：
+ *   1. 先递归处理 WITH 中的数据修改 CTE（须先于规则触发，因为 CTE 可能被拷入规则
+ *      动作）。对单个 DO INSTEAD 动作把改写结果写回 CTE 节点；不支持的条件规则、
+ *      DO ALSO、多语句 INSTEAD 规则、NOTHING 规则在 WITH 数据修改语句中都会报错。
+ *   2. 对非 SELECT/UTILITY 命令：打开结果关系（假定已加锁），针对命令类型重写
+ *      targetList：
+ *      - INSERT：找 VALUES RTE（多行插入），用 rewriteTargetListIU 处理主列表与
+ *        ON CONFLICT DO UPDATE 列表，rewriteValuesRTE 处理 VALUES 中的 DEFAULT；
+ *      - UPDATE：处理 FOR PORTION OF 的限定与列（视图留待递归处理），然后
+ *        rewriteTargetListIU；
+ *      - MERGE：对每个动作的 targetList 分别 rewriteTargetListIU；
+ *      - DELETE：仅处理 FOR PORTION OF 限定。
+ *   3. matchLocks 收集规则，fireRules 产出产品查询；若 VALUES 中仍有未处理的
+ *      DEFAULT 且存在产品查询，对每个产品查询的 VALUES RTE 用
+ *      rewriteValuesRTEToNulls 收尾。
+ *   4. 若没有无条件 INSTEAD 规则、目标是视图且无 INSTEAD OF 触发器，则尝试
+ *      rewriteTargetView 自动更新（存在条件 INSTEAD 规则会使其失败）；改写结果按
+ *      INSERT 前置 / 其他后置插入 product_queries，并把 instead/returning 置位
+ *      防止原查询被重复加入。
+ *   5. 对每个产品查询先做无限递归检查（rewrite_events 中 (relation,event) 重复即
+ *      报错），压入当前事件后递归 RewriteQuery，再弹出事件。
+ *   6. 若存在 INSTEAD 或条件 INSTEAD 而原查询带 RETURNING，但规则未改写 RETURNING，
+ *      报错（因为 RETURNING 必须来自无条件 INSTEAD 规则）；ON CONFLICT 与带规则
+ *      的表不兼容（可自动更新视图除外）。
+ *   7. 最终组装：无条件 INSTEAD 规则存在时原查询完全不执行；否则 INSERT 的原查询
+ *      放最前（先插后执行，保证后面扫描能看到），UPDATE/DELETE 放最后（先执行规则
+ *      动作，避免命令计数器前进后动作扫描不到被删/被改的行）；存在条件 INSTEAD 时
+ *      用叠加反向条件的 qual_product 替代原查询。
+ *   8. 若原查询带 CTE 且改写出多个非 utility 查询则报错（每个查询都会拷贝同一份
+ *      CTE，违反 CTE 只求值一次的语义）。
+ * ============================================================================
  */
 static List *
 RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length,
@@ -4650,13 +5212,32 @@ RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length,
 
 
 /*
- * Get a table's generated columns
+ * ============================================================================
+ * 【中文注释】get_generated_columns —— 获取表的生成列定义列表
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历表描述符，收集所有生成列（stored 与/或 virtual），为每列构造包含其生成
+ *   表达式（引用列号已调整为给定 rt_index）的 TargetEntry 列表。这些条目用于
+ *   替换规则动作/条件中 new.generated_col 引用，或用于展开表达式中的 virtual
+ *   生成列。
  *
- * If include_stored is true, both stored and virtual generated columns are
- * returned.  Otherwise, only virtual generated columns are returned.
+ * 参数：
+ *   rel           - 目标关系。
+ *   rt_index      - 生成表达式里 Var 应引用的 rtable 下标（规则场景下是 NEW 的
+ *                   varno，即 PRS2_NEW_VARNO + rt_length）。
+ *   include_stored- true 时同时返回 stored 与 virtual 生成列；false 时仅 virtual。
  *
- * Returns a list of TargetEntry, one for each generated column, containing
- * the attribute numbers and generation expressions.
+ * 返回值：
+ *   List * - TargetEntry 列表，每项 resno 为生成列属性号、expr 为生成表达式。
+ *
+ * 设计思想：
+ *   1. 先看 TupleDesc 的约束标志（has_generated_virtual / has_generated_stored）
+ *      快速判断是否需要遍历，避免无生成列时白白扫描。
+ *   2. 每个生成表达式用 build_generation_expression 从目录读出（含必要的 COLLATE
+ *      包裹），再 ChangeVarNodes 把 varno 1 调整为 rt_index。
+ *   3. 生成表达式内部引用 new.attribute，因此返回前通常还要再经
+ *      ReplaceVarsFromTargetList 用查询 targetList 替换 NEW——调用方负责此步。
+ * ============================================================================
  */
 static List *
 get_generated_columns(Relation rel, int rt_index, bool include_stored)
@@ -4692,10 +5273,30 @@ get_generated_columns(Relation rel, int rt_index, bool include_stored)
 }
 
 /*
- * Expand virtual generated columns in an expression
+ * ============================================================================
+ * 【中文注释】expand_generated_columns_in_expr —— 在独立表达式中展开 virtual 生成列
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把给定表达式中对 virtual 生成列的引用（Var）替换为对应的生成表达式。用于
+ *   不属于查询树本身的表达式，如默认值表达式、索引谓词等，其 rt_index 通常为 1。
  *
- * This is for expressions that are not part of a query, such as default
- * expressions or index predicates.  The rt_index is usually 1.
+ * 参数：
+ *   node    - 待展开的表达式（可能被就地改写，返回新表达式）。
+ *   rel     - 生成列所属的关系。
+ *   rt_index- 表达式中的 Var 所引用的 rtable 下标（通常为 1）。
+ *
+ * 返回值：
+ *   Node * - 展开后的表达式。
+ *
+ * 设计思想：
+ *   1. 只有存在 virtual 生成列时才需要处理（stored 生成列的值在行级计算，无需
+ *      内联展开到表达式里）。
+ *   2. 手工构造一个临时 RTE_RELATION RTE（eref 名称无关紧要）以调用
+ *      ReplaceVarsFromTargetList，用 get_generated_columns(rel, rt_index, false)
+ *      得到的表达式列表做替换，模式 REPLACEVARS_CHANGE_VARNO 保持 varno 映射。
+ *   3. 外层 hasSubLinks 传 NULL 是安全的：生成表达式不可能包含 SubLink，替换不会
+ *      引入新的子链接。
+ * ============================================================================
  */
 Node *
 expand_generated_columns_in_expr(Node *node, Relation rel, int rt_index)
@@ -4732,9 +5333,29 @@ expand_generated_columns_in_expr(Node *node, Relation rel, int rt_index)
 }
 
 /*
- * Build the generation expression for a generated column.
+ * ============================================================================
+ * 【中文注释】build_generation_expression —— 构造生成列的计算表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   取出指定生成列的生成表达式：其存储形态与列默认值一致（生成定义存放在
+ *   pg_attrdef），因此复用 build_column_default 读取，并补上列定义中指定的
+ *   COLLATE 约束。若找不到生成表达式则报错。
  *
- * Error out if there is no generation expression found for the given column.
+ * 参数：
+ *   rel    - 目标关系。
+ *   attrno - 生成列属性号（从 1 开始）。
+ *
+ * 返回值：
+ *   Node * - 生成表达式树。
+ *
+ * 设计思想：
+ *   1. 断言列确为 virtual/stored 生成列且表存在生成列约束，否则是内部错误。
+ *   2. build_column_default 对生成列会跳过类型级默认值、直接返回目录中的生成
+ *      定义表达式（生成列在此处相当于"必须存在的默认值"）；返回 NULL 说明目录
+ *      数据损坏，elog 报错。
+ *   3. 若列声明了排序规则（attcollation）且与表达式推算的排序规则不同，则用
+ *      CollateExpr 包裹强制指定，保证语义与列定义一致。
+ * ============================================================================
  */
 Node *
 build_generation_expression(Relation rel, int attrno)
@@ -4777,13 +5398,36 @@ build_generation_expression(Relation rel, int attrno)
 
 
 /*
- * QueryRewrite -
- *	  Primary entry point to the query rewriter.
- *	  Rewrite one query via query rewrite system, possibly returning 0
- *	  or many queries.
+ * ============================================================================
+ * 【中文注释】QueryRewrite —— 查询重写系统的主入口
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对一个查询执行完整的重写流程：先由 RewriteQuery 应用所有非 SELECT 规则
+ *  （INSERT/UPDATE/DELETE/MERGE），再由 fireRIRrules 对每条结果查询展开视图
+ *  （RIR 规则），最后统一决定哪条查询负责设置命令结果标签（canSetTag），返回
+ *  0 个或多个待执行的查询。
  *
- * NOTE: the parsetree must either have come straight from the parser,
- * or have been scanned by AcquireRewriteLocks to acquire suitable locks.
+ * 参数：
+ *   parsetree - 待重写的查询，必须是顶层原始查询（querySource == QSRC_ORIGINAL
+ *               且 canSetTag）。它必须来自解析器，或已被 AcquireRewriteLocks
+ *               加过合适锁。
+ *
+ * 返回值：
+ *   List * - 重写后的查询列表，可能为空。
+ *
+ * 设计思想：
+ *   1. 分三步：
+ *      - Step 1：RewriteQuery(parsetree, NIL, 0, 0) 应用非 SELECT 规则，可能得到
+ *        0 个或多个查询（规则动作、视图改写产物等）；
+ *      - Step 2：对每条查询调用 fireRIRrules(query, NIL) 展开其中的视图，并顺手
+ *        把原始 queryId 写回每个结果查询；
+ *      - Step 3：扫描结果列表决定 canSetTag：若原查询仍在列表中则由它设标签；
+ *        否则由最后一条与原始命令同类型的 INSTEAD 查询设置；都不满足则无查询设
+ *        标签（tcop 层会用原始查询构造默认标签兜底）。
+ *   2. 断言保证列表中至多一条 canSetTag 的查询；非断言编译时可提前跳出循环。
+ *   3. 视图展开（fireRIRrules）放在非 SELECT 规则之后，因为规则动作里可能引入
+ *      新的视图引用，需要在最终执行前全部展开。
+ * ============================================================================
  */
 List *
 QueryRewrite(Query *parsetree)

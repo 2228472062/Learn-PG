@@ -44,9 +44,46 @@ static void setRuleCheckAsUser_Query(Query *qry, Oid userid);
 
 
 /*
- * InsertRule -
- *	  takes the arguments and inserts them as a row into the system
- *	  relation "pg_rewrite"
+ * ============================================================================
+ * 【中文注释】InsertRule —— 将规则参数以行的形式插入系统目录 pg_rewrite
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   接收一条规则的全部要素（规则名、事件类型、所属关系、是否 INSTEAD、事件
+ *   条件、动作列表），把规则序列化后写入 pg_rewrite 系统表，并建立相应的依赖
+ *   关系。这是 CREATE RULE / CREATE VIEW 真正落盘规则的底层函数。
+ *
+ * 参数：
+ *   rulname     - 规则名（如 "_RETURN"）。
+ *   evtype      - 事件类型 CmdType（CMD_SELECT / CMD_INSERT / ...）。
+ *   eventrel_oid- 规则所属关系的 OID（ev_class）。
+ *   evinstead   - 是否为 INSTEAD 规则（true 表示替换原动作执行）。
+ *   event_qual  - 事件条件表达式（规则触发条件，NULL 表示无条件）。
+ *   action      - 动作查询列表（List<Query>）。
+ *   replace     - 是否允许替换同名已有规则。
+ *
+ * 返回值：
+ *   Oid - 新建（或更新后）规则的 OID。
+ *
+ * 设计思想：
+ *   1. 先把难以直接存储的树形结构序列化为字符串：event_qual 与 action 都用
+ *      nodeToString() 转成文本后放进 text 类型的 ev_qual / ev_action 列，读取时
+ *      再 stringToNode() 反序列化。
+ *   2. 通过 syscache RULERELNAME((关系OID,规则名)) 查找是否已存在同名规则：
+ *      - 若存在：若不允许替换（replace=false）则报重复对象错误；否则用
+ *        heap_modify_tuple 仅更新 ev_type/is_instead/ev_qual/ev_action 四列
+ *        （保留 oid、ev_class、rulename），并标记 is_update 以重建依赖。
+ *      - 若不存在：用 GetNewOidWithIndex 分配新 OID 后 heap_form_tuple 插入。
+ *   3. 依赖管理（pg_depend）：
+ *      - 规则依赖其所属关系：ON SELECT 规则用 DEPENDENCY_INTERNAL（内部依赖，
+ *        防止删除视图时被级联误删 SELECT 规则），其他规则用 DEPENDENCY_AUTO
+ *        （关系被删时规则自动删除）。
+ *      - 规则还依赖动作与条件中引用的所有对象（表、函数等），用
+ *        recordDependencyOnExpr 登记 DEPENDENCY_NORMAL，保证被引用对象删除时
+ *        规则随之失效。
+ *   4. 事件条件引用的 OLD/NEW 范围表变量需要在正确的 rtable 上下文中登记依赖，
+ *      因此用 getInsertSelectQuery 找到含 OLD/NEW 条目的那个查询再登记。
+ *   5. 触发对象后置创建钩子（InvokeObjectPostCreateHook），供扩展监视规则创建。
+ * ============================================================================
  */
 static Oid
 InsertRule(const char *rulname,
@@ -183,8 +220,29 @@ InsertRule(const char *rulname,
 }
 
 /*
- * DefineRule
- *		Execute a CREATE RULE command.
+ * ============================================================================
+ * 【中文注释】DefineRule —— 执行 CREATE RULE 命令
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   处理用户发出的 CREATE RULE 语句：先对规则的动作与条件做解析分析，再定位
+ *   目标关系并加锁，最后把规则安装到系统目录。是规则创建命令的用户入口。
+ *
+ * 参数：
+ *   stmt       - 解析后的 CREATE RULE 语法树（RuleStmt），包含规则名、目标关系、
+ *                事件类型、是否 INSTEAD、是否 REPLACE、动作与条件。
+ *   queryString- 原始 SQL 文本，用于解析过程中的错误定位与上下文。
+ *
+ * 返回值：
+ *   ObjectAddress - 新建规则的（类ID, 对象ID, 子ID）地址，供 DDL 框架返回信息。
+ *
+ * 设计思想：
+ *   1. 委托 transformRuleStmt() 完成解析分析：把动作里的查询、事件条件从原始
+ *      语法变换成已解析的 Query/表达式树（期间会做 OLD/NEW 引用、列解析等）。
+ *   2. 用 RangeVarGetRelid 解析关系名并加 AccessExclusiveLock（与
+ *      DefineQueryRewrite 保持同一锁级别，二者可能互相调用，锁级别必须一致，
+ *      否则会造成死锁或锁不匹配）。
+ *   3. 其余工作全部交给 DefineQueryRewrite 完成——这里只是一个薄封装。
+ * ============================================================================
  */
 ObjectAddress
 DefineRule(RuleStmt *stmt, const char *queryString)
@@ -214,11 +272,51 @@ DefineRule(RuleStmt *stmt, const char *queryString)
 
 
 /*
- * DefineQueryRewrite
- *		Create a rule
+ * ============================================================================
+ * 【中文注释】DefineQueryRewrite —— 创建规则（动作/条件已完成解析分析）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把一条已通过解析分析的规则安装到系统目录。与 DefineRule 的区别在于：这里
+ *   的动作(action)与条件(event_qual)已经是解析后的 Query 树/表达式，可直接使用。
+ *   它也是 CREATE VIEW（通过 internal 调用安装 _RETURN 规则）的核心落地点。
  *
- * This is essentially the same as DefineRule() except that the rule's
- * action and qual have already been passed through parse analysis.
+ * 参数：
+ *   rulename   - 规则名。
+ *   event_relid- 规则所属关系 OID。
+ *   event_qual - 已解析的事件条件表达式（可 NULL）。
+ *   event_type - 规则事件类型 CmdType。
+ *   is_instead - 是否 INSTEAD 规则。
+ *   replace    - 是否允许替换已有同名规则。
+ *   action     - 已解析的动作查询列表（List<Query>）。
+ *
+ * 返回值：
+ *   ObjectAddress - 规则的地址；注意当 action 为空且非 INSTEAD 时规则被视作
+ *                   no-op 而不会真正插入，此时 objectId 为 InvalidOid。
+ *
+ * 设计思想：
+ *   1. 打开事件关系并加 AccessExclusiveLock。锁级别与 DefineRule 保持一致；
+ *      加最强表锁是为了保证：安装 ON SELECT 规则期间没有 SELECT 正在并发执行；
+ *      对其他规则也至少能挡住并发 INSERT/UPDATE/DELETE 与并发 CREATE RULE。
+ *      （理想情况下其他规则用 ShareRowExclusiveLock 就够，但由于目录访问的
+ *        竞态问题暂统一用最强锁。）
+ *   2. 一连串合法性校验：
+ *      - 关系类型必须能挂规则（普通表/物化视图/视图/分区表），冲突日志表与系统
+ *        目录禁止挂规则（除非 allowSystemTableMods）。
+ *      - 调用者必须拥有该关系。
+ *      - 规则动作不得改写 OLD 或 NEW 伪行（prs2_old_varno/prs2_new_varno），
+ *        因为 Postgres 不实现该功能；注意用 getInsertSelectQuery 穿透
+ *        INSERT/SELECT 包装，防止被其"伪装"成普通动作而漏检。
+ *      - ON SELECT 规则有额外严格限制：关系必须是视图/物化视图、动作必须是且
+ *        仅是一个 INSTEAD SELECT、不能带数据修改型 WITH、不能有条件、targetlist
+ *        必须与事件关系精确匹配、关系上不能再有别的 ON SELECT 规则、规则名
+ *        必须叫 _RETURN。
+ *      - 非 SELECT 规则：RETURNING 列表至多出现在一个动作中、条件规则与
+ *        非 INSTEAD 规则禁止带 RETURNING、RETURNING 必须与事件关系匹配、规则
+ *        名不能是 _RETURN（防止误替换视图规则）。
+ *   3. 校验通过后调用 InsertRule 落盘，并调用 SetRelationRuleStatus 把 pg_class
+ *      的 relhasrules 置为 true——顺带广播 SI 失效消息强制所有后端刷新 relcache。
+ *   4. 注意"空动作且非 INSTEAD"的规则是无意义规则，直接跳过安装。
+ * ============================================================================
  */
 ObjectAddress
 DefineQueryRewrite(const char *rulename,
@@ -491,13 +589,38 @@ DefineQueryRewrite(const char *rulename,
 }
 
 /*
- * checkRuleResultList
- *		Verify that targetList produces output compatible with a tupledesc
+ * ============================================================================
+ * 【中文注释】checkRuleResultList —— 校验规则动作输出与关系元组描述兼容
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查传入的 targetList（可能是 SELECT 规则的目标列表，也可能是 RETURNING
+ *   列表）能否与事件关系的元组描述（TupleDesc）逐列对上号——数量、列名（可选）、
+ *   类型、typmod 都必须匹配。不匹配时抛出带详细定位信息的错误。
  *
- * The targetList might be either a SELECT targetlist, or a RETURNING list;
- * isSelect tells which.  This is used for choosing error messages.
+ * 参数：
+ *   targetList            - 待校验的目标列表（List<TargetEntry>）。
+ *   resultDesc            - 事件关系的元组描述（列数、每列的名字/类型等）。
+ *   isSelect              - true 表示这是 SELECT 规则的目标列表，false 表示是
+ *                           RETURNING 列表；用于选择错误提示文案。
+ *   requireColumnNameMatch- 是否要求列名也一致（仅 SELECT 且针对普通视图时要求，
+ *                           物化视图与 RETURNING 不要求）。
  *
- * A SELECT targetlist may optionally require that column names match.
+ * 返回值：
+ *   无；不匹配时直接报错。
+ *
+ * 设计思想：
+ *   逐列做四个层次的校验，保证规则动作的返回结构精确等于关系结构：
+ *   1. 数量：忽略 resjunk 条目后，目标列表项数必须等于关系列数，多了/少了都报错。
+ *   2. 丢弃列：关系中 attisdropped 的列不允许出现在目标位置——把含丢弃列的表转成
+ *      视图会破坏规则系统假定"目标列表列即表列"的不变量（resjunk 标记无法规避
+ *      该不变量），因此直接拒绝。RETURNING 遇到丢弃列同样报错。
+ *   3. 列名（仅当 requireColumnNameMatch）：目标条目的 resname 必须与关系列名
+ *      完全一致。
+ *   4. 类型与 typmod：exprType 必须与 atttypid 相等；typmod 允许一方为 -1（未指
+ *      定）——例如 numeric 列在表上有默认精度，而规则表达式的 typmod 常为 -1，
+ *      这种差异应被容忍。
+ *   这样严格校验确保视图展开 / 规则动作替换后无需再做类型转换，可直接对上目标列。
+ * ============================================================================
  */
 static void
 checkRuleResultList(List *targetList, TupleDesc resultDesc, bool isSelect,
@@ -620,9 +743,33 @@ checkRuleResultList(List *targetList, TupleDesc resultDesc, bool isSelect,
 }
 
 /*
- * setRuleCheckAsUser
- *		Recursively scan a query or expression tree and set the checkAsUser
- *		field to the given userid in all RTEPermissionInfos of the query.
+ * ============================================================================
+ * 【中文注释】setRuleCheckAsUser —— 把查询树中所有 RTEPermissionInfo 的权限检查
+ *                                  用户统一设为指定用户
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   递归遍历一棵查询/表达式树，把其中出现的所有 RTEPermissionInfo 的
+ *   checkAsUser 字段改写为给定的 userid。用于"以规则/视图定义者的身份检查权限"
+ *   的语义实现。
+ *
+ * 参数：
+ *   node   - 待遍历的查询树或表达式（通常是规则动作树）。
+ *   userid - 希望作为权限检查主体的用户 OID。
+ *
+ * 返回值：
+ *   无。
+ *
+ * 设计思想：
+ *   1. 为何需要它？当规则/视图定义者通过 CREATE RULE / CREATE VIEW 设置了
+ *      security_invoker 以外的权限语义时，规则动作涉及的表在规则展开后要按
+ *      定义者（而非执行者）的权限去检查。实现手段就是把动作树里的每个
+ *      RTEPermissionInfo->checkAsUser 记为定义者 OID，权限检查阶段据此切换身份。
+ *   2. 具体实现是对外提供一个简单的入口（本函数），实际遍历交给
+ *      setRuleCheckAsUser_walker：它遇到 Query 节点就深入处理该查询的
+ *      perminfos/子查询/CTE，其余节点用 expression_tree_walker 继续递归。
+ *   3. 注意这里统一改写所有 perminfo，包括可能来自系统表查询的部分；在规则的
+ *      动作树上下文中这是正确的，因为整个动作树都应视为定义者执行的逻辑。
+ * ============================================================================
  */
 void
 setRuleCheckAsUser(Node *node, Oid userid)
@@ -630,6 +777,29 @@ setRuleCheckAsUser(Node *node, Oid userid)
 	(void) setRuleCheckAsUser_walker(node, &userid);
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】setRuleCheckAsUser_walker —— 遍历器：分派 Query 与普通表达式节点
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   表达式遍历回调。遇到 Query 节点就调用 setRuleCheckAsUser_Query 处理其内部
+ *   的所有权限信息并返回 false（不继续对其整体做通用遍历，因为子结构已处理）；
+ *   其他节点交给 expression_tree_walker 继续递归。
+ *
+ * 参数：
+ *   node    - 当前遍历到的节点。
+ *   context - 指向 Oid（目标用户）的上下文指针。
+ *
+ * 返回值：
+ *   bool - true 表示终止遍历（本函数从不主动终止），false 表示继续。
+ *
+ * 设计思想：
+ *   标准的 expression_tree_walker 遍历器模式：把"需要特殊处理的节点类型"（Query）
+ *   拦下来单独处理，其余类型交给通用遍历器兜底。Query 之所以特殊，是因为它的
+ *   子结构（rtable 中的子查询、cteList、子链接里的查询）分布在多个字段里，通用
+ *   遍历器无法完整覆盖，必须用专门的 setRuleCheckAsUser_Query 处理。
+ * ============================================================================
+ */
 static bool
 setRuleCheckAsUser_walker(Node *node, Oid *context)
 {
@@ -644,6 +814,33 @@ setRuleCheckAsUser_walker(Node *node, Oid *context)
 								  context);
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】setRuleCheckAsUser_Query —— 改写单个查询内部全部权限检查用户
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   处理一个 Query：先把本查询自带的 RTEPermissionInfo 的 checkAsUser 全部设为
+ *   userid，再递归进入其子查询 RTE、WITH CTE，以及各子链接（subplan/sublink）
+ *   里的查询，确保整棵查询树里的权限信息都被覆盖。
+ *
+ * 参数：
+ *   qry    - 待处理的查询。
+ *   userid - 权限检查主体用户 OID。
+ *
+ * 返回值：
+ *   无。
+ *
+ * 设计思想：
+ *   按 Query 结构的"三处嵌套"分别递归，保证不遗漏：
+ *   1. 直接字段 rteperminfos：本查询的目标/来源表的权限信息，直接逐个改写。
+ *   2. rtable 里的 RTE_SUBQUERY：FROM (SELECT ...) 这样的内联子查询。
+ *   3. cteList：WITH ... AS 定义的公共表表达式（其查询体也需改写）。
+ *   4. 若本查询带子链接（hasSubLinks），用 query_tree_walker 找到子链接中嵌套
+ *      的 Query 再递归——这里传 QTW_IGNORE_RC_SUBQUERIES 标志，避免对 rtable
+ *      中已被第 2 步处理过的子查询 RTE 重复遍历。
+ *   注意所有递归都复用同一个 userid，实现"整棵树统一以定义者身份检查权限"。
+ * ============================================================================
+ */
 static void
 setRuleCheckAsUser_Query(Query *qry, Oid userid)
 {
@@ -682,7 +879,33 @@ setRuleCheckAsUser_Query(Query *qry, Oid userid)
 
 
 /*
- * Change the firing semantics of an existing rule.
+ * ============================================================================
+ * 【中文注释】EnableDisableRule —— 修改既有规则的触发时机（ev_enabled）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把某关系上一条已存在规则的 ev_enabled 字段改为指定值，实现 ALTER TABLE ...
+ *   ENABLE/DISABLE [ALWAYS|REPLICA] RULE 命令的语义（控制规则在何种复制模式下
+ *   触发）。
+ *
+ * 参数：
+ *   rel       - 规则所属的关系（已由调用方打开）。
+ *   rulename  - 规则名。
+ *   fires_when- 新的触发时机，取值 RULE_FIRES_ON_ORIGIN / RULE_FIRES_ON_REPLICA /
+ *               RULE_FIRES_ON_ALWAYS / RULE_DISABLED 之一。
+ *
+ * 返回值：
+ *   无。
+ *
+ * 设计思想：
+ *   1. 打开 pg_rewrite，通过 syscache 找到对应规则元组的拷贝；找不到报错。
+ *   2. 权限检查：调用者必须是规则所属关系的所有者。
+ *   3. 仅当 ev_enabled 与目标值不同时才执行 CatalogTupleUpdate 写回；相同则跳过
+ *      写目录（避免无谓的目录更新）。
+ *   4. 只要发生了改动，就用 CacheInvalidateRelcache 广播 SI 失效消息，让所有
+ *      后端（含自己）重建 relcache 条目——规则触发状态缓存在 relcache 里，不
+ *      失效的话改动无法及时生效。
+ *   5. 触发对象后置修改钩子 InvokeObjectPostAlterHook，供扩展感知变更。
+ * ============================================================================
  */
 void
 EnableDisableRule(Relation rel, const char *rulename,
@@ -746,7 +969,33 @@ EnableDisableRule(Relation rel, const char *rulename,
 
 
 /*
- * Perform permissions and integrity checks before acquiring a relation lock.
+ * ============================================================================
+ * 【中文注释】RangeVarCallbackForRenameRule —— 重命名规则前的关系权限/完整性检查
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   作为 RangeVarGetRelidExtended 的回调，在解析重命名 ALTER RULE 的目标关系时、
+ *   真正加锁之前执行各种预检查：关系类型是否允许挂规则、是否系统目录/冲突日志
+ *   表、调用者是否拥有该关系。这样能在加锁前尽早以清晰的错误拒绝非法操作。
+ *
+ * 参数：
+ *   rv      - 用户写的关系名（RangeVar）。
+ *   relid   - 已解析出的关系 OID（可能已被并发删除为 InvalidOid）。
+ *   oldrelid- 之前解析出的 OID（本函数未使用）。
+ *   arg     - 透传参数（本函数未使用）。
+ *
+ * 返回值：
+ *   无；检查失败直接报错，concurrently dropped 时静默返回。
+ *
+ * 设计思想：
+ *   PostgreSQL DDL 的标准"lockname 回调"模式：对关系的检查分两阶段，先把能
+ *   做的权限/类型检查放在"加锁之前"的回调里，可以减少对锁的持有时间，也能在
+ *   加锁前就反馈常见错误。此处检查：
+ *   1. 关系必须可挂规则（普通表/视图/分区表）。
+ *   2. 不能是冲突日志表、不能是系统目录（除非 allowSystemTableMods）。
+ *   3. 必须是关系所有者。
+ *   关系在解析与回调之间被并发删除时（relid 无效），syscache 查不到元组则直接
+ *   return，把错误处理交给后续正式加锁/使用阶段。
+ * ============================================================================
  */
 static void
 RangeVarCallbackForRenameRule(const RangeVar *rv, Oid relid, Oid oldrelid,
@@ -795,7 +1044,36 @@ RangeVarCallbackForRenameRule(const RangeVar *rv, Oid relid, Oid oldrelid,
 }
 
 /*
- * Rename an existing rewrite rule.
+ * ============================================================================
+ * 【中文注释】RenameRewriteRule —— 重命名一条已存在的重写规则
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   实现 ALTER TABLE ... RENAME RULE 命令：把指定关系上名为 oldName 的规则改名
+ *   为 newName，并做必要的权限、命名约束检查与缓存失效广播。
+ *
+ * 参数：
+ *   relation - 目标关系的 RangeVar。
+ *   oldName  - 规则旧名。
+ *   newName  - 规则新名。
+ *
+ * 返回值：
+ *   ObjectAddress - 被重命名规则的地址。
+ *
+ * 设计思想：
+ *   1. 用 RangeVarGetRelidExtended 解析关系并加 AccessExclusiveLock（锁一直持有
+ *      到事务结束，保证重命名期间无人并发使用该关系及其规则）。加锁前的预检查
+ *      交给 RangeVarCallbackForRenameRule 回调完成。
+ *   2. 校验规则必须存在；新名不得与同关系已有规则重名（IsDefinedRewriteRule）。
+ *   3. 两条命名约束（与 DefineQueryRewrite 里的规则相呼应）：
+ *      - ON SELECT 规则禁止重命名——视图的 _RETURN 规则名是约定俗成的，改名会
+ *        破坏视图机制。
+ *      - 反过来，非视图规则的新名不得叫 _RETURN，防止通过改名把视图规则替换成
+ *        普通规则。
+ *   4. 通过 syscache 拷贝元组、修改 rulename 后 CatalogTupleUpdate 写回，
+ *      触发对象后置修改钩子。
+ *   5. 广播 CacheInvalidateRelcache 强制所有后端刷新 relcache（规则名缓存在
+ *      relcache 的规则集中）。
+ * ============================================================================
  */
 ObjectAddress
 RenameRewriteRule(RangeVar *relation, const char *oldName,

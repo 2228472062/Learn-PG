@@ -71,15 +71,30 @@ static Node *remove_nulling_relids_mutator(Node *node,
 
 
 /*
- * contain_aggs_of_level -
- *	Check if an expression contains an aggregate function call of a
- *	specified query level.
+ * ============================================================================
+ * 【中文注释】contain_aggs_of_level —— 判断表达式是否包含指定查询层的聚合函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历一棵查询/表达式树，检查其中是否存在 agglevelsup 恰好等于 levelsup 的
+ *   聚合调用（Aggref 或 GroupingFunc）。用于判断"某个查询层上是否使用了聚合"。
  *
- * The objective of this routine is to detect whether there are aggregates
- * belonging to the given query level.  Aggregates belonging to subqueries
- * or outer queries do NOT cause a true result.  We must recurse into
- * subqueries to detect outer-reference aggregates that logically belong to
- * the specified query level.
+ * 参数：
+ *   node    - 待检查的树根，可以是 Query 或普通表达式树。
+ *   levelsup- 目标查询层：0 表示当前查询层，1 表示外层，依此类推。
+ *
+ * 返回值：
+ *   bool - 存在属于该查询层的聚合则返回 true，否则 false。
+ *
+ * 设计思想：
+ *   1. 一个关键点：不仅要检查"当前树里直接可见"的聚合，还要**递归进入子查询**
+ *      去找"子查询引用了外层查询的聚合"这种情形——这种聚合（agglevelsup 指向
+ *      外层）逻辑上仍属于外层查询层，所以必须递归下去才能准确判定。
+ *   2. 属于子查询自己或更外层的聚合（agglevelsup 不等于 levelsup）不会导致返回
+ *      true，此时继续向下检查其参数。
+ *   3. 用 query_or_expression_tree_walker 启动遍历，并传 0 作为起始
+ *      sublevels_up：若从 Query 开始，不会先自增层数（见 walker 中进入子查询才
+ *      自增的设计）。
+ * ============================================================================
  */
 bool
 contain_aggs_of_level(Node *node, int levelsup)
@@ -98,6 +113,29 @@ contain_aggs_of_level(Node *node, int levelsup)
 										   0);
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】contain_aggs_of_level_walker —— 聚合存在性检查的遍历器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   contain_aggs_of_level 的实际递归实现。返回 true 表示"找到匹配聚合"，立即
+ *   中止整个遍历。
+ *
+ * 参数：
+ *   node    - 当前遍历节点。
+ *   context- 携带当前 sublevels_up（已深入多少层子查询）。
+ *
+ * 返回值：
+ *   bool - true 表示命中并终止遍历；false 表示继续遍历。
+ *
+ * 设计思想：
+ *   1. 对 Aggref/GroupingFunc：比较 agglevelsup 与当前 sublevels_up，相等即命中；
+ *      不等则继续检查其参数（聚合的参数里可能嵌套了更深层的聚合或子查询）。
+ *   2. 对 Query：表示进入一个子查询，sublevels_up 加一后递归（query_tree_walker），
+ *      返回后减一恢复现场——这是把"层"计数与递归深度同步的标准做法。
+ *   3. 其他节点用 expression_tree_walker 通用遍历。
+ * ============================================================================
+ */
 static bool
 contain_aggs_of_level_walker(Node *node,
 							 contain_aggs_of_level_context *context)
@@ -133,17 +171,28 @@ contain_aggs_of_level_walker(Node *node,
 }
 
 /*
- * locate_agg_of_level -
- *	  Find the parse location of any aggregate of the specified query level.
+ * ============================================================================
+ * 【中文注释】locate_agg_of_level —— 定位指定查询层中聚合的源码位置
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历查询树，找到第一个"属于指定查询层、且解析位置已知"的聚合调用，返回其
+ *   location（源码中的位置，用于错误报告定位）。找不到则返回 -1。
  *
- * Returns -1 if no such agg is in the querytree, or if they all have
- * unknown parse location.  (The former case is probably caller error,
- * but we don't bother to distinguish it from the latter case.)
+ * 参数：
+ *   node    - 树根（Query 或表达式）。
+ *   levelsup- 目标查询层。
  *
- * Note: it might seem appropriate to merge this functionality into
- * contain_aggs_of_level, but that would complicate that function's API.
- * Currently, the only uses of this function are for error reporting,
- * and so shaving cycles probably isn't very important.
+ * 返回值：
+ *   int - 聚合的源码 location；找不到或位置未知返回 -1。
+ *
+ * 设计思想：
+ *   1. 与 contain_aggs_of_level 功能相近，但目标是"报错时给用户指出聚合在哪"，
+ *      因此保存的是 location 而非布尔值。两者故意分开实现：合并会让
+ *      contain_aggs_of_level 的 API 变复杂，而本函数仅用于错误报告，性能无关紧要。
+ *   2. 返回 -1 有两种情况：根本找不到该层聚合（多半是调用方搞错了层数），或
+ *      找到了但 location 为 -1（源码位置未知）。这两种情况难以区分也无须区分，
+ *      调用方只需在 >=0 时用于报错定位。
+ * ============================================================================
  */
 int
 locate_agg_of_level(Node *node, int levelsup)
@@ -165,6 +214,27 @@ locate_agg_of_level(Node *node, int levelsup)
 	return context.agg_location;
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】locate_agg_of_level_walker —— 聚合定位遍历器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   locate_agg_of_level 的递归实现：遇到"层数匹配且 location>=0"的聚合即把位置
+ *   写入 context 并返回 true 终止遍历。
+ *
+ * 参数：
+ *   node    - 当前节点。
+ *   context - 记录聚合位置（agg_location）与当前查询层（sublevels_up）。
+ *
+ * 返回值：
+ *   bool - true 表示已找到并终止遍历。
+ *
+ * 设计思想：
+ *   与 contain_aggs_of_level_walker 的遍历骨架完全一致（进入子查询时层数自增、
+ *   GroupingFunc 同样处理），差别仅在命中条件多了 location>=0，且命中时保存位置
+ *   而非返回简单 true。
+ * ============================================================================
+ */
 static bool
 locate_agg_of_level_walker(Node *node,
 						   locate_agg_of_level_context *context)
@@ -206,9 +276,26 @@ locate_agg_of_level_walker(Node *node,
 }
 
 /*
- * contain_windowfuncs -
- *	Check if an expression contains a window function call of the
- *	current query level.
+ * ============================================================================
+ * 【中文注释】contain_windowfuncs —— 判断表达式是否包含当前查询层的窗口函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历查询/表达式树，检查是否存在窗口函数调用（WindowFunc）。注意只关心
+ *   **当前查询层**的窗口函数，且**不递归进入子查询**。
+ *
+ * 参数：
+ *   node - 树根（Query 或表达式）。
+ *
+ * 返回值：
+ *   bool - 找到窗口函数返回 true，否则 false。
+ *
+ * 设计思想：
+ *   与 contain_aggs_of_level 最大的不同：窗口函数在 PostgreSQL 中只允许出现在
+ *   最外层的查询中（窗口不能在子查询里直接使用外层窗口），因此遍历时明确"不能
+ *   递归进入子查询"，否则会把子查询里的引用误判。这个差别由
+ *   contain_windowfuncs_walker 中"不做 Query 特殊处理"来体现——expression_tree_
+ *   walker 默认不会钻入 RTE 子查询。
+ * ============================================================================
  */
 bool
 contain_windowfuncs(Node *node)
@@ -223,6 +310,26 @@ contain_windowfuncs(Node *node)
 										   0);
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】contain_windowfuncs_walker —— 窗口函数存在性遍历器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   contain_windowfuncs 的递归实现：遇到 WindowFunc 立即返回 true 终止遍历。
+ *
+ * 参数：
+ *   node    - 当前节点。
+ *   context - 未使用（保持 walker 签名兼容）。
+ *
+ * 返回值：
+ *   bool - true 表示命中并终止遍历。
+ *
+ * 设计思想：
+ *   只有一条命中规则（IsA WindowFunc），其余交给 expression_tree_walker。注释里
+ *   明确写着"不得递归进入子查询"：因为 expression_tree_walker 不会进入 RTE 的
+ *   子查询，天然符合"只看当前层"的要求，无需像聚合检查那样处理 Query。
+ * ============================================================================
+ */
 static bool
 contain_windowfuncs_walker(Node *node, void *context)
 {
@@ -235,17 +342,23 @@ contain_windowfuncs_walker(Node *node, void *context)
 }
 
 /*
- * locate_windowfunc -
- *	  Find the parse location of any windowfunc of the current query level.
+ * ============================================================================
+ * 【中文注释】locate_windowfunc —— 定位当前查询层中窗口函数的源码位置
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历查询树，找到第一个"解析位置已知"的窗口函数并返回其 location，用于错误
+ *   报告定位；找不到或位置未知返回 -1。
  *
- * Returns -1 if no such windowfunc is in the querytree, or if they all have
- * unknown parse location.  (The former case is probably caller error,
- * but we don't bother to distinguish it from the latter case.)
+ * 参数：
+ *   node - 树根（Query 或表达式）。
  *
- * Note: it might seem appropriate to merge this functionality into
- * contain_windowfuncs, but that would complicate that function's API.
- * Currently, the only uses of this function are for error reporting,
- * and so shaving cycles probably isn't very important.
+ * 返回值：
+ *   int - 窗口函数的源码 location；找不到返回 -1。
+ *
+ * 设计思想：
+ *   与 locate_agg_of_level 同模式：为错误报告服务而单独实现，不合并进
+ *   contain_windowfuncs。同样只关心当前查询层、不递归进子查询。
+ * ============================================================================
  */
 int
 locate_windowfunc(Node *node)
@@ -266,6 +379,26 @@ locate_windowfunc(Node *node)
 	return context.win_location;
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】locate_windowfunc_walker —— 窗口函数定位遍历器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   locate_windowfunc 的递归实现：遇到 location>=0 的 WindowFunc 即保存位置并
+ *   返回 true 终止遍历。
+ *
+ * 参数：
+ *   node    - 当前节点。
+ *   context - 记录窗口函数位置（win_location）。
+ *
+ * 返回值：
+ *   bool - true 表示已找到并终止遍历。
+ *
+ * 设计思想：
+ *   与 contain_windowfuncs_walker 骨架一致（不递归子查询），差别在于命中时记录
+ *   位置，且只接受 location>=0 的窗口函数（-1 表示来源未知，不适合报错定位）。
+ * ============================================================================
+ */
 static bool
 locate_windowfunc_walker(Node *node, locate_windowfunc_context *context)
 {

@@ -110,8 +110,34 @@
  */
 
 /*
- * Make a RowExpr from the specified column names, which have to be among the
- * output columns of the CTE.
+ * ============================================================================
+ * 【中文注释】make_path_rowexpr —— 由列名列表构造行值表达式 RowExpr
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   针对 SEARCH / CYCLE 子句中指定的列集合，构造一个 ROW(...) 行值表达式，用于
+ *   表示"当前这一行的搜索/环检测列"。生成的 RowExpr 的元素是引用 CTE 输出列的 Var。
+ *
+ * 参数：
+ *   cte      - 正在改写的有 SEARCH/CYCLE 子句的公共表表达式（提供其输出列名、
+ *              类型、typmod、collation 等元数据）。
+ *   col_list - 列名字符串列表（如 SEARCH ... BY col1, col2 中的 col1、col2）。
+ *
+ * 返回值：
+ *   RowExpr* - 类型为 RECORDOID 的匿名记录行值表达式；每个元素是对应列的 Var，
+ *              列名信息保存在 colnames 中。
+ *
+ * 设计思想：
+ *   1. RowExpr 的行类型用 RECORDOID（匿名记录类型），而不是命名复合类型——因为
+ *      这些搜索列来自用户任意指定的列，无法预知固定的命名记录类型；匿名记录类型
+ *      配合 colnames 字段即可满足后续构造的需要。
+ *   2. 通过两层遍历把 col_list 中的每个列名与 cte->ctecolnames 中的输出列名做
+ *      字符串匹配，找到对应的输出位置 i，然后用 makeVar(1, i+1, ...) 生成一个
+ *      引用"第 1 个范围表、第 i+1 列"的 Var。这里的 varno 固定取 1，因为该 RowExpr
+ *      随后会被塞进左右两个 UNION 分支的查询里，而那两个查询都只有 1 个 RTE
+ *      （见 rewriteSearchAndCycle 中对 newq1/newq2 的构造）。
+ *   3. colnames 里同时记录用户指定的列名，供后续 FIELD 引用（如 sqc.depth）使用。
+ *   注意：此处假定列名一定能匹配上（解析阶段已保证），因此未匹配时静默忽略。
+ * ============================================================================
  */
 static RowExpr *
 make_path_rowexpr(const CommonTableExpr *cte, const List *col_list)
@@ -152,8 +178,27 @@ make_path_rowexpr(const CommonTableExpr *cte, const List *col_list)
 }
 
 /*
- * Wrap a RowExpr in an ArrayExpr, for the initial search depth first or cycle
- * row.
+ * ============================================================================
+ * 【中文注释】make_path_initial_array —— 把行值包装成单元素数组表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   将表示"一条路径中单个元素"的 RowExpr 包装成 ARRAY[ROWElem] 形式的 ArrayExpr，
+ *   作为 SEARCH DEPTH FIRST 或 CYCLE 路径数组的初始值。
+ *
+ * 参数：
+ *   rowexpr - 单个路径元素的行值表达式（见 make_path_rowexpr）。
+ *
+ * 返回值：
+ *   Expr* - 一个 element_typeid 为 RECORDOID、整体类型为 RECORDARRAYOID 的
+ *           单元素数组表达式。
+ *
+ * 设计思想：
+ *   SEARCH DEPTH FIRST 与 CYCLE 都以"数组形式记录已走过的行"，路径数组是
+ *   record[] 类型。初始化时路径里只有起点这一行，所以直接生成一个仅含一个
+ *   RowExpr 的数组即可。写成单元素数组而不是裸的行值，是为了让后续的数组
+ *   连接操作（||）类型自洽——连接要求两侧都是数组类型。类型统一采用匿名
+ *   记录（RECORDOID / RECORDARRAYOID），与 make_path_rowexpr 保持一致。
+ * ============================================================================
  */
 static Expr *
 make_path_initial_array(RowExpr *rowexpr)
@@ -170,11 +215,30 @@ make_path_initial_array(RowExpr *rowexpr)
 }
 
 /*
- * Make an array catenation expression like
+ * ============================================================================
+ * 【中文注释】make_path_cat_expr —— 构造路径数组拼接表达式 cpa || ARRAY[ROW(cols)]
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   生成"把当前行的元素追加到已有路径数组末尾"的表达式，即
+ *      path_var || ARRAY[ROW(col1, col2, ...)]
+ *   其中 path_var 是引用已有路径数组（record[] 类型）的 Var，| | 运算符在内部
+ *   表示为 array_cat 函数调用。
  *
- * cpa || ARRAY[ROW(cols)]
+ * 参数：
+ *   rowexpr       - 当前行元素的行值表达式（来自 make_path_rowexpr）。
+ *   path_varattno - 已有路径数组列在范围表中的属性号（varno 固定为 1）。
  *
- * where the varattno of cpa is provided as path_varattno.
+ * 返回值：
+ *   Expr* - array_cat(RECORDARRAYOID, ...) 函数调用表达式。
+ *
+ * 设计思想：
+ *   递归求值时需要"记录每一条走过的路径"，而深度优先搜索与环检测的迭代步要把
+ *   当前行追加进路径。这里直接构造底层函数调用 array_cat（F_ARRAY_CAT）而非使用
+ *   运算符树，是因为 record[] 的 || 运算解析后本来就是 array_cat，绕开运算符解析
+ *   可以直接指定输入/输出类型（都是 RECORDARRAYOID），避免再走一遍类型推断。
+ *   左侧参数用 makeVar(1, path_varattno, RECORDARRAYOID, -1, 0, 0) 引用已存在
+ *   的路径列，右侧是包裹当前元素的单元素数组。
+ * ============================================================================
  */
 static Expr *
 make_path_cat_expr(RowExpr *rowexpr, AttrNumber path_varattno)
@@ -197,7 +261,48 @@ make_path_cat_expr(RowExpr *rowexpr, AttrNumber path_varattno)
 }
 
 /*
- * The real work happens here.
+ * ============================================================================
+ * 【中文注释】rewriteSearchAndCycle —— SEARCH/CYCLE 子句改写的核心实现
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把带 SEARCH 或 CYCLE 子句的递归 CTE 改写成等价的、只在内部使用 UNION 的
+ *   递归 CTE：通过给 CTE 的输出列追加额外列（搜索序列列 / 环标记列 / 环路径列），
+ *   并改写左右两个 UNION 分支的查询体，实现在递归过程中记录搜索顺序与检测环路。
+ *   具体改写形式见本文件顶部的示意注释。
+ *
+ * 参数：
+ *   cte - 待改写的 CommonTableExpr；其 ctequery 必须是顶层为 UNION 的递归查询，
+ *         且至少带 search_clause 或 cycle_clause 之一。
+ *
+ * 返回值：
+ *   CommonTableExpr* - 改写后的新 CTE（输入对象会被复制，不修改原对象）。
+ *
+ * 设计思想：
+ *   整体策略是"把搜索/环检测语义下沉为普通列运算"，让递归执行引擎完全不用感知
+ *   SEARCH/CYCLE 的存在。具体分四步：
+ *   1. 计算追加列的属性号：先放搜索序列列（sqc），再放环标记列（cmc）与环路径
+ *      列（cpa）；若同时有 SEARCH 与 CYCLE，环的两列顺延一位（文件头注释明确：
+ *      搜索列在环列之前）。
+ *   2. 改写左分支（非递归项，初值）：把原始查询包成子查询（*TLOCRN*），对原
+ *      WITH 列做透传，并追加各额外列的初始值——广度优先搜索为 ROW(0, cols)，
+ *      深度优先搜索为 ARRAY[ROW(cols)]，CYCLE 为环标记默认值 + ARRAY[ROW(cols)]。
+ *   3. 改写右分支（递归项，迭代步）：包成子查询（*TROCRN*），透传原列与上一步
+ *      的额外列，再重新计算：搜索列为 sqc.depth+1（广度优先，取 RowExpr 第一字段
+ *      自增）或 sqc || ARRAY[ROW(cols)]（深度优先）；环标记列为
+ *      CASE WHEN ROW(cols) = ANY(cpa) THEN cmv ELSE cmd END；环路径列为
+ *      cpa || ARRAY[ROW(cols)]。若带 CYCLE，还在 FROM 上加 cmc <> cmv 的 WHERE
+ *      条件，用于剪枝已访问过的行。
+ *   4. 同步更新各结构：SetOperationStmt 的列类型列表（含 DISTINCT 时的分组子句）、
+ *      CTE 查询的 targetList、以及 cte 的输出列列表（ctecolnames/types/typmods/
+ *      collations），使 CTE 对外暴露的列集合与内部一致。
+ *
+ * 细节说明：
+ *   - 引用递归 CTE 的 Var 使用 ctelevelsup=2（在右分支子查询内部向上两级可见），
+ *     且通过 RTE_CTE 类型与名称匹配来定位；找不到（递归引用不在右分支最顶层
+ *     范围表）时按"暂未实现"报错。
+ *   - 追加列做 VarSublevelsUp 提升时统一 +1，因为右分支的子查询被嵌套进了新的
+ *     一层 RTE 子查询中。
+ * ============================================================================
  */
 CommonTableExpr *
 rewriteSearchAndCycle(CommonTableExpr *cte)
