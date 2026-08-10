@@ -5689,8 +5689,6 @@ get_relids_for_join(Query *query, int joinrelid)
  */
 static Node *
 find_jointree_node_for_rel(Node *jtnode, int relid)
-static Node *
-find_jointree_node_for_rel(Node *jtnode, int relid)
 {
 	if (jtnode == NULL)
 		return NULL;
@@ -5795,9 +5793,6 @@ get_nullingrels(Query *parse)
  *   info              —— 输出结构(各叶子关系的置空集合数组)。
  * 【返回值】无。
  */
-static void
-get_nullingrels_recurse(Node *jtnode, Relids upper_nullingrels,
-						nullingrel_info *info)
 static void
 get_nullingrels_recurse(Node *jtnode, Relids upper_nullingrels,
 						nullingrel_info *info)

@@ -43,11 +43,6 @@ lib*.pc
 /Release/
 /tmp_install/
 /portlock/
-<<<<<<< HEAD
 build/
 /build/
 .opencode
-=======
-/build/
-./build/
->>>>>>> master

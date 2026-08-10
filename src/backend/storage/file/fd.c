@@ -407,7 +407,7 @@ typedef struct
 /* (中文)临时句柄的登记项(AllocateFile/AllocateDir/OpenPipeStream/
  * OpenTransientFile 打开的句柄都在此登记):
  * - kind         : 句柄类型(见 AllocateDescKind);
- * - desc         : 联合体,按 kind 存 FILE*/DIR*/裸 fd;
+ * - desc         : 联合体,按 kind 存 FILE*、DIR*、裸 fd;
  * - create_subid : 创建时的子事务号——子事务回滚时,凡 create_subid
  *                  等于该子事务号的条目会被立即关闭(见 AtEOSubXact_Files)。
  * 登记的意义:事务/子事务结束与进程退出时能统一关闭,防止 ereport
