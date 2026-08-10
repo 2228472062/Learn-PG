@@ -102,11 +102,40 @@ static StatsBuildData *make_build_data(Relation rel, StatExtEntry *stat,
 
 
 /*
- * Compute requested extended stats, using the rows sampled for the plain
- * (single-column) stats.
+ * ============================================================================
+ * 【中文注释】BuildRelationExtStatistics —— 计算并写回关系的扩展统计（顶层入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   使用普通单列 ANALYZE 采样的行数据，为表上定义的所有扩展统计对象计算其
+ *   统计（ndistinct/dependencies/MCV/表达式统计），并序列化写回系统表
+ *   pg_statistic_ext_data。
  *
- * This fetches a list of stats types from pg_statistic_ext, computes the
- * requested stats, and serializes them back into the catalog.
+ * 参数：
+ *   onerel       - 被分析的关系。
+ *   inh          - 是否包含继承子表。
+ *   totalrows    - 全表估算行数。
+ *   numrows      - 采样行数。
+ *   rows         - 采样元组数组。
+ *   natts        - 被分析的单列个数。
+ *   vacattrstats - 单列的 VacAttrStats 数组（用于取列类型等信息）。
+ *
+ * 返回值：无。
+ *
+ * 设计思想：
+ *   1. 打开 pg_statistic_ext，用 fetch_statentries_for_relation() 取回该关系的所有
+ *      统计对象列表（StatExtEntry）。
+ *   2. 每个统计对象在独立内存上下文 cxt 中构建，循环结束 MemoryContextReset 释放，
+ *      避免内存累积。
+ *   3. 用 lookup_var_attr_stats() 检查本次分析的列是否覆盖该对象所需全部列；若
+ *      不覆盖则（非 autovacuum 时）发 WARNING 并跳过。
+ *   4. 用 statext_compute_stattarget() 计算统计目标；目标为 0 表示禁用该对象，跳过
+ *      （保留旧统计，与单列统计的做法一致）。
+ *   5. make_build_data() 评估表达式并准备 StatsBuildData；随后按对象请求的类型
+ *      分别调用 statext_ndistinct_build/statext_dependencies_build/statext_mcv_build
+ *      或表达式统计（build_expr_data + compute_expr_stats + serialize_expr_stats）。
+ *   6. statext_store() 统一序列化并写回 catalog；通过
+ *      pgstat_progress_update_* 上报进度。
+ * ============================================================================
  */
 void
 BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
@@ -247,7 +276,22 @@ BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
 }
 
 /*
- * Test if the given relation has extended statistics objects.
+ * ============================================================================
+ * 【中文注释】HasRelationExtStatistics —— 判断关系是否定义了扩展统计对象
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查 pg_statistic_ext 中是否存在 stxrelid 指向该关系的统计对象。
+ *
+ * 参数：
+ *   onerel - 目标关系。
+ *
+ * 返回值：
+ *   bool - 有则 true，无则 false。
+ *
+ * 设计思想：
+ *   在 pg_statistic_ext 上按 stxrelid 索引（StatisticExtRelidIndexId）做等值扫描，
+ *   取到第一条即存在。加 RowExclusiveLock 后扫描、关闭释放。
+ * ============================================================================
  */
 bool
 HasRelationExtStatistics(Relation onerel)

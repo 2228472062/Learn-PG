@@ -115,20 +115,48 @@ static void upsert_pg_statistic(Relation starel, HeapTuple oldtup,
 static bool delete_pg_statistic(Oid reloid, AttrNumber attnum, bool stainherit);
 
 /*
- * Insert or Update Attribute Statistics
+ * ============================================================================
+ * 【中文注释】attribute_statistics_update —— 更新/导入单个列的属性统计信息（入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   这是"导入或更新单列统计信息"的核心入口（SQL 层由 pg_restore_attribute_stats()
+ *   调用）。它负责：从 fcinfo 位置参数中解析出目标模式名、表名、列标识（列名或列号）、
+ *   是否统计继承表；加锁并做权限/类型等前置检查；然后把用户提供的各种统计值写入
+ *   pg_statistic 系统表（由 attribute_statistics_update_internal() 完成）。
  *
- * See pg_statistic.h for an explanation of how each statistic kind is
- * stored. Custom statistics kinds are not supported.
+ * 参数：
+ *   fcinfo - 位置参数调用信息，参数布局由枚举 attribute_stats_argnum 定义，例如：
+ *       ATTRELSCHEMA_ARG(0) = 模式名(text)、ATTRELNAME_ARG(1) = 表名(text)、
+ *       ATTNAME_ARG(2) = 列名(text，与 ATT NUM 二选一)、ATTNUM_ARG(3) = 列号(int2)、
+ *       INHERITED_ARG(4) = 是否含继承表(bool)、NULL_FRAC_ARG = 空值比例(float4)、
+ *       AVG_WIDTH_ARG = 平均宽度(int4)、N_DISTINCT_ARG = 去重数估计(float4)、
+ *       MOST_COMMON_VALS_ARG / MOST_COMMON_FREQS_ARG = MCV 值/频率、
+ *       HISTOGRAM_BOUNDS_ARG = 直方图边界、CORRELATION_ARG = 相关性，
+ *       以及数组类型专用的 MCELEM/DECHIST/范围类型统计等。
+ *       凡 PG_ARGISNULL() 为真的参数表示"本次未指定"，对应统计项保持原值不变。
  *
- * Depending on the statistics kind, we need to derive information from the
- * attribute for which we're storing the stats. For instance, the MCVs are
- * stored as an anyarray, and the representation of the array needs to store
- * the correct element type, which must be derived from the attribute.
+ * 返回值：
+ *   bool - true 表示所有指定统计项都成功；false 表示某个统计项因参数非法被跳过
+ *          （该函数对这类问题只发 WARNING，不会中断整个操作）。
  *
- * Major errors, such as the table not existing, the attribute not existing,
- * or a permissions failure are always reported at ERROR. Other errors, such
- * as a conversion failure on one statistic kind, are reported as a WARNING
- * and other statistic kinds may still be updated.
+ * 设计思想：
+ *   1.【先加锁再查属性】：使用 RangeVarGetRelidExtended() 以 ShareUpdateExclusiveLock
+ *      锁定目标表，并借助回调 RangeVarCallbackForStats() 在加锁过程中完成权限检查
+ *      （要求表属主或拥有 MAINTAIN 权限）。这样做避免了"先解析名字、后加锁"之间的
+ *      TOCTOU 竞态，也保证锁顺序一致。
+ *   2.【恢复期间禁止写统计】：若正处于流式恢复（RecoveryInProgress），直接报 ERROR，
+ *      防止在主库之外的实例上修改统计信息。
+ *   3.【列标识二选一】：允许按列名(attname)或列号(attnum)指定列，但二者不可同时给出。
+ *      按名字给时需用 get_attnum() 解析出列号；按列号给时反查列名，并用
+ *      SearchSysCacheExistsAttName() 额外检查，因为 get_attname() 本身不检查
+ *      attisdropped（已删除列）。
+ *   4.【禁止系统列】：attnum < 0 表示系统列（如 ctid、xmin 等），不支持其统计信息，
+ *      直接报错。
+ *
+ * 调用链：
+ *   pg_restore_attribute_stats()(SQL) → attribute_statistics_update()
+ *   → attribute_statistics_update_internal()（实际写库工作）
+ * ============================================================================
  */
 static bool
 attribute_statistics_update(FunctionCallInfo fcinfo)
@@ -209,7 +237,45 @@ attribute_statistics_update(FunctionCallInfo fcinfo)
 }
 
 /*
- * Workhorse function for attribute_statistics_update.
+ * ============================================================================
+ * 【中文注释】attribute_statistics_update_internal —— 属性统计更新的工作函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   attribute_statistics_update() 的"干活"部分。调用方已经完成了加锁和列解析，
+ *   本函数不再需要关心锁/权限/列名解析，只需根据 fcinfo 中的参数把各统计项
+ *   （MCV、直方图、相关性、MCELEM、数组元素计数直方图、范围类型统计等）整理成
+ *   pg_statistic 一条记录，然后 upsert 进 pg_statistic 表。
+ *
+ * 参数：
+ *   reloid   - 已锁定关系的 OID。
+ *   attname  - 列名（仅用于报错信息）。
+ *   attnum   - 列号（已确保是用户列，attnum>0）。
+ *   inherited- 统计是否针对继承树（stainherit 标志）。
+ *   fcinfo   - 位置参数，与 attribute_statistics_update() 相同的布局。
+ *
+ * 返回值：
+ *   bool - true 全部成功；false 某个统计项因"参数不合法/类型不支持"被降级跳过。
+ *
+ * 设计思想：
+ *   1.【按需决定要写哪些统计项】：
+ *     通过 do_mcv / do_histogram / do_correlation / do_mcelem / do_dechist /
+ *     do_bounds_histogram / do_range_length_histogram 等布尔变量，判断哪些参数
+ *     被提供。每个 do_* 还配合 stats_check_arg_*() 做前置校验，任何一处校验失败
+ *     就把对应 do_* 置 false 并置 result=false，实现"单个统计项出错不影响其他项"。
+ *   2.【从属性推导类型信息】：调用 statatt_get_type() 拿到列的类型 OID、typmod、
+ *     排序/相等操作符等；若需要 MCELEM/DECHIST 再调 statatt_get_elem_type() 取
+ *     元素类型。原因是 MCV 等统计以 anyarray 存储，必须用正确的元素类型来构建数组。
+ *   3.【前置条件检查】：直方图与相关性需要小于操作符(lt_opr)；范围统计只对
+ *     范围/多范围类型有效；否则发 WARNING 并放弃对应项。
+ *   4.【更新或新建两条路径合一】：先用 SearchSysCache3(STATRELATTINH) 查是否已有
+ *     该 (rel,attnum,inh) 的 pg_statistic 记录。若存在，用 heap_deform_tuple() 把
+ *     旧值解出作为基础（未指定的项保持旧值）；若不存在，用
+ *     statatt_init_empty_tuple() 构造全默认的空记录。之后对每个统计项通过
+ *     statatt_set_slot() 填进对应 stakind 槽位，并记录 replaces[] 标记哪些列被改写。
+ *   5.【范围类型直方图的顺序怪癖】：BOUNDS_HISTOGRAM 数值上大于
+ *     RANGE_LENGTH_HISTOGRAM，但代码刻意把 BOUNDS 放在前面，为的是与 ANALYZE
+ *     写入顺序保持一致（见原英文注释）。
+ * ============================================================================
  */
 static bool
 attribute_statistics_update_internal(Oid reloid,
@@ -554,7 +620,31 @@ attribute_statistics_update_internal(Oid reloid,
 }
 
 /*
- * Upsert the pg_statistic record.
+ * ============================================================================
+ * 【中文注释】upsert_pg_statistic —— 向 pg_statistic 表插入或更新一条记录
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把一组值（values/nulls/replaces）写入 pg_statistic 表：若旧元组存在则按
+ *   replaces 指定列做就地更新（heap_modify_tuple + CatalogTupleUpdate），否则
+ *   插入一条新元组（heap_form_tuple + CatalogTupleInsert）。
+ *
+ * 参数：
+ *   starel   - 已以 RowExclusiveLock 打开的 pg_statistic 关系。
+ *   oldtup   - 从 syscache 取到的旧记录（可能为 NULL，表示此前无记录）。
+ *   values   - Natts_pg_statistic 长度的列值数组。
+ *   nulls    - 与 values 对应的"是否为 NULL"标志。
+ *   replaces - 与 values 对应的"是否替换该列"标志（仅更新路径使用）。
+ *
+ * 返回值：无。
+ *
+ * 设计思想：
+ *   pg_statistic 是普通堆表（非 MVCC 语义的 catcache 索引由 CatalogTuple* 维护）。
+ *   更新时用 heap_modify_tuple 同时传入 values/nulls/replaces 三个数组，
+ *   replaces=true 的列取 values 里的新值，replaces=false 的列保留旧元组中的值，
+ *   从而实现"只覆盖用户指定统计项"的语义。操作结束后 CommandCounterIncrement()
+ *   提升命令计数器，确保后续同一命令中的查询能看到本次修改（系统表写操作的通用
+ *   惯例）。
+ * ============================================================================
  */
 static void
 upsert_pg_statistic(Relation starel, HeapTuple oldtup,
@@ -580,7 +670,28 @@ upsert_pg_statistic(Relation starel, HeapTuple oldtup,
 }
 
 /*
- * Delete pg_statistic record.
+ * ============================================================================
+ * 【中文注释】delete_pg_statistic —— 删除 pg_statistic 中的一条列统计记录
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   根据 (reloid, attnum, stainherit) 三元组，在 pg_statistic 表中查找并删除对应
+ *   记录。它同时服务于 SQL 函数 pg_clear_attribute_stats() 和内部函数
+ *   delete_attribute_statistics()。
+ *
+ * 参数：
+ *   reloid    - 目标关系的 OID。
+ *   attnum    - 目标列号。
+ *   stainherit- 是否针对继承树的统计记录。
+ *
+ * 返回值：
+ *   bool - true 表示确实删除了一条记录；false 表示本来就无此记录（幂等删除）。
+ *
+ * 设计思想：
+ *   通过系统缓存 SearchSysCache3(STATRELATTINH) 按主键精确查找（该缓存键正好是
+ *   (starelid, staattnum, stainherit)），命中后调用 CatalogTupleDelete() 删除。
+ *   删除系统表元组必须经由 CatalogTupleDelete() 而非普通 heap_delete，以保持
+ *   系统表索引同步。结尾同样调用 CommandCounterIncrement()。
+ * ============================================================================
  */
 static bool
 delete_pg_statistic(Oid reloid, AttrNumber attnum, bool stainherit)
@@ -610,7 +721,27 @@ delete_pg_statistic(Oid reloid, AttrNumber attnum, bool stainherit)
 }
 
 /*
- * Delete statistics for the given attribute.
+ * ============================================================================
+ * 【中文注释】pg_clear_attribute_stats —— SQL 函数：清空指定列的统计信息
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   可直接从 SQL 调用的函数（对应目录 pg_proc 中的一项），删除某个表某列的
+ *   pg_statistic 记录，使该列回到"无统计"状态。参数为
+ *   (schemaname, relname, attname, inherited)。
+ *
+ * 参数：
+ *   fcinfo - PG_FUNCTION_ARGS 宏展开的标准调用信息。
+ *
+ * 返回值：
+ *   Datum（void）—— 无返回。
+ *
+ * 设计思想：
+ *   与 attribute_statistics_update() 类似的前置处理：必需参数非空检查、恢复期间
+ *   禁止操作、先加锁并做权限回调、用 get_attnum() 把列名转列号；额外拒绝系统列
+ *   （attnum<0）并在列不存在时报错。之后直接调用 delete_pg_statistic() 完成删除。
+ *   注意：本函数不允许用 attnum 指定列，只能给 attname，因此列存在性检查放在
+ *   get_attnum() 之后（InvalidAttrNumber 表示不存在）。
+ * ============================================================================
  */
 Datum
 pg_clear_attribute_stats(PG_FUNCTION_ARGS)
@@ -663,30 +794,32 @@ pg_clear_attribute_stats(PG_FUNCTION_ARGS)
 }
 
 /*
- * Import statistics for a given relation attribute.
+ * ============================================================================
+ * 【中文注释】pg_restore_attribute_stats —— SQL 函数：恢复（导入）单列统计信息
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   可直接从 SQL 调用的"恢复/导入列统计"函数。它以"键-值对"形式接收变长
+ *   (variadic) 参数（形如 pg_restore_attribute_stats('schemaname'=>'public',
+ *   'relname'=>'t', 'attname'=>'c', 'null_frac'=>0.1, ...)），把键值对翻译成
+ *   位置参数后转交 attribute_statistics_update() 执行。
  *
- * Inserts or replaces a row in pg_statistic for the given relation and
- * attribute name or number. It takes input parameters that correspond to
- * columns in the view pg_stats.
+ * 参数：
+ *   fcinfo - 原始变长参数调用信息（name,value,name,value,...）。
  *
- * Parameters are given in a pseudo named-attribute style: they must be
- * pairs of parameter names (as text) and values (of appropriate types).
- * We do that, rather than using regular named-parameter notation, so
- * that we can add or change parameters without fear of breaking
- * carelessly-written calls.
+ * 返回值：
+ *   bool - 由内部更新函数的结果合并而成；任一环节失败返回 false。
  *
- * Parameters null_frac, avg_width, and n_distinct all correspond to NOT NULL
- * columns in pg_statistic. The remaining parameters all belong to a specific
- * stakind. Some stakinds require multiple parameters, which must be specified
- * together (or neither specified).
+ * 设计思想：
+ *   之所以用"变长键值对"而非普通命名参数：键值对方式可以在不破坏既有调用的情况下
+ *   灵活增删参数，便于长期演进。翻译工作由 stats_fill_fcinfo_from_arg_pairs() 完成，
+ *   它把每个已知名字的键映射到位置参数数组的对应下标（未知名字或类型不匹配会发
+ *   WARNING 并把 result 置 false，其余参数照常处理）。翻译后的结果存入栈上的
+ *   LOCAL_FCINFO(positional_fcinfo)，再用它与目标参数个数匹配的尺寸初始化。
  *
- * Parameters are only superficially validated. Omitting a parameter or
- * passing NULL leaves the statistic unchanged.
- *
- * Parameters corresponding to ANYARRAY columns are instead passed in as text
- * values, which is a valid input string for an array of the type or element
- * type of the attribute. Any error generated by the array_in() function will
- * in turn fail the function.
+ * 说明：参数与 pg_stats 视图列一一对应；ANYARRAY 类型的参数（如 most_common_vals）
+ *   以文本形式传入，文本内容必须是"该列类型数组"的合法输入，解析失败时整个函数
+ *   会报错。
+ * ============================================================================
  */
 Datum
 pg_restore_attribute_stats(PG_FUNCTION_ARGS)
@@ -708,11 +841,37 @@ pg_restore_attribute_stats(PG_FUNCTION_ARGS)
 }
 
 /*
- * Import attribute statistics from NullableDatum inputs for all statistical
- * values.
+ * ============================================================================
+ * 【中文注释】import_attribute_statistics —— 以 C 接口导入单列统计信息
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 pg_restore_attribute_stats() 等价，但面向 C 代码而非 SQL 调用：它不接收
+ *   变长键值对，而是接收已经按参数顺序排好的 NullableDatum 数组。调用方通常已经
+ *   打开并锁定了 rel（例如从其他系统导入统计的代码）。
  *
- * For now, the 'version' argument is ignored. In the future it can be used
- * to interpret older statistics properly.
+ * 参数：
+ *   rel      - 已打开的目标关系。
+ *   attnum   - 目标列号。
+ *   inherited- 是否统计继承树。
+ *   version  - 版本号（当前忽略，预留用于解释旧版统计格式）。
+ *   null_frac / avg_width / n_distinct / most_common_vals / most_common_freqs /
+ *   histogram_bounds / correlation / most_common_elems / most_common_elem_freqs /
+ *   elem_count_histogram / range_length_histogram / range_empty_frac /
+ *   range_bounds_histogram - 每个统计项对应的 NullableDatum 值
+ *                            （isnull=true 表示该项未指定/为 NULL）。
+ *
+ * 返回值：
+ *   bool - true 表示全部成功；false 表示有统计项被降级跳过（见内部函数）。
+ *
+ * 设计思想：
+ *   1. 先做断言，确保所有统计项指针非空（表示"已显式给出"，即使语义上可以是
+ *      NULL）。
+ *   2. 把所有输入值填进一个临时构造的位置参数 fcinfo（newfcinfo）：前 5 个位置
+ *      （模式名/表名/列名/列号/继承标志）由 rel 与 attnum 推导，其余位置直接
+ *      逐项复制 NullableDatum。
+ *   3. 通过复用 attribute_statistics_update_internal() 完成与 SQL 路径完全一致的
+ *      校验与写库逻辑，避免两套实现漂移。
+ * ============================================================================
  */
 bool
 import_attribute_statistics(Relation rel, AttrNumber attnum, bool inherited,
@@ -792,7 +951,25 @@ import_attribute_statistics(Relation rel, AttrNumber attnum, bool inherited,
 }
 
 /*
- * Delete attribute statistics.
+ * ============================================================================
+ * 【中文注释】delete_attribute_statistics —— 以 C 接口删除单列统计信息
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   面向 C 代码的封装：给定已打开的关系与列号，删除该列的 pg_statistic 记录。
+ *   与 SQL 函数 pg_clear_attribute_stats() 等价，但不需要做参数解析/加锁/权限
+ *   检查（这些由调用方负责）。
+ *
+ * 参数：
+ *   rel      - 目标关系（由调用方持有锁）。
+ *   attnum   - 列号。
+ *   inherited- 是否针对继承树。
+ *
+ * 返回值：
+ *   bool - 是否有记录被真正删除。
+ *
+ * 设计思想：
+ *   薄封装，直接转调 delete_pg_statistic()，只负责把 Relation 转换为 relid。
+ * ============================================================================
  */
 bool
 delete_attribute_statistics(Relation rel, AttrNumber attnum, bool inherited)

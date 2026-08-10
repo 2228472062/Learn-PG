@@ -64,7 +64,30 @@ static bool relation_statistics_update_internal(Oid reloid,
 												FunctionCallInfo fcinfo);
 
 /*
- * Internal function for modifying statistics for a relation.
+ * ============================================================================
+ * 【中文注释】relation_statistics_update —— 更新/导入关系统计信息（入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   "导入或更新关系级统计"的入口。关系级统计指存放在 pg_class 中的四个字段：
+ *   relpages（页数）、reltuples（估算行数）、relallvisible（全可见页数）、
+ *   relallfrozen（全冻结页数）。本函数解析出 (schemaname, relname) 后加锁，
+ *   转交 relation_statistics_update_internal() 实际写库。
+ *
+ * 参数：
+ *   fcinfo - 位置参数，布局见枚举 relation_stats_argnum：
+ *       RELSCHEMA_ARG(0)=模式名(text)、RELNAME_ARG(1)=表名(text)、
+ *       RELPAGES_ARG(2)=页数(int4)、RELTUPLES_ARG(3)=行数(float4)、
+ *       RELALLVISIBLE_ARG(4)=全可见页数(int4)、RELALLFROZEN_ARG(5)=全冻结页数(int4)。
+ *       为 NULL 的参数表示该项不修改。
+ *
+ * 返回值：
+ *   bool - true 成功；false 有参数校验失败（只发 WARNING，不中断）。
+ *
+ * 设计思想：
+ *   与 attribute_statistics_update() 相同的前置模式：恢复期间禁止、先通过
+ *   RangeVarGetRelidExtended() 加 ShareUpdateExclusiveLock 并在回调
+ *   RangeVarCallbackForStats() 中做权限检查。
+ * ============================================================================
  */
 static bool
 relation_statistics_update(FunctionCallInfo fcinfo)
@@ -94,7 +117,31 @@ relation_statistics_update(FunctionCallInfo fcinfo)
 }
 
 /*
- * Workhorse function for relation_statistics_update.
+ * ============================================================================
+ * 【中文注释】relation_statistics_update_internal —— 关系统计更新的工作函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 relpages / reltuples / relallvisible / relallfrozen 四个值中"被提供的"
+ *   那些写入 pg_class 对应行。未提供的字段保持原值。
+ *
+ * 参数：
+ *   reloid - 已锁定的关系 OID。
+ *   fcinfo - 位置参数（见 relation_statistics_update()）。
+ *
+ * 返回值：
+ *   bool - true 成功；false 因 reltuples 不合法（NaN/Inf/<-1）被拒。
+ *
+ * 设计思想：
+ *   1.【数值合理性校验】：reltuples 必须为有限值且 >= -1.0（-1 表示"未知"，
+ *      与 ANALYZE 约定一致）；非法则发 WARNING 并置 result=false。
+ *   2.【增量更新】：只有"参数已提供"且"与 pg_class 现值不同"的字段才进入
+ *      replaces 数组。用 heap_modify_tuple_by_cols() 一次性更新多列（比逐列更新
+ *      高效），再 CatalogTupleUpdate() 写回。
+ *   3.【锁级别与 VACUUM 保持一致】：对 pg_class 取 RowExclusiveLock，这与
+ *      vac_update_relstats() 的做法一致，保证与并发 VACUUM/ANALYZE 的写冲突能
+ *      被正确串行化。
+ *   4. 末尾 CommandCounterIncrement()，保证本事务内后续可见。
+ * ============================================================================
  */
 static bool
 relation_statistics_update_internal(Oid reloid, FunctionCallInfo fcinfo)
@@ -217,8 +264,24 @@ relation_statistics_update_internal(Oid reloid, FunctionCallInfo fcinfo)
 }
 
 /*
- * Clear statistics for a given pg_class entry; that is, set back to initial
- * stats for a newly-created table.
+ * ============================================================================
+ * 【中文注释】pg_clear_relation_stats —— SQL 函数：重置关系统计信息
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把指定表的 pg_class 统计字段重置为"新建表"的初始状态：relpages=0、
+ *   reltuples=-1（未知）、relallvisible=0、relallfrozen=0。
+ *
+ * 参数：
+ *   fcinfo - 前两个位置参数为 (schemaname, relname)。
+ *
+ * 返回值：
+ *   Datum（void）。
+ *
+ * 设计思想：
+ *   构造一个 6 位置的 fcinfo：前两位原样复制传入的模式名/表名，后四位硬编码为
+ *   初始值，然后复用 relation_statistics_update() 走统一路径（加锁+权限+写库），
+ *   避免重复代码。
+ * ============================================================================
  */
 Datum
 pg_clear_relation_stats(PG_FUNCTION_ARGS)
@@ -244,6 +307,27 @@ pg_clear_relation_stats(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】pg_restore_relation_stats —— SQL 函数：恢复（导入）关系统计信息
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   以"键-值对"变长参数的形式导入关系统计（对应 pg_class 的 relpages 等字段），
+ *   例如 pg_restore_relation_stats('schemaname'=>'public', 'relname'=>'t',
+ *   'relpages'=>100, 'reltuples'=>10000, ...)。
+ *
+ * 参数：
+ *   fcinfo - 变长键值对参数。
+ *
+ * 返回值：
+ *   bool - 由 stats_fill_fcinfo_from_arg_pairs() 与 relation_statistics_update()
+ *          的结果合并。
+ *
+ * 设计思想：
+ *   与 pg_restore_attribute_stats() 完全同构：先把变长键值对翻译成位置参数数组
+ *   （relarginfo 定义名字→位置映射），再调用内部更新函数。
+ * ============================================================================
+ */
 Datum
 pg_restore_relation_stats(PG_FUNCTION_ARGS)
 {
@@ -265,11 +349,28 @@ pg_restore_relation_stats(PG_FUNCTION_ARGS)
 }
 
 /*
- * Import relation statistics from NullableDatum inputs for all statistical
- * values.
+ * ============================================================================
+ * 【中文注释】import_relation_statistics —— 以 C 接口导入关系统计信息
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   面向 C 代码的导入接口：给定已打开的关系 rel 与四个统计项的 NullableDatum
+ *   值，把它们写入 pg_class。逻辑上与 pg_restore_relation_stats() 相同，但参数
+ *   以数组方式直接传递，无需解析键值对。
  *
- * For now, the 'version' argument is ignored. In the future it can be used
- * to interpret older statistics properly.
+ * 参数：
+ *   rel         - 已打开的关系。
+ *   version     - 版本号（当前忽略）。
+ *   relpages / reltuples / relallvisible / relallfrozen - 对应统计值
+ *       （NullableDatum，isnull=true 表示不修改该项）。
+ *
+ * 返回值：
+ *   bool - 是否成功（转自内部更新函数）。
+ *
+ * 设计思想：
+ *   构造一个 NUM_RELATION_STATS_ARGS 长度的位置 fcinfo，前两个位置（模式名/表名）
+ *   由 rel 推导，后四个位置直接赋值 NullableDatum，然后复用
+ *   relation_statistics_update_internal()。
+ * ============================================================================
  */
 bool
 import_relation_statistics(Relation rel,

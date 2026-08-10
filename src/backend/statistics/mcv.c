@@ -98,49 +98,38 @@ static int	count_distinct_groups(int numrows, SortItem *items,
 #define RESULT_IS_FINAL(value, is_or)	((is_or) ? (value) : (!(value)))
 
 /*
- * get_mincount_for_mcv_list
- * 		Determine the minimum number of times a value needs to appear in
- * 		the sample for it to be included in the MCV list.
+ * ============================================================================
+ * 【中文注释】get_mincount_for_mcv_list —— 计算纳入 MCV 列表所需的最小出现次数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   决定一个值在采样数据中至少要出现多少次，才值得把它纳入多元 MCV 列表。这是
+ *   MCV 列表的"入选阈值"。
  *
- * We want to keep only values that appear sufficiently often in the
- * sample that it is reasonable to extrapolate their sample frequencies to
- * the entire table.  We do this by placing an upper bound on the relative
- * standard error of the sample frequency, so that any estimates the
- * planner generates from the MCV statistics can be expected to be
- * reasonably accurate.
+ * 参数：
+ *   samplerows - 样本行数 n。
+ *   totalrows  - 全表估算行数 N。
  *
- * Since we are sampling without replacement, the sample frequency of a
- * particular value is described by a hypergeometric distribution.  A
- * common rule of thumb when estimating errors in this situation is to
- * require at least 10 instances of the value in the sample, in which case
- * the distribution can be approximated by a normal distribution, and
- * standard error analysis techniques can be applied.  Given a sample size
- * of n, a population size of N, and a sample frequency of p=cnt/n, the
- * standard error of the proportion p is given by
- *		SE = sqrt(p*(1-p)/n) * sqrt((N-n)/(N-1))
- * where the second term is the finite population correction.  To get
- * reasonably accurate planner estimates, we impose an upper bound on the
- * relative standard error of 20% -- i.e., SE/p < 0.2.  This 20% relative
- * error bound is fairly arbitrary, but has been found empirically to work
- * well.  Rearranging this formula gives a lower bound on the number of
- * instances of the value seen:
- *		cnt > n*(N-n) / (N-n+0.04*n*(N-1))
- * This bound is at most 25, and approaches 0 as n approaches 0 or N. The
- * case where n approaches 0 cannot happen in practice, since the sample
- * size is at least 300.  The case where n approaches N corresponds to
- * sampling the whole table, in which case it is reasonable to keep
- * the whole MCV list (have no lower bound), so it makes sense to apply
- * this formula for all inputs, even though the above derivation is
- * technically only valid when the right hand side is at least around 10.
+ * 返回值：
+ *   double - 最小出现次数阈值 cnt（出现次数大于该阈值的组才进入 MCV 列表）。
  *
- * An alternative way to look at this formula is as follows -- assume that
- * the number of instances of the value seen scales up to the entire
- * table, so that the population count is K=N*cnt/n. Then the distribution
- * in the sample is a hypergeometric distribution parameterised by N, n
- * and K, and the bound above is mathematically equivalent to demanding
- * that the standard deviation of that distribution is less than 20% of
- * its mean.  Thus the relative errors in any planner estimates produced
- * from the MCV statistics are likely to be not too large.
+ * 设计思想：
+ *   1. 只保留在样本中"出现足够频繁"的值，这样把样本频率外推到全表才可靠。
+ *      方法是对样本频率的相对标准误差设置上界，保证规划器基于 MCV 统计的估算
+ *      足够准确。
+ *   2. 无放回抽样下，某个值的样本频率服从超几何分布。经验法则：样本中至少出现
+ *      10 次后，该分布可近似为正态分布，从而可套用标准误差分析。
+ *      比例 p=cnt/n 的标准误差为
+ *          SE = sqrt(p*(1-p)/n) * sqrt((N-n)/(N-1))
+ *      第二项是有限总体校正因子。
+ *   3. 要求相对标准误差 SE/p < 0.2（20%，经验上工作良好），反解得出现次数下界：
+ *          cnt > n*(N-n) / (N-n+0.04*n*(N-1))
+ *      该下界最大为 25；当 n→0 或 n→N 时趋于 0。n→0 实际不会发生（样本至少
+ *      300 行）；n→N 意味着抽样了整个表，此时保留整个 MCV 列表（阈值=0）也合理，
+ *      因此该公式对所有输入都适用。
+ *   4. 另一视角：假设出现次数按比例放大到全表，总体计数 K=N*cnt/n，样本分布是
+ *      参数为 (N,n,K) 的超几何分布；上述下界等价于要求该分布的“标准差 < 均值的
+ *      20%”，即基于 MCV 统计产生的规划估计相对误差不会太大。
+ * ============================================================================
  */
 static double
 get_mincount_for_mcv_list(int samplerows, double totalrows)
@@ -161,18 +150,42 @@ get_mincount_for_mcv_list(int samplerows, double totalrows)
 }
 
 /*
- * Builds MCV list from the set of sampled rows.
+ * ============================================================================
+ * 【中文注释】statext_mcv_build —— 从采样数据构建多元 MCV 列表（顶层入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   这是构建多元 MCV（Most Common Values，最常见组合值）统计的入口函数。它把
+ *   采样到的若干行数据按所有列组合排序、分组、筛选出高频的组合，最终生成 MCVList
+ *   结构，供 ANALYZE 存入 pg_statistic_ext_data.stxdmcv。
  *
- * The algorithm is quite simple:
+ * 参数：
+ *   data      - 采样数据（StatsBuildData）：包含采样行数、各列 Datum/空值数组、
+ *               attnums、VacAttrStats 数组等。
+ *   totalrows - 全表估算行数。
+ *   stattarget- 统计对象的目标数（该对象/列/系统默认三者取最小值），即 MCV 列表
+ *               最多保留多少个组合。
  *
- *	   (1) sort the data (default collation, '<' for the data type)
+ * 返回值：
+ *   MCVList* - 构建好的 MCV 列表；无有效列表（如样本为空）时返回 NULL。
  *
- *	   (2) count distinct groups, decide how many to keep
+ * 设计思想（算法四步走）：
+ *   1. 用 build_mss() 为所有列建立 MultiSortSupport，再用 build_sorted_items()
+ *      按"全列组合"排序采样行。
+ *   2. 用 build_distinct_groups() 把排序后的行聚成不同的组，并统计每组出现次数；
+ *      组按频率降序排列。
+ *   3. 确定保留多少项：上限取 stattarget 与总组数的较小值；然后用
+ *      get_mincount_for_mcv_list() 计算入选阈值，从频率最高往下数，凡是组出现
+ *      次数不低于阈值的都保留。
+ *   4. 若保留项数 >0，则构造 MCVList：用 build_column_frequencies() 计算各列
+ *      （单独一列）的每个值在样本中的频率，从而算出每项的 base_frequency（若列
+ *      相互独立时该项的期望频率 = 各列频率之积）。这就是 MCV 项"实际频率 vs 独立
+ *      假设频率"的对照依据。
+ *   5. 释放中间数组（items、groups、nfreqs、freqs），返回 mcvlist。
  *
- *	   (3) build the MCV list using the threshold determined in (2)
- *
- *	   (4) remove rows represented by the MCV from the sample
- *
+ * 与单列 MCV 的区别：单列 MCV 只关心组频率本身；多元 MCV 更关心"实际频率与独立
+ * 假设（base_frequency）的偏差"，所以阈值算法不同（这里直接对所有保留项用最小
+ * 出现次数阈值，而不考虑与平均频率的比较）。
+ * ============================================================================
  */
 MCVList *
 statext_mcv_build(StatsBuildData *data, double totalrows, int stattarget)
@@ -338,8 +351,26 @@ statext_mcv_build(StatsBuildData *data, double totalrows, int stattarget)
 }
 
 /*
- * build_mss
- *		Build a MultiSortSupport for the given StatsBuildData.
+ * ============================================================================
+ * 【中文注释】build_mss —— 为给定统计数据构建多列排序支持结构
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为 MCV 构建过程中需要按"多列组合"排序采样行，而多列排序需要 MultiSortSupport
+ *   （每列一个 SortSupport + 维度数）。本函数根据 data 中各列的类型构建该结构。
+ *
+ * 参数：
+ *   data - 采样数据，其中 data->stats[i]->attrtypid 给出第 i 列类型、
+ *          attrcollid 给出排序规则。
+ *
+ * 返回值：
+ *   MultiSortSupport - 初始化好的排序支持结构。
+ *
+ * 设计思想：
+ *   1. multi_sort_init(numattrs) 创建结构；
+ *   2. 对每一列用 lookup_type_cache(attrtypid, TYPECACHE_LT_OPR) 查找该类型的
+ *      小于操作符（排序用），找不到则报错（理论不会发生）；
+ *   3. 调用 multi_sort_add_dimension() 把该列的排序操作符与排序规则注册进去。
+ * ============================================================================
  */
 static MultiSortSupport
 build_mss(StatsBuildData *data)
@@ -368,10 +399,24 @@ build_mss(StatsBuildData *data)
 }
 
 /*
- * count_distinct_groups
- *		Count distinct combinations of SortItems in the array.
+ * ============================================================================
+ * 【中文注释】count_distinct_groups —— 统计不同"列组合值"的组数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   统计已排序的 SortItem 数组中有多少组互不相同的多列组合值（即去重后的行数）。
  *
- * The array is assumed to be sorted according to the MultiSortSupport.
+ * 参数：
+ *   numrows - 数组长度。
+ *   items   - 排序好的 SortItem 数组。
+ *   mss     - 多列排序支持（用于逐组比较）。
+ *
+ * 返回值：
+ *   int - 不同组合的组数。
+ *
+ * 设计思想：
+ *   数组已按 mss 排序，因此只需相邻两两比较：不同则组数+1。初始 ndistinct=1
+ *   （至少一个元素）。比较用 multi_sort_compare()。
+ * ============================================================================
  */
 static int
 count_distinct_groups(int numrows, SortItem *items, MultiSortSupport mss)
@@ -393,9 +438,21 @@ count_distinct_groups(int numrows, SortItem *items, MultiSortSupport mss)
 }
 
 /*
- * compare_sort_item_count
- *		Comparator for sorting items by count (frequencies) in descending
- *		order.
+ * ============================================================================
+ * 【中文注释】compare_sort_item_count —— 按出现次数降序比较 SortItem 的比较器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   qsort_interruptible() 的回调：把 SortItem 数组按 count（出现次数）从大到小
+ *   排序，用于把不同组按频率排序。
+ *
+ * 参数：
+ *   a, b - 两个待比较的 SortItem 指针。
+ *   arg  - 未使用（标准 qsort 参数）。
+ *
+ * 返回值：
+ *   int - a.count < b.count 时 >0，a.count > b.count 时 <0，相等时 0
+ *         （注意返回值方向与常规比较器相反，实现降序）。
+ * ============================================================================
  */
 static int
 compare_sort_item_count(const void *a, const void *b, void *arg)
@@ -412,11 +469,28 @@ compare_sort_item_count(const void *a, const void *b, void *arg)
 }
 
 /*
- * build_distinct_groups
- *		Build an array of SortItems for distinct groups and counts matching
- *		items.
+ * ============================================================================
+ * 【中文注释】build_distinct_groups —— 把排序后的行聚成组并统计频率
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   给定按多列组合排序的 SortItem 数组，把相邻的相同组合聚成一组，计算每组的
+ *   出现次数（count），并返回一个按 count 降序排列的组数组。
  *
- * The 'items' array is assumed to be sorted.
+ * 参数：
+ *   numrows   - items 数组长度。
+ *   items     - 已排序的 SortItem 数组。
+ *   mss       - 多列排序支持。
+ *   ndistinct - 输出参数：不同组的个数。
+ *
+ * 返回值：
+ *   SortItem* - 组数组（长度 *ndistinct），每组带 count；按 count 降序。
+ *
+ * 设计思想：
+ *   1. 先用 count_distinct_groups() 算出组数 ngroups，一次性分配空间。
+ *   2. 扫描排序数组：与前一元素不同则开启新组，相同则当前组 count++。
+ *   3. 用 qsort_interruptible() + compare_sort_item_count() 按频率降序排序。
+ *   4. 断言 j+1 == ngroups，保证恰好填满。
+ * ============================================================================
  */
 static SortItem *
 build_distinct_groups(int numrows, SortItem *items, MultiSortSupport mss,
@@ -458,7 +532,26 @@ build_distinct_groups(int numrows, SortItem *items, MultiSortSupport mss,
 	return groups;
 }
 
-/* compare sort items (single dimension) */
+/*
+ * ============================================================================
+ * 【中文注释】sort_item_compare —— 按单列比较两个 SortItem 的比较器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   仅按 SortItem 的第一个值（values[0]/isnull[0]）比较两个 SortItem，用于对
+ *   build_column_frequencies() 中"某一列的取值数组"排序/去重。
+ *
+ * 参数：
+ *   a, b - 待比较的 SortItem 指针。
+ *   arg  - SortSupport 指针（该列的排序支持）。
+ *
+ * 返回值：
+ *   int - 按 ApplySortComparator 比较第 0 维的结果。
+ *
+ * 设计思想：
+ *   与 multi_sort_compare 不同，这里只比较单列，故直接把 SortSupport 作为比较
+ *   上下文，用 ApplySortComparator 处理 NULL 排序等逻辑。
+ * ============================================================================
+ */
 static int
 sort_item_compare(const void *a, const void *b, void *arg)
 {
@@ -472,17 +565,32 @@ sort_item_compare(const void *a, const void *b, void *arg)
 }
 
 /*
- * build_column_frequencies
- *		Compute frequencies of values in each column.
+ * ============================================================================
+ * 【中文注释】build_column_frequencies —— 统计各列单值的出现频率
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对 MCV 覆盖的每一列，统计该列每个"单值"在样本中出现的总次数（可能来自多个
+ *   MCV 项），返回每列一个按值排序的 SortItem 数组。这些单值频率用于计算 MCV 项
+ *   的 base_frequency（列独立假设下的期望频率）。
  *
- * This returns an array of SortItems for each attribute the MCV is built
- * on, with a frequency (number of occurrences) for each value. This is
- * then used to compute "base" frequency of MCV items.
+ * 参数：
+ *   groups  - 组的 SortItem 数组（含每组每列的取值与组 count）。
+ *   ngroups - 组的个数。
+ *   mss     - 多列排序支持（含各列的 SortSupport）。
+ *   ncounts - 输出参数：每列的去重值个数。
  *
- * All the memory is allocated in a single chunk, so that a single pfree
- * is enough to release it. We do not allocate space for values/isnull
- * arrays in the SortItems, because we can simply point into the input
- * groups directly.
+ * 返回值：
+ *   SortItem** - 长度为 ndims 的指针数组，第 dim 个是长度为 ncounts[dim]、
+ *                按该列值排序去重的 SortItem 数组。
+ *
+ * 设计思想：
+ *   1. 内存一次性分配（单块），一次 pfree 即可全部释放。
+ *   2. 每个 SortItem 的 values/isnull 直接"指向"输入 groups 中对应位置
+ *      （&groups[i].values[dim]），不额外拷贝，节省内存。
+ *   3. 每列做法：取出各组在该列的值并按 sort_item_compare 排序，然后去重：相同
+ *      值的 count 累加（因为同一单值可出现在多个 MCV 组里）。ncounts[dim] 记录
+ *      该列去重后的值个数。
+ * ============================================================================
  */
 static SortItem **
 build_column_frequencies(SortItem *groups, int ngroups,
@@ -549,8 +657,26 @@ build_column_frequencies(SortItem *groups, int ngroups,
 }
 
 /*
- * statext_mcv_load
- *		Load the MCV list for the indicated pg_statistic_ext_data tuple.
+ * ============================================================================
+ * 【中文注释】statext_mcv_load —— 从系统表加载 MCV 列表
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从 pg_statistic_ext_data 表加载并反序列化某个统计对象的 MCVList，供规划器
+ *   在估算选择性时使用。
+ *
+ * 参数：
+ *   mvoid - 统计对象 OID。
+ *   inh   - 是否加载继承树版本（stxdinherit）。
+ *
+ * 返回值：
+ *   MCVList* - 反序列化后的 MCV 列表。
+ *
+ * 设计思想：
+ *   通过 syscache（STATEXTDATASTXOID）按 (mvoid, inh) 精确查找 pg_statistic_ext_data
+ *   元组；找不到元组则报"cache lookup failed"；stxdmcv 列为 NULL 说明该统计尚未
+ *   构建，报 "not yet built" 错误。随后调用 statext_mcv_deserialize() 解析 bytea，
+ *   并 ReleaseSysCache 释放缓存引用。
+ * ============================================================================
  */
 MCVList *
 statext_mcv_load(Oid mvoid, bool inh)
@@ -581,39 +707,40 @@ statext_mcv_load(Oid mvoid, bool inh)
 
 
 /*
- * statext_mcv_serialize
- *		Serialize MCV list into a pg_mcv_list value.
+ * ============================================================================
+ * 【中文注释】statext_mcv_serialize —— 把 MCV 列表序列化为 pg_mcv_list（bytea）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把内存中的 MCVList 编码成 bytea 以便写入 pg_statistic_ext_data.stxdmcv 列
+ *   （该列类型即 pg_mcv_list）。
  *
- * The MCV items may include values of various data types, and it's reasonable
- * to expect redundancy (values for a given attribute, repeated for multiple
- * MCV list items). So we deduplicate the values into arrays, and then replace
- * the values by indexes into those arrays.
+ * 参数：
+ *   mcvlist - 内存中的 MCV 列表。
+ *   stats   - VacAttrStats 数组（每列一个），用于读取各列类型的 typlen/typbyval
+ *             等信息以确定序列化格式。
  *
- * The overall structure of the serialized representation looks like this:
+ * 返回值：
+ *   bytea* - 序列化结果（varlena），调用方负责 pfree。
  *
- * +---------------+----------------+---------------------+-------+
- * | header fields | dimension info | deduplicated values | items |
- * +---------------+----------------+---------------------+-------+
+ * 设计思想：
+ *   1.【去重】：MCV 项可能含多种类型的值，且同一属性值常在不同 MCV 项里重复出现，
+ *      所以先把每列的取值去重成数组，再用"数组下标"代替具体值，减少体积。
+ *   2.【整体布局】：
+ *         +---------------+----------------+---------------------+-------+
+ *         | header fields | dimension info | deduplicated values | items |
+ *         +---------------+----------------+---------------------+-------+
+ *      其中 dimension info 描述每列类型的信息（typlen、typbyval、去重后值个数等）；
+ *      deduplicated values 是各列去重后的值；items 是真正的 MCV 项，值被替换成
+ *      uint16 下标。
+ *   3.【下标宽度】：用 uint16 存下标。MCV 项数受统计目标限制（当前上限 1 万），
+ *      即使放宽到 6.5 万也仍在 uint16 范围内，有足够余量；且该上限是按"每列去重
+ *      值个数"而言，实际通常很少，故 uint16 足够。
+ *   4.【体积预期】：不指望像直方图那样省很多空间——MCV 没有做桶分裂（那是直方图
+ *      高冗余的来源）。
  *
- * Where dimension info stores information about the type of the K-th
- * attribute (e.g. typlen, typbyval and length of deduplicated values).
- * Deduplicated values store deduplicated values for each attribute.  And
- * items store the actual MCV list items, with values replaced by indexes into
- * the arrays.
- *
- * When serializing the items, we use uint16 indexes. The number of MCV items
- * is limited by the statistics target (which is capped to 10k at the moment).
- * We might increase this to 65k and still fit into uint16, so there's a bit of
- * slack. Furthermore, this limit is on the number of distinct values per column,
- * and we usually have few of those (and various combinations of them for the
- * those MCV list). So uint16 seems fine for now.
- *
- * We don't really expect the serialization to save as much space as for
- * histograms, as we are not doing any bucket splits (which is the source
- * of high redundancy in histograms).
- *
- * TODO: Consider packing boolean flags (NULL) for each item into a single char
- * (or a longer type) instead of using an array of bool items.
+ *   TODO：可考虑把每个 item 的 NULL 标志打包成单个 char（或更长类型），而不是
+ *   用一个 bool 数组。
+ * ============================================================================
  */
 bytea *
 statext_mcv_serialize(MCVList *mcvlist, VacAttrStats **stats)
@@ -983,11 +1110,32 @@ statext_mcv_serialize(MCVList *mcvlist, VacAttrStats **stats)
 }
 
 /*
- * statext_mcv_deserialize
- *		Reads serialized MCV list into MCVList structure.
+ * ============================================================================
+ * 【中文注释】statext_mcv_deserialize —— 反序列化 pg_mcv_list 为 MCVList 结构
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 statext_mcv_serialize() 互逆：把磁盘上的 bytea（pg_mcv_list）解码回内存
+ *   中的 MCVList 结构。
  *
- * All the memory needed by the MCV list is allocated as a single chunk, so
- * it's possible to simply pfree() it at once.
+ * 参数：
+ *   data - 序列化的 bytea（可为 NULL，此时返回 NULL）。
+ *
+ * 返回值：
+ *   MCVList* - 反序列化结果。MCV 列表所需内存全部一次性分配（单块），因此一次
+ *              pfree 即可整体释放。
+ *
+ * 设计思想：
+ *   1. 先做健壮性检查：数据长度必须不小于 MinSizeOfMCVList（至少容纳完整头部），
+ *      否则报"invalid MCV size"。
+ *   2. 从 VARDATA_ANY 处开始，依次解析 magic/type/ndimensions/nitems 等头部字段，
+ *      并校验 magic/type 合法、ndims 在 [1, STATS_MAX_DIMENSIONS] 内、nitems 不为 0。
+ *   3. 根据头部计算所需的 DimensionInfo 区、去重值区、items 区的偏移，用
+ *      mcv_total_size() 等宏校验总长度是否与头部声明一致（防损坏数据越界）。
+ *   4. 解析每列的 dimension info 与去重值，建立 datum 映射表（map[dim][index]）；
+ *      然后逐 item 按下标把值填回，NULL 标志单独处理。
+ *   5. 全程用 ptr/endptr 断言防越界（ptr==endptr 表示恰好消费完整段数据），最后
+ *      释放用于映射的临时 buffer。
+ * ============================================================================
  */
 MCVList *
 statext_mcv_deserialize(bytea *data)
@@ -1320,16 +1468,33 @@ statext_mcv_deserialize(bytea *data)
 }
 
 /*
- * SRF with details about buckets of a histogram:
+ * ============================================================================
+ * 【中文注释】pg_stats_ext_mcvlist_items —— 把 MCV 列表展开为 SRF 结果集
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   这是一个集合返回函数（SRF），用于把给定的 pg_mcv_list（序列化 bytea）展开成
+ *   一组可读的记录，方便用户直接查看 MCV 列表内容。
  *
- * - item ID (0...nitems)
- * - values (string array)
- * - nulls only (boolean array)
- * - frequency (double precision)
- * - base_frequency (double precision)
+ * 参数：
+ *   PG_FUNCTION_ARGS - 参数 0 是 pg_mcv_list 类型的 bytea。
  *
- * The input is the OID of the statistics, and there are no rows returned if
- * the statistics contains no histogram.
+ * 返回值：
+ *   Datum - 每个 MCV 项返回一行，列结构为：
+ *           - item ID（0...nitems，int4）
+ *           - values（各列值的 text 数组）
+ *           - nulls（各列是否为 NULL 的 boolean 数组）
+ *           - frequency（该组合实际频率，float8）
+ *           - base_frequency（列独立假设下的期望频率，float8）
+ *     若统计对象没有 MCV 数据则返回空集。
+ *
+ * 设计思想：
+ *   1. SRF 三阶段模式：首调用初始化 funcctx 并反序列化 MCV 列表（存 user_fctx），
+ *      记录 max_calls=nitems；后续每次调用返回一项；耗尽后 SRF_RETURN_DONE。
+ *   2. 每个 item 的 values 列用各列类型的输出函数（getTypeOutputInfo）把 Datum
+ *      转成 text 后聚成 text 数组；NULL 值单独记录进 nulls 数组。
+ *   3. 通过 get_call_result_type() 获取返回类型的 TupleDesc，用 heap_form_tuple
+ *      构造元组。
+ * ============================================================================
  */
 Datum
 pg_stats_ext_mcvlist_items(PG_FUNCTION_ARGS)
@@ -1460,10 +1625,22 @@ pg_stats_ext_mcvlist_items(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_mcv_list_in		- input routine for type pg_mcv_list.
+ * ============================================================================
+ * 【中文注释】pg_mcv_list_in —— pg_mcv_list 类型的文本输入函数（禁用）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   pg_mcv_list 类型"真实到足以作为表列"，但没有任何自身的操作，也不允许文本
+ *   输入——该类型只由统计构建过程写入，用户无法手工输入。
  *
- * pg_mcv_list is real enough to be a table column, but it has no operations
- * of its own, and disallows input too
+ * 参数：
+ *   PG_FUNCTION_ARGS - 调用参数（实际不会有效执行）。
+ *
+ * 返回值：
+ *   直接报错：cannot accept a value of type pg_mcv_list。
+ *
+ * 设计思想：
+ *   pg_mcv_list 以二进制形式存储（bytea 序列化），无需解析文本输入，故直接拒绝。
+ * ============================================================================
  */
 Datum
 pg_mcv_list_in(PG_FUNCTION_ARGS)
@@ -1481,15 +1658,22 @@ pg_mcv_list_in(PG_FUNCTION_ARGS)
 
 
 /*
- * pg_mcv_list_out		- output routine for type pg_mcv_list.
+ * ============================================================================
+ * 【中文注释】pg_mcv_list_out —— pg_mcv_list 类型的文本输出函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   MCV 列表内部就是序列化后的 bytea，因此直接复用 byteaout() 把它转成文本。
  *
- * MCV lists are serialized into a bytea value, so we simply call byteaout()
- * to serialize the value into text. But it'd be nice to serialize that into
- * a meaningful representation (e.g. for inspection by people).
+ * 参数：
+ *   PG_FUNCTION_ARGS - 调用参数。
  *
- * XXX This should probably return something meaningful, similar to what
- * pg_dependencies_out does. Not sure how to deal with the deduplicated
- * values, though - do we want to expand that or not?
+ * 返回值：
+ *   Datum - bytea 的文本表示。
+ *
+ * 设计思想：
+ *   XXX 理想情况下应输出有意义的表示（类似 pg_dependencies_out 那样），便于人类
+ *   查看；但涉及去重值的展开策略未定，暂时用 byteaout 兜底。
+ * ============================================================================
  */
 Datum
 pg_mcv_list_out(PG_FUNCTION_ARGS)
@@ -1498,7 +1682,18 @@ pg_mcv_list_out(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_mcv_list_recv		- binary input routine for type pg_mcv_list.
+ * ============================================================================
+ * 【中文注释】pg_mcv_list_recv —— pg_mcv_list 类型的二进制输入函数（禁用）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 pg_mcv_list_in 类似，pg_mcv_list 不允许二进制输入，直接报错。
+ *
+ * 参数：
+ *   PG_FUNCTION_ARGS - 调用参数（实际不会有效执行）。
+ *
+ * 返回值：
+ *   直接报错：cannot accept a value of type pg_mcv_list。
+ * ============================================================================
  */
 Datum
 pg_mcv_list_recv(PG_FUNCTION_ARGS)
@@ -1511,10 +1706,18 @@ pg_mcv_list_recv(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_mcv_list_send		- binary output routine for type pg_mcv_list.
+ * ============================================================================
+ * 【中文注释】pg_mcv_list_send —— pg_mcv_list 类型的二进制输出函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   MCV 列表本身就是序列化好的 bytea，直接复用 byteasend() 发送。
  *
- * MCV lists are serialized in a bytea value (although the type is named
- * differently), so let's just send that.
+ * 参数：
+ *   PG_FUNCTION_ARGS - 调用参数。
+ *
+ * 返回值：
+ *   Datum - 序列化后的二进制表示。
+ * ============================================================================
  */
 Datum
 pg_mcv_list_send(PG_FUNCTION_ARGS)
@@ -1523,10 +1726,28 @@ pg_mcv_list_send(PG_FUNCTION_ARGS)
 }
 
 /*
- * match the attribute/expression to a dimension of the statistic
+ * ============================================================================
+ * 【中文注释】mcv_match_expression —— 把表达式匹配到统计的某个维度
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判断给定的表达式（一个 Var 或一个表达式）对应 MCV 统计的第几个维度（列），
+ *   返回该维度的零基下标。
  *
- * Returns the zero-based index of the matching statistics dimension.
- * Optionally determines the collation.
+ * 参数：
+ *   expr   - 待匹配的节点：若是 Var 则按 varattno 匹配；否则当作统计的表达式之一。
+ *   keys   - 统计对象覆盖的普通列号位图（bms）。
+ *   exprs  - 统计对象定义的表达式列表。
+ *   collid - 可选输出参数：返回该表达式/列的排序规则 OID。
+ *
+ * 返回值：
+ *   int - 匹配到的维度下标（0 基）。匹配不到则 ERROR。
+ *
+ * 设计思想：
+ *   1. Var：直接用 bms_member_index(keys, varattno) 找到该列在 keys 中的下标；
+ *      idx<0 说明该列不在统计对象里，报错。collid 取 var->varcollid。
+ *   2. 表达式：普通列排在前面（个数 = bms_num_members(keys)），表达式排在其后，
+ *      逐个用 equal() 与 stat_expr 比较；找不到则报错。collid 取 exprCollation。
+ * ============================================================================
  */
 static int
 mcv_match_expression(Node *expr, Bitmapset *keys, List *exprs, Oid *collid)
@@ -1574,23 +1795,38 @@ mcv_match_expression(Node *expr, Bitmapset *keys, List *exprs, Oid *collid)
 }
 
 /*
- * mcv_get_match_bitmap
- *	Evaluate clauses using the MCV list, and update the match bitmap.
+ * ============================================================================
+ * 【中文注释】mcv_get_match_bitmap —— 用 MCV 列表评估子句并维护匹配位图
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   用给定的一串子句（AND 或 OR 连接）逐个评估 MCV 列表中每个 item 是否可能匹配，
+ *   返回每个 item 的匹配/不匹配位图。评估过程中用位图跳过不可能再改变结果的 item。
  *
- * A match bitmap keeps match/mismatch status for each MCV item, and we
- * update it based on additional clauses. We also use it to skip items
- * that can't possibly match (e.g. item marked as "mismatch" can't change
- * to "match" when evaluating AND clause list).
+ * 参数：
+ *   root    - PlannerInfo（规划上下文）。
+ *   clauses - 待评估的子句列表（AND 连接时全匹配才匹配，OR 连接时任一匹配即匹配）。
+ *   keys    - 统计覆盖的列号位图。
+ *   exprs   - 统计定义的表达式列表。
+ *   mcvlist - MCV 列表。
+ *   is_or   - true 表示按 OR 逻辑合并（任一子句匹配即认为 item 匹配），false 表示
+ *             AND 逻辑（所有子句都匹配才认为匹配）。
  *
- * The function also returns a flag indicating whether there was an
- * equality condition for all attributes, the minimum frequency in the MCV
- * list, and a total MCV frequency (sum of frequencies for all items).
+ * 返回值：
+ *   bool* - 长度 mcvlist->nitems 的匹配位图。
  *
- * XXX Currently the match bitmap uses a bool for each MCV item, which is
- * somewhat wasteful as we could do with just a single bit, thus reducing
- * the size to ~1/8. It would also allow us to combine bitmaps simply using
- * & and |, which should be faster than min/max. The bitmaps are fairly
- * small, though (thanks to the cap on the MCV list size).
+ * 设计思想：
+ *   1. 位图初始化为 !is_or：AND 列表初始全 true（先假定匹配，遇不匹配变 false）、
+ *      OR 列表初始全 false（先假定不匹配，遇匹配变 true）。
+ *   2. 对每个子句评估所有 item：
+ *      - OpClause：用 mcv_match_expression() 找到维度，逐 item 调操作符函数比较
+ *        值与常量（注意严格函数下 NULL 直接判不匹配）；跳过 RESULT_IS_FINAL 的项。
+ *      - ScalarArrayOpExpr：对数组每个元素做同样比较后合并。
+ *      - NullTest / BoolExpr（AND/OR/NOT）递归处理。
+ *   3. RESULT_IS_FINAL 用于提前终止：AND 列表中某项已是 false 就不会再变 true，
+ *      反之 OR 列表中已是 true 的项也不会再变 false，可跳过后续子句。
+ *   XXX 位图用 bool 数组略浪费（其实 1 bit 足够，还能用 &/| 加速合并），但 MCV
+ *   列表大小有上限，位图仍很小，暂不优化。
+ * ============================================================================
  */
 static bool *
 mcv_get_match_bitmap(PlannerInfo *root, List *clauses,
@@ -1965,37 +2201,36 @@ mcv_get_match_bitmap(PlannerInfo *root, List *clauses,
 
 
 /*
- * mcv_combine_selectivities
- * 		Combine per-column and multi-column MCV selectivity estimates.
+ * ============================================================================
+ * 【中文注释】mcv_combine_selectivities —— 合并单列与多元 MCV 的选择性估计
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把"仅用单列统计、假设列独立"得到的简单选择性（simple_sel）与基于多元 MCV
+ *   统计的估计结合起来，得到最终的选择性。
  *
- * simple_sel is a "simple" selectivity estimate (produced without using any
- * extended statistics, essentially assuming independence of columns/clauses).
+ * 参数：
+ *   simple_sel  - 简单选择性：不使用任何扩展统计，本质上假设列/子句相互独立。
+ *   mcv_sel     - 所有"匹配"MCV 项的频率之和。
+ *   mcv_basesel - 所有匹配 MCV 项的 base_frequency 之和。
+ *   mcv_totalsel- 全部 MCV 项频率之和（无论是否匹配），作为"未覆盖部分"的上界。
  *
- * mcv_sel and mcv_basesel are sums of the frequencies and base frequencies of
- * all matching MCV items.  The difference (mcv_sel - mcv_basesel) is then
- * essentially interpreted as a correction to be added to simple_sel, as
- * described below.
+ * 返回值：
+ *   Selectivity - 合并后的选择性（在 [0,1] 内）。
  *
- * mcv_totalsel is the sum of the frequencies of all MCV items (not just the
- * matching ones).  This is used as an upper bound on the portion of the
- * selectivity estimates not covered by the MCV statistics.
- *
- * Note: While simple and base selectivities are defined in a quite similar
- * way, the values are computed differently and are not therefore equal. The
- * simple selectivity is computed as a product of per-clause estimates, while
- * the base selectivity is computed by adding up base frequencies of matching
- * items of the multi-column MCV list. So the values may differ for two main
- * reasons - (a) the MCV list may not cover 100% of the data and (b) some of
- * the MCV items did not match the estimated clauses.
- *
- * As both (a) and (b) reduce the base selectivity value, it generally holds
- * that (simple_sel >= mcv_basesel). If the MCV list covers all the data, the
- * values may be equal.
- *
- * So, other_sel = (simple_sel - mcv_basesel) is an estimate for the part not
- * covered by the MCV list, and (mcv_sel - mcv_basesel) may be seen as a
- * correction for the part covered by the MCV list. Those two statements are
- * actually equivalent.
+ * 设计思想：
+ *   1. 记 mcv_basesel 是"MCV 匹配项在列独立假设下的总选择性"，而 simple_sel 是
+ *      "无扩展统计时的估计"。二者计算方式不同（前者=匹配项 base_frequency 求和，
+ *      后者=各子句估计乘积），故通常不等，差异来自：(a) MCV 列表未覆盖全部数据、
+ *      (b) 部分 MCV 项未匹配当前子句。
+ *   2. 由于 (a)(b) 都会压低 mcv_basesel，一般 simple_sel >= mcv_basesel；若 MCV
+ *      覆盖全部数据，二者可能相等。
+ *   3. 合并公式：
+ *        other_sel = clamp(simple_sel - mcv_basesel)   // 未被 MCV 覆盖部分的估计
+ *        且 other_sel 不能超过 1 - mcv_totalsel
+ *        sel = mcv_sel + other_sel                      // MCV 部分 + 非 MCV 部分
+ *   4. 即 (mcv_sel - mcv_basesel) 可视作对 simple_sel 的修正项，与上面 other_sel
+ *      的表述在数学上等价。
+ * ============================================================================
  */
 Selectivity
 mcv_combine_selectivities(Selectivity simple_sel,
@@ -2023,21 +2258,34 @@ mcv_combine_selectivities(Selectivity simple_sel,
 
 
 /*
- * mcv_clauselist_selectivity
- *		Use MCV statistics to estimate the selectivity of an implicitly-ANDed
- *		list of clauses.
+ * ============================================================================
+ * 【中文注释】mcv_clauselist_selectivity —— 用 MCV 统计估计 AND 子句列表选择性
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   用多元 MCV 统计估计一个隐式 AND 连接的子句列表的选择性：找出哪些 MCV 项同时
+ *   匹配列表中的每个子句，返回这些项的频率之和作为选择性。
  *
- * This determines which MCV items match every clause in the list and returns
- * the sum of the frequencies of those items.
+ * 参数：
+ *   root    - PlannerInfo。
+ *   stat    - 正在使用的扩展统计对象信息。
+ *   clauses - 隐式 AND 的子句列表。
+ *   varRelid/jointype/sjinfo/rel - 规划上下文（本函数未直接使用，保留接口一致）。
+ *   basesel - 输出参数：所有匹配项 base_frequency 之和（列独立假设下各匹配项的
+ *             选择性之和）。
+ *   totalsel- 输出参数：全部 MCV 项频率之和（无论是否匹配）。
  *
- * In addition, it returns the sum of the base frequencies of each of those
- * items (that is the sum of the selectivities that each item would have if
- * the columns were independent of one another), and the total selectivity of
- * all the MCV items (not just the matching ones).  These are expected to be
- * used together with a "simple" selectivity estimate (one based only on
- * per-column statistics) to produce an overall selectivity estimate that
- * makes use of both per-column and multi-column statistics --- see
- * mcv_combine_selectivities().
+ * 返回值：
+ *   Selectivity - 匹配项的频率之和，即基于 MCV 的选择性。
+ *
+ * 设计思想：
+ *   1. 加载统计对象存储的 MCV 列表（statext_mcv_load），继承标志取自 rel 对应
+ *      的 RTE（root->simple_rte_array[rel->relid]->inh）。
+ *   2. 调用 mcv_get_match_bitmap(..., is_or=false) 得到每个 item 是否匹配。
+ *   3. 遍历 items：totalsel 累加所有 item 频率；对匹配项再累加 base_frequency 与
+ *      频率 s。
+ *   4. 返回的 s、*basesel、*totalsel 与"简单选择性"一起交给
+ *      mcv_combine_selectivities() 合成最终估计（同时利用单列与多列统计）。
+ * ============================================================================
  */
 Selectivity
 mcv_clauselist_selectivity(PlannerInfo *root, StatisticExtInfo *stat,
@@ -2079,42 +2327,39 @@ mcv_clauselist_selectivity(PlannerInfo *root, StatisticExtInfo *stat,
 
 
 /*
- * mcv_clause_selectivity_or
- *		Use MCV statistics to estimate the selectivity of a clause that
- *		appears in an ORed list of clauses.
+ * ============================================================================
+ * 【中文注释】mcv_clause_selectivity_or —— 用 MCV 估计 OR 子句列表中单个子句的选择性
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   针对 OR 连接的子句列表中的某个子句，用 MCV 统计估计其选择性，并同时输出
+ *   用于计算"OR 列表整体选择性"的重叠信息（见下述算法）。OR 列表中每个子句都要
+ *   调用本函数一次。
  *
- * As with mcv_clauselist_selectivity() this determines which MCV items match
- * the clause and returns both the sum of the frequencies and the sum of the
- * base frequencies of those items, as well as the sum of the frequencies of
- * all MCV items (not just the matching ones) so that this information can be
- * used by mcv_combine_selectivities() to produce a selectivity estimate that
- * makes use of both per-column and multi-column statistics.
+ * 参数：
+ *   root / stat / mcv - 规划上下文、统计对象信息、已加载的 MCV 列表。
+ *   clause   - 待估计的单个子句。
+ *   or_matches - in/out 参数：累积"已评估子句"的匹配位图；首次调用时应传 NULL，
+ *                函数内部首次分配并清零。
+ *   basesel  - 输出：本子句匹配项的 base_frequency 之和。
+ *   overlap_mcvsel / overlap_basesel - 输出：与已评估子句"重叠"（即也匹配先前
+ *                某子句）的那些项的 frequency / base_frequency 之和，对应下面公式
+ *                中的重叠项。
+ *   totalsel - 输出：所有 MCV 项频率之和。
  *
- * Additionally, we return information to help compute the overall selectivity
- * of the ORed list of clauses assumed to contain this clause.  This function
- * is intended to be called for each clause in the ORed list of clauses,
- * allowing the overall selectivity to be computed using the following
- * algorithm:
+ * 返回值：
+ *   Selectivity - 本子句匹配项的 frequency 之和（该子句的选择性）。
  *
- * Suppose P[n] = P(C[1] OR C[2] OR ... OR C[n]) is the combined selectivity
- * of the first n clauses in the list.  Then the combined selectivity taking
- * into account the next clause C[n+1] can be written as
- *
- *		P[n+1] = P[n] + P(C[n+1]) - P((C[1] OR ... OR C[n]) AND C[n+1])
- *
- * The final term above represents the overlap between the clauses examined so
- * far and the (n+1)'th clause.  To estimate its selectivity, we track the
- * match bitmap for the ORed list of clauses examined so far and examine its
- * intersection with the match bitmap for the (n+1)'th clause.
- *
- * We then also return the sums of the MCV item frequencies and base
- * frequencies for the match bitmap intersection corresponding to the overlap
- * term above, so that they can be combined with a simple selectivity estimate
- * for that term.
- *
- * The parameter "or_matches" is an in/out parameter tracking the match bitmap
- * for the clauses examined so far.  The caller is expected to set it to NULL
- * the first time it calls this function.
+ * 设计思想：
+ *   1. 令 P[n]=P(C[1] OR ... OR C[n]) 为前 n 个子句的合并选择性，则加入第 n+1
+ *      个子句后：
+ *          P[n+1] = P[n] + P(C[n+1]) - P((C[1] OR ... OR C[n]) AND C[n+1])
+ *      末项是先前子句与新子句的重叠，通过"已评估子句位图 ∩ 新子句位图"来估计。
+ *   2. 流程：若 *or_matches 为 NULL 则分配清零；用 mcv_get_match_bitmap(...,false)
+ *      生成新子句的匹配位图；遍历 items 累加新子句的选择性 s、basesel，以及重叠
+ *      项（同时匹配先前子句）的 overlap_mcvsel/overlap_basesel；最后把新子句的
+ *      匹配并入 *or_matches（按位或）。
+ *   3. 输出的 totalsel 供 mcv_combine_selectivities() 使用。
+ * ============================================================================
  */
 Selectivity
 mcv_clause_selectivity_or(PlannerInfo *root, StatisticExtInfo *stat,
@@ -2168,7 +2413,20 @@ mcv_clause_selectivity_or(PlannerInfo *root, StatisticExtInfo *stat,
 }
 
 /*
- * Free allocations of a MCVList.
+ * ============================================================================
+ * 【中文注释】statext_mcv_free —— 释放 MCVList 结构
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   释放 MCVList 的内存：先释放每个 item 的 values/isnull 数组，再释放结构本身。
+ *
+ * 参数：
+ *   mcvlist - 待释放的 MCV 列表。
+ *
+ * 返回值：无。
+ *
+ * 设计思想：
+ *   反序列化/构建时每个 item 的 values、isnull 是独立 palloc 的，因此需逐项释放。
+ * ============================================================================
  */
 void
 statext_mcv_free(MCVList *mcvlist)
@@ -2184,16 +2442,39 @@ statext_mcv_free(MCVList *mcvlist)
 }
 
 /*
- * Create the MCV composite datum, which is a serialization of an array of
- * MCVItems.
+ * ============================================================================
+ * 【中文注释】statext_mcv_import —— 从 SQL 导入 MCV 列表并序列化
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把用户通过 SQL 提供的 MCV 元素数组组装成 MCVList 并序列化为 bytea（pg_mcv_list
+ *   值），用于 pg_restore_extended_stats() 等导入场景。
  *
- * The inputs consist of four separate arrays of equal length "numitems"
- * (mcv_elems, mcv_nulls, freqs and base_freqs) that form the basics of
- * what is stored in the catalogs.  These form an array of composite
- * records defined by the three atttypX arrays of equal length "numattrs".
+ * 参数：
+ *   elevel      - 出错时的错误级别（< ERROR 时返回 NULL Datum 而非抛错）。
+ *   numattrs    - 维度（列）个数。
+ *   atttypids   - 每列的类型 OID。
+ *   atttypmods  - 每列的 typmod。
+ *   atttypcolls - 每列的排序规则。
+ *   nitems      - MCV 项个数。
+ *   mcv_elems   - 长度 numitems*numattrs 的元素数组（列主序存储）。
+ *   mcv_nulls   - 对应的 NULL 标志数组。
+ *   freqs / base_freqs - 每项的实际频率与独立假设频率。
  *
- * If any data element fails to convert to the input type specified for that
- * attribute, then function will return a NULL Datum if elevel < ERROR.
+ * 返回值：
+ *   Datum - 序列化后的 bytea Datum；任何元素转换失败且 elevel<ERROR 时返回
+ *           (Datum) 0。
+ *
+ * 设计思想：
+ *   1. 分配 MCVList，填头部（magic/type/ndimensions/nitems）与每项的 frequency、
+ *      base_frequency。
+ *   2. 逐"列"处理：取该列类型的输入函数（getTypeInputInfo），对该列的所有值用
+ *      InputFunctionCallSafe 做文本→类型转换；NULL 值跳过输入（isnull 置 true）。
+ *      转换失败按 elevel 报错并跳转到 error 标签。
+ *   3. statext_mcv_serialize() 需要 VacAttrStats 数组，此处用类型元组构造一份只含
+ *      attrtype/attrtypid/attrcollid 的轻量 VacAttrStats。
+ *   4. 序列化后释放临时内存；bytes 为 NULL（如序列化失败）时按 elevel 报错。
+ *   5. error 标签统一释放 mcvlist 并返回 (Datum) 0。
+ * ============================================================================
  */
 Datum
 statext_mcv_import(int elevel, int numattrs,

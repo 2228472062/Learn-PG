@@ -81,6 +81,30 @@ static Selectivity clauselist_apply_dependencies(PlannerInfo *root, List *clause
 												 AttrNumber *list_attnums,
 												 Bitmapset **estimatedclauses);
 
+/*
+ * ============================================================================
+ * 【中文注释】generate_dependencies_recurse —— 递归生成所有函数依赖（核心）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   递归枚举"k-置换"形式的函数依赖。所谓函数依赖形如 (a,b => c)，其中箭头左边
+ *   是前 k-1 个属性（决定方），箭头右边是第 k 个属性（被决定方）。
+ *
+ * 参数：
+ *   state   - 依赖生成器状态。
+ *   index   - 当前正在生成第几个元素（0 基）。
+ *   start   - 当前元素可取的最小属性号（仅对前 k-1 个元素生效）。
+ *   current - 正在构造的依赖临时缓冲（长度 k）。
+ *
+ * 返回值：无。
+ *
+ * 设计思想：
+ *   1. 依赖不同于普通组合：前 (k-1) 个元素顺序无关——(a,b=>c) 与 (b,a=>c) 等价，
+ *      因此前 k-1 个元素按**升序**递归生成（用 start 约束），避免重复。
+ *   2. 最后一个元素（被决定方）不受升序限制，只需保证它不出现在前 k-1 个元素中。
+ *      对每个候选 i 检查 current[0..index-1] 里是否有重复，无重复即构成一个合法
+ *      依赖，写入 state->dependencies（必要时 repalloc 扩容）。
+ * ============================================================================
+ */
 static void
 generate_dependencies_recurse(DependencyGenerator state, int index,
 							  AttrNumber start, AttrNumber *current)
@@ -146,7 +170,20 @@ generate_dependencies_recurse(DependencyGenerator state, int index,
 	}
 }
 
-/* generate all dependencies (k-permutations of n elements) */
+/*
+ * ============================================================================
+ * 【中文注释】generate_dependencies —— 生成全部 k 置换依赖（入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   驱动 generate_dependencies_recurse() 生成所有 k 置换依赖的入口：分配临时缓冲，
+ *   从 (index=0, start=0) 开始递归。
+ *
+ * 参数：
+ *   state - 依赖生成器状态（内含 k、n、存储数组）。
+ *
+ * 返回值：无。
+ * ============================================================================
+ */
 static void
 generate_dependencies(DependencyGenerator state)
 {
@@ -158,10 +195,24 @@ generate_dependencies(DependencyGenerator state)
 }
 
 /*
- * initialize the DependencyGenerator of variations, and prebuild the variations
+ * ============================================================================
+ * 【中文注释】DependencyGenerator_init —— 初始化依赖生成器并预生成全部依赖
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   创建并初始化一个"枚举 n 个属性中所有 k 置换依赖"的生成器，并一次性预生成
+ *   所有依赖存入内部数组。
  *
- * This pre-builds all the variations. We could also generate them in
- * DependencyGenerator_next(), but this seems simpler.
+ * 参数：
+ *   n - 属性总数，要求 n>=k。
+ *   k - 依赖大小（含被决定方，共 k 个属性），要求 k>0。
+ *
+ * 返回值：
+ *   DependencyGenerator - 生成器状态。
+ *
+ * 设计思想：
+ *   预先用 generate_dependencies() 生成全部依赖，比在 DependencyGenerator_next()
+ *   里现场生成更简单。状态结构与依赖数组均为 palloc 分配。
+ * ============================================================================
  */
 static DependencyGenerator
 DependencyGenerator_init(int n, int k)
@@ -185,7 +236,19 @@ DependencyGenerator_init(int n, int k)
 	return state;
 }
 
-/* free the DependencyGenerator state */
+/*
+ * ============================================================================
+ * 【中文注释】DependencyGenerator_free —— 释放依赖生成器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   释放依赖生成器内部状态（依赖数组与状态结构本身）。
+ *
+ * 参数：
+ *   state - 生成器状态。
+ *
+ * 返回值：无。
+ * ============================================================================
+ */
 static void
 DependencyGenerator_free(DependencyGenerator state)
 {
@@ -193,7 +256,26 @@ DependencyGenerator_free(DependencyGenerator state)
 	pfree(state);
 }
 
-/* generate next combination */
+/*
+ * ============================================================================
+ * 【中文注释】DependencyGenerator_next —— 取出下一个依赖
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从预生成的数组里返回下一个 k 置换依赖（长度为 k 的属性号数组）；遍历完时
+ *   返回 NULL。
+ *
+ * 参数：
+ *   state - 生成器状态。
+ *
+ * 返回值：
+ *   AttrNumber* - 指向长度为 k 的依赖数组（位于 state->dependencies 内，无需
+ *                 释放）；无更多依赖时返回 NULL。
+ *
+ * 设计思想：
+ *   依赖数组按"每个 k 个连续元素"排布，第 current 个依赖起始位置为
+ *   &dependencies[k*current]。
+ * ============================================================================
+ */
 static AttrNumber *
 DependencyGenerator_next(DependencyGenerator state)
 {
@@ -205,11 +287,29 @@ DependencyGenerator_next(DependencyGenerator state)
 
 
 /*
- * validates functional dependency on the data
+ * ============================================================================
+ * 【中文注释】dependency_degree —— 计算某个候选函数依赖的"有效度"
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   这是检测函数依赖的真正工作核心：给定一个 k 属性的候选依赖（前 k-1 个属性
+ *   决定第 k 个），在采样数据上统计该依赖成立的比例（degree）。
  *
- * An actual work horse of detecting functional dependencies. Given a variation
- * of k attributes, it checks that the first (k-1) are sufficient to determine
- * the last one.
+ * 参数：
+ *   data       - 采样数据。
+ *   k          - 依赖属性个数。
+ *   dependency - 长度为 k 的属性号数组，前 k-1 个是决定方，最后一个是被决定方。
+ *
+ * 返回值：
+ *   double - 依赖有效度 = 支持该依赖的行数 / 总行数，取值范围 [0,1]。
+ *
+ * 设计思想：
+ *   1. 按前 k-1 列对采样行排序（multi_sort_*），使"决定方相同"的行聚成组。
+ *   2. 扫描每个组：若组内被决定方（第 k 列）的取值全部一致，则整个组支持该依赖
+ *      （n_supporting_rows += group_size）；只要出现一次被决定方取值不同，就记为
+ *      一次违反（n_violations++）。
+ *   3. 有效度 = 支持行数 / 总行数。为降低噪声，一个组是否支持依赖以该组整体的
+ *      一致性判断，而不是逐行比较。
+ * ============================================================================
  */
 static double
 dependency_degree(StatsBuildData *data, int k, AttrNumber *dependency)
@@ -323,20 +423,33 @@ dependency_degree(StatsBuildData *data, int k, AttrNumber *dependency)
 }
 
 /*
- * detects functional dependencies between groups of columns
+ * ============================================================================
+ * 【中文注释】statext_dependencies_build —— 构建函数依赖统计（顶层入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对统计对象覆盖的所有列组合，检测并生成函数依赖列表。它枚举所有可能的
+ *   "k 置换"依赖（k=2..n），对每个候选计算有效度 degree，把 degree>0 的依赖存入
+ *   MVDependencies 结构。
  *
- * Generates all possible subsets of columns (variations) and computes
- * the degree of validity for each one. For example when creating statistics
- * on three columns (a,b,c) there are 9 possible dependencies
+ * 参数：
+ *   data - 采样数据（StatsBuildData），要求至少覆盖 2 列（data->nattnums >= 2）。
  *
- *	   two columns			  three columns
- *	   -----------			  -------------
- *	   (a) -> b				  (a,b) -> c
- *	   (a) -> c				  (a,c) -> b
- *	   (b) -> a				  (b,c) -> a
- *	   (b) -> c
- *	   (c) -> a
- *	   (c) -> b
+ * 返回值：
+ *   MVDependencies* - 依赖集合；若没有任何 degree>0 的依赖则返回 NULL。
+ *
+ * 设计思想：
+ *   1. 从最小的 2 列依赖开始，逐步扩大到覆盖全部列的依赖。从最小开始是因为想
+ *      跳过已被隐含的依赖（例如 (a=>b) 与 (b=>c) 蕴含 (a=>c) 的某种程度）。
+ *   2. 对每个 k 用 DependencyGenerator 枚举所有 k 置换；对每个候选调用
+ *      dependency_degree() 计算有效度。为便于统一释放中间内存，degree 计算在独立
+ *      内存上下文 cxt 中完成，每次循环后 MemoryContextReset(cxt)。
+ *   3. degree == 0 的候选不存储；否则构造 MVDependency，属性号映射回统计对象覆盖
+ *      的真实列号（data->attnums[dependency[i]]）。
+ *   4. 依赖集合用 repalloc 动态扩容，最后释放 cxt 返回结果。
+ *
+ *   例如三列 (a,b,c) 上共有 9 个可能的依赖（见原文图示）：2 列的有 6 个（a=>b、
+ *   a=>c、b=>a、b=>c、c=>a、c=>b），3 列的有 3 个（(a,b)=>c、(a,c)=>b、(b,c)=>a）。
+ * ============================================================================
  */
 MVDependencies *
 statext_dependencies_build(StatsBuildData *data)
@@ -431,7 +544,26 @@ statext_dependencies_build(StatsBuildData *data)
 
 
 /*
- * Serialize list of dependencies into a bytea value.
+ * ============================================================================
+ * 【中文注释】statext_dependencies_serialize —— 序列化函数依赖为 bytea
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把内存中的 MVDependencies 结构编码成 bytea（varlena），用于写入
+ *   pg_statistic_ext_data.stxddependencies 列。
+ *
+ * 参数：
+ *   dependencies - 待序列化的依赖集合。
+ *
+ * 返回值：
+ *   bytea* - 序列化结果（新分配）。
+ *
+ * 设计思想：
+ *   布局（紧凑、不关心对齐）：[ varlena 头 | magic | type | ndeps ]
+ *   然后对每个依赖：[ degree(double) | nattributes(AttrNumber) |
+ *                    attributes(AttrNumber*nattributes) ]。
+ *   先累加每项大小（SizeOfItem）算出总长一次 palloc，逐字段 memcpy；用 Assert
+ *   保证最终 tmp 恰好到达缓冲区末尾（防溢出/防写穿）。
+ * ============================================================================
  */
 bytea *
 statext_dependencies_serialize(MVDependencies *dependencies)
@@ -485,7 +617,27 @@ statext_dependencies_serialize(MVDependencies *dependencies)
 }
 
 /*
- * Reads serialized dependencies into MVDependencies structure.
+ * ============================================================================
+ * 【中文注释】statext_dependencies_deserialize —— 反序列化依赖 bytea
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 statext_dependencies_serialize() 互逆：把磁盘 bytea 解码回 MVDependencies。
+ *
+ * 参数：
+ *   data - 序列化字节串（可为 NULL，此时返回 NULL）。
+ *
+ * 返回值：
+ *   MVDependencies* - 反序列化结果。
+ *
+ * 设计思想：
+ *   健壮性优先：
+ *   1. 长度检查：至少能容纳 SizeOfHeader，否则报 "invalid MVDependencies size"。
+ *   2. 读 header（magic/type/ndeps），校验 magic、type 合法且 ndeps>0；再按
+ *      MinSizeOfItems(ndeps) 检查最小整体长度，防伪造的短 bytea。
+ *   3. 为 deps 指针数组 repalloc 空间，逐依赖读 degree/nattributes/attributes，
+ *      Assert 属性个数在 [2, STATS_MAX_DIMENSIONS]。
+ *   4. 全程断言指针不越过 bytea 末尾，且最后恰好消费完整段数据。
+ * ============================================================================
  */
 MVDependencies *
 statext_dependencies_deserialize(bytea *data)
@@ -578,7 +730,20 @@ statext_dependencies_deserialize(bytea *data)
 }
 
 /*
- * Free allocations of a MVDependencies.
+ * ============================================================================
+ * 【中文注释】statext_dependencies_free —— 释放 MVDependencies 结构
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   释放依赖集合：先逐条释放每个 MVDependency，再释放集合结构本身。
+ *
+ * 参数：
+ *   dependencies - 待释放的依赖集合。
+ *
+ * 返回值：无。
+ *
+ * 设计思想：
+ *   每个依赖是独立 palloc 的（见 deserialize/build），因此需逐条释放。
+ * ============================================================================
  */
 void
 statext_dependencies_free(MVDependencies *dependencies)
@@ -589,16 +754,26 @@ statext_dependencies_free(MVDependencies *dependencies)
 }
 
 /*
- * Validate a set of MVDependencies against the extended statistics object
- * definition.
+ * ============================================================================
+ * 【中文注释】statext_dependencies_validate —— 校验依赖与统计对象定义一致
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   校验导入的 MVDependencies 中每条依赖的属性号是否与该统计对象（stxkeys +
+ *   numexprs）的定义吻合，防止提交与对象定义不匹配的依赖统计。
  *
- * Every MVDependencies must be checked to ensure that the attnums in the
- * attributes list correspond to attnums/expressions defined by the
- * extended statistics object.
+ * 参数：
+ *   dependencies - 待校验的依赖集合。
+ *   stxkeys      - 统计对象覆盖的普通列（int2vector）。
+ *   numexprs     - 统计对象中的表达式个数。
+ *   elevel       - 校验失败时使用的错误级别（WARNING 或 ERROR）。
  *
- * Positive attnums are attributes which must be found in the stxkeys, while
- * negative attnums correspond to an expression number, no attribute number
- * can be below (0 - numexprs).
+ * 返回值：
+ *   bool - true 合法；false 发现非法属性号（已按 elevel 报错）。
+ *
+ * 设计思想：
+ *   规则：正属性号必须出现在 stxkeys 中；负属性号代表表达式序号，其下界为
+ *   (0 - numexprs)。任一依赖的任一属性违反规则即判整体非法。
+ * ============================================================================
  */
 bool
 statext_dependencies_validate(const MVDependencies *dependencies,
@@ -654,9 +829,24 @@ statext_dependencies_validate(const MVDependencies *dependencies,
 }
 
 /*
- * dependency_is_fully_matched
- *		checks that a functional dependency is fully matched given clauses on
- *		attributes (assuming the clauses are suitable equality clauses)
+ * ============================================================================
+ * 【中文注释】dependency_is_fully_matched —— 检查依赖的所有属性都已被子句覆盖
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判断一条函数依赖（如 a=>b）涉及的每个属性（决定方与被决定方）是否都出现在
+ *   给定的属性位图中，即当前子句集合是否"完全匹配"了这条依赖。
+ *
+ * 参数：
+ *   dependency - 函数依赖。
+ *   attnums    - 已被子句覆盖的属性号位图。
+ *
+ * 返回值：
+ *   bool - 依赖中每个属性都在位图中时为 true，否则 false。
+ *
+ * 设计思想：
+ *   逐属性用 bms_is_member() 检查。注意属性号需要原样匹配（这些是统计对象里的
+ *   属性号，与子句解析出的属性号一一对应）。
+ * ============================================================================
  */
 static bool
 dependency_is_fully_matched(MVDependency *dependency, Bitmapset *attnums)
@@ -679,8 +869,25 @@ dependency_is_fully_matched(MVDependency *dependency, Bitmapset *attnums)
 }
 
 /*
- * statext_dependencies_load
- *		Load the functional dependencies for the indicated pg_statistic_ext tuple
+ * ============================================================================
+ * 【中文注释】statext_dependencies_load —— 从系统表加载函数依赖统计
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从 pg_statistic_ext_data 表加载并反序列化某个统计对象的 MVDependencies，
+ *   供规划器在选择性估算时使用。
+ *
+ * 参数：
+ *   mvoid - 统计对象 OID。
+ *   inh   - 是否加载继承树版本（stxdinherit）。
+ *
+ * 返回值：
+ *   MVDependencies* - 反序列化后的依赖集合。
+ *
+ * 设计思想：
+ *   通过 syscache（STATEXTDATASTXOID）按 (mvoid, inh) 精确查找元组；找不到元组则
+ *   报 "cache lookup failed"；stxddependencies 列为 NULL 说明该统计尚未构建，报
+ *   "not yet built"。随后反序列化并 ReleaseSysCache 释放缓存引用。
+ * ============================================================================
  */
 MVDependencies *
 statext_dependencies_load(Oid mvoid, bool inh)
@@ -711,13 +918,26 @@ statext_dependencies_load(Oid mvoid, bool inh)
 }
 
 /*
- * dependency_is_compatible_clause
- *		Determines if the clause is compatible with functional dependencies
+ * ============================================================================
+ * 【中文注释】dependency_is_compatible_clause —— 判断子句是否适用于函数依赖
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查一个子句是否可用于函数依赖统计的选择性估算。
  *
- * Only clauses that have the form of equality to a pseudoconstant, or can be
- * interpreted that way, are currently accepted.  Furthermore the variable
- * part of the clause must be a simple Var belonging to the specified
- * relation, whose attribute number we return in *attnum on success.
+ * 参数：
+ *   clause - 待检查的子句。
+ *   relid  - 子句中变量所属关系的 relid。
+ *   attnum - 输出参数：成功时返回子句中变量的属性号。
+ *
+ * 返回值：
+ *   bool - 兼容返回 true，并把属性号写入 *attnum；否则 false。
+ *
+ * 设计思想：
+ *   只接受"等于一个伪常量"形式（或可解释成该形式）的子句，例如 a=1 或
+ *   a IN (1,2,3)（IN 会被拆成等值）。且变量部分必须是属于指定关系的简单 Var，
+ *   其属性号经检查后返回。实现上通过 extract_restriction_or_clause()/
+ *   examine_simple_variable() 等自顶向下拆解，排除系统属性（不允许对系统列做统计）。
+ * ============================================================================
  */
 static bool
 dependency_is_compatible_clause(Node *clause, Index relid, AttrNumber *attnum)
@@ -892,20 +1112,28 @@ dependency_is_compatible_clause(Node *clause, Index relid, AttrNumber *attnum)
 }
 
 /*
- * find_strongest_dependency
- *		find the strongest dependency on the attributes
+ * ============================================================================
+ * 【中文注释】find_strongest_dependency —— 选出属性集上最强的依赖
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在多个依赖集合中，为给定属性集找出"最强"的那条函数依赖，用于优先应用。
  *
- * When applying functional dependencies, we start with the strongest
- * dependencies. That is, we select the dependency that:
+ * 参数：
+ *   dependencies - 依赖集合数组。
+ *   ndependencies- 集合个数。
+ *   attnums      - 被等值子句覆盖的属性位图。
  *
- * (a) has all attributes covered by equality clauses
+ * 返回值：
+ *   MVDependency* - 选中的最强依赖；没有可用依赖时返回 NULL。
  *
- * (b) has the most attributes
- *
- * (c) has the highest degree of validity
- *
- * This guarantees that we eliminate the most redundant conditions first
- * (see the comment in dependencies_clauselist_selectivity).
+ * 设计思想：
+ *   强度排序规则（按优先级）：
+ *   (a) 依赖的所有属性都被等值子句覆盖（完全匹配优先）；
+ *   (b) 依赖包含的属性最多；
+ *   (c) 有效度 degree 最高。
+ *   这样保证先消除最冗余的条件（参见 dependencies_clauselist_selectivity 注释：
+ *   从最强依赖开始递归应用）。
+ * ============================================================================
  */
 static MVDependency *
 find_strongest_dependency(MVDependencies **dependencies, int ndependencies,
@@ -960,35 +1188,33 @@ find_strongest_dependency(MVDependencies **dependencies, int ndependencies,
 }
 
 /*
- * clauselist_apply_dependencies
- *		Apply the specified functional dependencies to a list of clauses and
- *		return the estimated selectivity of the clauses that are compatible
- *		with any of the given dependencies.
+ * ============================================================================
+ * 【中文注释】clauselist_apply_dependencies —— 用函数依赖估计子句列表的选择性
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把给定的函数依赖应用到子句列表上，估算其中"兼容"子句的选择性，并把这些
+ *   子句标记为已估计。只估计与某个依赖兼容、且其属性被任一依赖提到（作为决定方
+ *   或被决定方）的、尚未被估计的子句。
  *
- * This will estimate all not-already-estimated clauses that are compatible
- * with functional dependencies, and which have an attribute mentioned by any
- * of the given dependencies (either as an implying or implied attribute).
+ * 参数：
+ *   root / varRelid / jointype / sjinfo / ... - 规划上下文。
+ *   clauses - 待处理的子句列表。
+ *   dependencies / ndependencies - 可用的函数依赖集合。
+ *   estimatedclauses - in/out：已被本函数估计的子句下标位图。
  *
- * Given (lists of) clauses on attributes (a,b) and a functional dependency
- * (a=>b), the per-column selectivities P(a) and P(b) are notionally combined
- * using the formula
+ * 返回值：
+ *   Selectivity - 兼容子句的估计选择性。
  *
- *		P(a,b) = f * P(a) + (1-f) * P(a) * P(b)
- *
- * where 'f' is the degree of dependency.  This reflects the fact that we
- * expect a fraction f of all rows to be consistent with the dependency
- * (a=>b), and so have a selectivity of P(a), while the remaining rows are
- * treated as independent.
- *
- * In practice, we use a slightly modified version of this formula, which uses
- * a selectivity of Min(P(a), P(b)) for the dependent rows, since the result
- * should obviously not exceed either column's individual selectivity.  I.e.,
- * we actually combine selectivities using the formula
- *
- *		P(a,b) = f * Min(P(a), P(b)) + (1-f) * P(a) * P(b)
- *
- * This can make quite a difference if the specific values matching the
- * clauses are not consistent with the functional dependency.
+ * 设计思想（核心公式）：
+ *   对属性 (a,b) 及依赖 (a=>b)，单列选择性 P(a)、P(b) 用如下公式合并：
+ *        P(a,b) = f * P(a) + (1-f) * P(a) * P(b)
+ *   其中 f 是依赖有效度：预期 f 比例的行与依赖一致（选择性 P(a)），其余行按独立
+ *   处理。
+ *   实际实现做了修正，被依赖行的选择性取 Min(P(a), P(b))：
+ *        P(a,b) = f * Min(P(a), P(b)) + (1-f) * P(a) * P(b)
+ *   因为合并结果显然不应超过任一单列选择性。当匹配子句的具体取值与依赖不一致时，
+ *   这个修正可能带来显著差异。
+ * ============================================================================
  */
 static Selectivity
 clauselist_apply_dependencies(PlannerInfo *root, List *clauses,
@@ -1137,12 +1363,28 @@ clauselist_apply_dependencies(PlannerInfo *root, List *clauses,
 }
 
 /*
- * dependency_is_compatible_expression
- *		Determines if the expression is compatible with functional dependencies
+ * ============================================================================
+ * 【中文注释】dependency_is_compatible_expression —— 判断表达式是否适用于函数依赖
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查一个子句的变量部分是否与统计对象中定义的某个表达式匹配，用于处理对
+ *   表达式建立的函数依赖统计。
  *
- * Similar to dependency_is_compatible_clause, but doesn't enforce that the
- * expression is a simple Var.  On success, return the matching statistics
- * expression into *expr.
+ * 参数：
+ *   clause   - 待检查的子句。
+ *   relid    - 关系 relid。
+ *   statlist - 统计对象定义的表达式列表。
+ *   expr     - 输出参数：成功时返回与子句匹配的统计表达式。
+ *
+ * 返回值：
+ *   bool - 兼容返回 true；否则 false。
+ *
+ * 设计思想：
+ *   与 dependency_is_compatible_clause() 类似，但**不要求**变量部分是简单 Var。
+ *   它允许子句变量是复杂表达式：把子句的变量表达式与统计对象的每个表达式用
+ *   equal() 比较，找到匹配即成功。这使依赖统计也能作用于表达式（例如对
+ *   lower(a) 建的统计）。
+ * ============================================================================
  */
 static bool
 dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, Node **expr)
@@ -1320,31 +1562,34 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 }
 
 /*
- * dependencies_clauselist_selectivity
- *		Return the estimated selectivity of (a subset of) the given clauses
- *		using functional dependency statistics, or 1.0 if no useful functional
- *		dependency statistic exists.
+ * ============================================================================
+ * 【中文注释】dependencies_clauselist_selectivity —— 用函数依赖统计估计子句列表选择性
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   使用函数依赖统计估算给定子句列表（的一个子集）的选择性；若没有可用的函数
+ *   依赖统计则返回 1.0（即不提供修正）。
  *
- * 'estimatedclauses' is an input/output argument that gets a bit set
- * corresponding to the (zero-based) list index of each clause that is included
- * in the estimated selectivity.
+ * 参数：
+ *   root / clauses / varRelid / ... - 规划上下文。
+ *   estimatedclauses - in/out 位图：记录哪些子句（按零基下标）被本函数计入估计，
+ *                      供调用方避免重复估计。
  *
- * Given equality clauses on attributes (a,b) we find the strongest dependency
- * between them, i.e. either (a=>b) or (b=>a). Assuming (a=>b) is the selected
- * dependency, we then combine the per-clause selectivities using the formula
+ * 返回值：
+ *   Selectivity - 估计的选择性。
  *
- *	   P(a,b) = f * P(a) + (1-f) * P(a) * P(b)
- *
- * where 'f' is the degree of the dependency.  (Actually we use a slightly
- * modified version of this formula -- see clauselist_apply_dependencies()).
- *
- * With clauses on more than two attributes, the dependencies are applied
- * recursively, starting with the widest/strongest dependencies. For example
- * P(a,b,c) is first split like this:
- *
- *	   P(a,b,c) = f * P(a,b) + (1-f) * P(a,b) * P(c)
- *
- * assuming (a,b=>c) is the strongest dependency.
+ * 设计思想：
+ *   1. 对属性 (a,b) 上的等值子句，先找它们之间最强的依赖，即 (a=>b) 或 (b=>a)。
+ *      假定选中 (a=>b)，则用如下公式合并单列选择性：
+ *           P(a,b) = f * P(a) + (1-f) * P(a) * P(b)
+ *      其中 f 是依赖有效度。（实际用略修改的公式，见
+ *      clauselist_apply_dependencies()。）
+ *   2. 对超过两个属性的子句，依赖被**递归**应用，从最宽/最强的依赖开始。例如
+ *      P(a,b,c) 先按最强依赖 (a,b=>c) 拆分为：
+ *           P(a,b,c) = f * P(a,b) + (1-f) * P(a,b) * P(c)
+ *   3. 实现要点：把子句按"覆盖同一组属性"分组；找出每组的候选依赖并选出最强，
+ *      应用合并公式；对被依赖属性（决定方）的等值条件做去冗余，最后统计所有
+ *      被估计子句的选择性。
+ * ============================================================================
  */
 Selectivity
 dependencies_clauselist_selectivity(PlannerInfo *root,
