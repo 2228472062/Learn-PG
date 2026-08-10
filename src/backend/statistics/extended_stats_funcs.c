@@ -172,7 +172,24 @@ static Datum import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 								 bool *pg_statistic_ok);
 
 /*
- * Fetch a pg_statistic_ext row by name and namespace OID.
+ * ============================================================================
+ * 【中文注释】get_pg_statistic_ext —— 按名字与命名空间查找统计对象元组
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在 pg_statistic_ext 中按 (stxname, stxnamespace) 精确查找一个统计对象元组。
+ *
+ * 参数：
+ *   pg_stext - 已打开的 pg_statistic_ext 关系。
+ *   nspoid   - 命名空间（schema）OID。
+ *   stxname  - 统计对象名。
+ *
+ * 返回值：
+ *   HeapTuple - 找到时返回 syscache 拷贝的元组（调用方需释放）；找不到返回 NULL。
+ *
+ * 设计思想：
+ *   用 (name, namespace) 唯一索引（StatisticExtNameIndexId）等值扫描，至多得到
+ *   一行；取其 oid 再用 STATEXTOID syscache 取回元组副本返回。
+ * ============================================================================
  */
 static HeapTuple
 get_pg_statistic_ext(Relation pg_stext, Oid nspoid, const char *stxname)

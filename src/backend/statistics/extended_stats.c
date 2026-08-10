@@ -325,17 +325,30 @@ HasRelationExtStatistics(Relation onerel)
 }
 
 /*
- * ComputeExtStatisticsRows
- *		Compute number of rows required by extended statistics on a table.
+ * ============================================================================
+ * 【中文注释】ComputeExtStatisticsRows —— 计算扩展统计所需的采样行数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   计算为了构建该表上的扩展统计，ANALYZE 需要采样多少行。只考虑"本次实际能构建"
+ *   的统计对象——例如只分析了部分列时，会跳过需要额外列的统计对象。
  *
- * Computes number of rows we need to sample to build extended statistics on a
- * table. This only looks at statistics we can actually build - for example
- * when analyzing only some of the columns, this will skip statistics objects
- * that would require additional columns.
+ * 参数：
+ *   onerel       - 目标关系。
+ *   natts        - 被分析的单列个数。
+ *   vacattrstats - 单列 VacAttrStats 数组。
  *
- * See statext_compute_stattarget for details about how we compute the
- * statistics target for a statistics object (from the object target,
- * attribute targets and default statistics target).
+ * 返回值：
+ *   int - 需要的采样行数（= 300 * 最大统计目标），无可用对象时为 0。
+ *
+ * 设计思想：
+ *   1. 遍历该关系的所有统计对象；用 lookup_var_attr_stats() 判断能否基于已分析
+ *      列构建（不能则跳过，构建阶段的警告留到 BuildRelationExtStatistics）。
+ *   2. 对每个可构建对象用 statext_compute_stattarget() 计算统计目标；取所有对象
+ *      中的**最大值**（保证足够样本满足最"贪婪"的对象）。
+ *   3. 最终按采样系数（300 行/目标）返回样本大小。
+ *   关于统计目标的计算细节（对象目标、列目标、默认目标），参见
+ *   statext_compute_stattarget()。
+ * ============================================================================
  */
 int
 ComputeExtStatisticsRows(Relation onerel,
@@ -400,24 +413,28 @@ ComputeExtStatisticsRows(Relation onerel,
 }
 
 /*
- * statext_compute_stattarget
- *		compute statistics target for an extended statistic
+ * ============================================================================
+ * 【中文注释】statext_compute_stattarget —— 计算扩展统计对象的统计目标
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   解析一个扩展统计对象的最终统计目标（决定 MCV 项数等详细程度）。
  *
- * When computing target for extended statistics objects, we consider three
- * places where the target may be set - the statistics object itself,
- * attributes the statistics object is defined on, and then the default
- * statistics target.
+ * 参数：
+ *   stattarget - 统计对象自身的统计目标（来自 ALTER STATISTICS ... SET STATISTICS）。
+ *   nattrs     - 统计对象覆盖的列数。
+ *   stats      - 对应列的 VacAttrStats 数组（含各列 attstattarget）。
  *
- * First we look at what's set for the statistics object itself, using the
- * ALTER STATISTICS ... SET STATISTICS command. If we find a valid value
- * there (i.e. not -1) we're done. Otherwise we look at targets set for any
- * of the attributes the statistic is defined on, and if there are columns
- * with defined target, we use the maximum value. We do this mostly for
- * backwards compatibility, because this is what we did before having
- * statistics target for extended statistics.
+ * 返回值：
+ *   int - 最终统计目标（>=0）。
  *
- * And finally, if we still don't have a statistics target, we use the value
- * set in default_statistics_target.
+ * 设计思想：
+ *   统计目标可能有三个来源，按优先级取：
+ *   1. 统计对象自身：statstarget >= 0 时直接用（0 表示禁用该统计的构建）。
+ *   2. 对象为 -1 时，取其所覆盖列中 attstattarget 的**最大值**。这主要是向后兼容：
+ *      在扩展统计还没有自己目标之前就是这么做的。
+ *   3. 若仍为负（对象与列都没设），用全局默认 default_statistics_target。
+ *   最终断言目标在 [0, MAX_STATISTICS_TARGET] 内。
+ * ============================================================================
  */
 static int
 statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats)
@@ -458,8 +475,24 @@ statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats)
 }
 
 /*
- * statext_is_kind_built
- *		Is this stat kind built in the given pg_statistic_ext_data tuple?
+ * ============================================================================
+ * 【中文注释】statext_is_kind_built —— 判断某类统计是否已在数据元组中构建
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查给定的 pg_statistic_ext_data 元组中，指定统计种类对应的列是否非 NULL
+ *   （即该统计是否已构建完成）。
+ *
+ * 参数：
+ *   htup - pg_statistic_ext_data 元组。
+ *   type - 统计种类（STATS_EXT_NDISTINCT / DEPENDENCIES / MCV / EXPRESSIONS）。
+ *
+ * 返回值：
+ *   bool - 已构建（对应列非空）返回 true，否则 false。
+ *
+ * 设计思想：
+ *   按种类映射到 stxdndistinct/stxddependencies/stxdmcv/stxdexpr 列号，用
+ *   heap_attisnull() 判空。未知种类直接报错。
+ * ============================================================================
  */
 bool
 statext_is_kind_built(HeapTuple htup, char type)
@@ -492,7 +525,29 @@ statext_is_kind_built(HeapTuple htup, char type)
 }
 
 /*
- * Return a list (of StatExtEntry) of statistics objects for the given relation.
+ * ============================================================================
+ * 【中文注释】fetch_statentries_for_relation —— 取回关系的全部统计对象
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   扫描 pg_statistic_ext，返回该关系定义的所有扩展统计对象，每个对象解析为
+ *   StatExtEntry 结构（含覆盖列、类型列表、目标、表达式等）。
+ *
+ * 参数：
+ *   pg_statext - 已打开并加锁的 pg_statistic_ext 关系。
+ *   rel        - 目标关系。
+ *
+ * 返回值：
+ *   List* - StatExtEntry 列表。
+ *
+ * 设计思想：
+ *   1. 按 stxrelid 索引做等值扫描。
+ *   2. 每个元组解析：stxkeys（列号数组）、stxkind（统计种类数组）、stxstattarget、
+ *      stxnamespace/stxname（用于报错信息）。
+ *   3. 若 stxkind 含 'e'（表达式统计），解析 stxexpr 表达式数组（text[]，需反
+ *      parse）；解析失败按 errsave 处理。
+ *   4. 构造 StatExtEntry 时校验列数在 [1, STATS_MAX_DIMENSIONS] 内（用 errsave
+ *      回调，解析失败可跳过）。
+ * ============================================================================
  */
 static List *
 fetch_statentries_for_relation(Relation pg_statext, Relation rel)
@@ -599,10 +654,28 @@ fetch_statentries_for_relation(Relation pg_statext, Relation rel)
 }
 
 /*
- * examine_attribute -- pre-analysis of a single column
+ * ============================================================================
+ * 【中文注释】examine_attribute —— 单列预分析（构建 VacAttrStats）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判断一个表达式（通常是对列的直接引用）是否可分析；若可，为它创建并初始化
+ *   一个 VacAttrStats 结构并返回；否则返回 NULL。
  *
- * Determine whether the column is analyzable; if so, create and initialize
- * a VacAttrStats struct for it.  If not, return NULL.
+ * 参数：
+ *   expr - 待分析的表达式（这里实为列或表达式）。
+ *
+ * 返回值：
+ *   VacAttrStats* - 初始化好的结构；不可分析时 NULL。
+ *
+ * 设计思想：
+ *   1. 类型取自表达式树本身（attrtypid/attrtypmod/attrcollid），而非列的类型——
+ *      因为 opclass 的存储类型（opckeytype）对我们不感兴趣。
+ *   2. 从 syscache 取 Form_pg_type，填充 attrtype。
+ *   3. stavalues 元素类型默认等于分析对象的类型，类型特定的 typanalyze 函数可按需
+ *      修改。
+ *   4. 调用类型特定的 typanalyze（缺省用 std_typanalyze）；若它表示不可分析
+ *      （ok=false 或未设 compute_stats/minrows），则释放并返回 NULL。
+ * ============================================================================
  */
 static VacAttrStats *
 examine_attribute(Node *expr)
@@ -678,10 +751,29 @@ examine_attribute(Node *expr)
 }
 
 /*
- * examine_expression -- pre-analysis of a single expression
+ * ============================================================================
+ * 【中文注释】examine_expression —— 单个表达式预分析（构建 VacAttrStats）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 examine_attribute() 类似，但用于统计对象里的**表达式**（如 lower(col)）：
+ *   判断是否可分析并构建 VacAttrStats。
  *
- * Determine whether the expression is analyzable; if so, create and initialize
- * a VacAttrStats struct for it.  If not, return NULL.
+ * 参数：
+ *   expr       - 待分析的表达式（必非 NULL）。
+ *   stattarget - 统计目标，用于填 VacAttrStats.attstattarget。
+ *
+ * 返回值：
+ *   VacAttrStats* - 初始化好的结构；不可分析时 NULL。
+ *
+ * 设计思想：
+ *   1. 表达式没有单独的统计目标设置，选用为扩展统计计算出的目标（比全局默认更
+ *      合理）。
+ *   2. 类型与 typmod 取表达式树的结果类型；排序规则取 exprCollation()——CREATE
+ *      STATISTICS 不允许为表达式指定 collation，但表达式本身可写
+ *      "(col COLLATE "en_US")"，此时 exprCollation() 会正确返回。
+ *   3. 其余初始化（attrtype、anl_context、statypid 等）与 examine_attribute 相同，
+ *      最后同样调用 typanalyze 判断可分析性。
+ * ============================================================================
  */
 static VacAttrStats *
 examine_expression(Node *expr, int stattarget)
@@ -763,11 +855,30 @@ examine_expression(Node *expr, int stattarget)
 }
 
 /*
- * Using 'vacatts' of size 'nvacatts' as input data, return a newly-built
- * VacAttrStats array which includes only the items corresponding to
- * attributes indicated by 'attrs'.  If we don't have all of the per-column
- * stats available to compute the extended stats, then we return NULL to
- * indicate to the caller that the stats should not be built.
+ * ============================================================================
+ * 【中文注释】lookup_var_attr_stats —— 取出统计对象覆盖列的 VacAttrStats
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从大小为 nvacatts 的 vacatts 数组中，按 attrs 位图筛选出统计对象真正覆盖的
+ *   那些列，返回一个新的 VacAttrStats 指针数组。表达式部分则逐一调用
+ *   examine_expression() 构建。
+ *
+ * 参数：
+ *   attrs     - 统计对象覆盖的列号位图。
+ *   exprs     - 统计对象的表达式列表。
+ *   nvacatts  - vacatts 数组长度。
+ *   vacatts   - 本次 ANALYZE 得到的单列 VacAttrStats 数组。
+ *
+ * 返回值：
+ *   VacAttrStats** - 按位图顺序排列的指针数组（含表达式统计的指针），长度
+ *                    bms_num_members(attrs) + list_length(exprs)；
+ *                    若缺失所需列的单列统计，返回 NULL（表示无法构建该对象）。
+ *
+ * 设计思想：
+ *   若位图中的任一列没有对应的单列统计（说明本次未分析该列），说明我们没有构建
+ *   扩展统计所需的全部数据，返回 NULL 让调用方跳过。位图成员本身即列号，直接用
+ *   作下标；表达式统计追加在普通列之后。
+ * ============================================================================
  */
 static VacAttrStats **
 lookup_var_attr_stats(Bitmapset *attrs, List *exprs,
@@ -844,9 +955,30 @@ lookup_var_attr_stats(Bitmapset *attrs, List *exprs,
 }
 
 /*
- * statext_store
- *	Serializes the statistics and stores them into the pg_statistic_ext_data
- *	tuple.
+ * ============================================================================
+ * 【中文注释】statext_store —— 把计算好的扩展统计序列化并写入系统表
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把统计对象计算出的 ndistinct/dependencies/MCV/表达式统计序列化为 bytea，
+ *   写入（或替换）pg_statistic_ext_data 中的一行。
+ *
+ * 参数：
+ *   statOid     - 统计对象 OID。
+ *   inh         - 是否针对继承树。
+ *   ndistinct   - 多元去重统计（可为 NULL，表示该类型未计算）。
+ *   dependencies- 函数依赖统计（可为 NULL）。
+ *   mcv         - MCV 列表（可为 NULL）。
+ *   exprs       - 表达式统计序列化结果（(Datum) 0 表示没有）。
+ *   stats       - 各列 VacAttrStats（供 MCV 序列化读取类型信息）。
+ *
+ * 返回值：无。
+ *
+ * 设计思想：
+ *   1. 打开 pg_statistic_ext_data，构造 values/nulls 数组：固定列 stxoid、stxdinherit
+ *      必填；各统计列按"是否有结果"决定填值还是 NULL。
+ *   2. 用 RemoveStatisticsDataById() 删除旧元组，再插入新元组——比"先判断更新还是
+ *      插入"更简单可靠。
+ * ============================================================================
  */
 static void
 statext_store(Oid statOid, bool inh,
@@ -917,7 +1049,21 @@ statext_store(Oid statOid, bool inh,
 	table_close(pg_stextdata, RowExclusiveLock);
 }
 
-/* initialize multi-dimensional sort */
+/*
+ * ============================================================================
+ * 【中文注释】multi_sort_init —— 初始化多维排序支持结构
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   分配并初始化 MultiSortSupport，用于按"多列组合"对行排序。
+ *
+ * 参数：
+ *   ndims - 排序维度数（列数），要求 >=2。
+ *
+ * 返回值：
+ *   MultiSortSupport - 初始化好的结构（ndims 已设置，各维度 SortSupport 待
+ *                      multi_sort_add_dimension() 填充）。
+ * ============================================================================
+ */
 MultiSortSupport
 multi_sort_init(int ndims)
 {
@@ -934,8 +1080,25 @@ multi_sort_init(int ndims)
 }
 
 /*
- * Prepare sort support info using the given sort operator and collation
- * at the position 'sortdim'
+ * ============================================================================
+ * 【中文注释】multi_sort_add_dimension —— 注册第 sortdim 维的排序支持
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   用给定的排序操作符与排序规则，为 MultiSortSupport 的第 sortdim 维准备
+ *   SortSupport 信息。
+ *
+ * 参数：
+ *   mss      - 多维排序支持结构。
+ *   sortdim  - 维度下标。
+ *   oper     - 排序操作符 OID。
+ *   collation- 排序规则 OID。
+ *
+ * 返回值：无。
+ *
+ * 设计思想：
+ *   设置 SortSupport 的上下文/排序规则/NULL 排序位置（NULL 排后），然后调用
+ *   PrepareSortSupportFromOrderingOp() 按操作符准备比较函数。
+ * ============================================================================
  */
 void
 multi_sort_add_dimension(MultiSortSupport mss, int sortdim,
@@ -950,7 +1113,22 @@ multi_sort_add_dimension(MultiSortSupport mss, int sortdim,
 	PrepareSortSupportFromOrderingOp(oper, ssup);
 }
 
-/* compare all the dimensions in the selected order */
+/*
+ * ============================================================================
+ * 【中文注释】multi_sort_compare —— 按全部维度依次比较两个 SortItem
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   qsort 类回调：按维度顺序（0..ndims-1）依次比较两个 SortItem，第一个不等即
+ *   返回结果；全部相等返回 0。
+ *
+ * 参数：
+ *   a, b - 两个 SortItem 指针。
+ *   arg  - MultiSortSupport 指针。
+ *
+ * 返回值：
+ *   int - 比较结果（<0 / 0 / >0）。
+ * ============================================================================
+ */
 int
 multi_sort_compare(const void *a, const void *b, void *arg)
 {
@@ -975,7 +1153,22 @@ multi_sort_compare(const void *a, const void *b, void *arg)
 	return 0;
 }
 
-/* compare selected dimension */
+/*
+ * ============================================================================
+ * 【中文注释】multi_sort_compare_dim —— 只比较指定单一维度
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   仅用第 dim 维的值比较两个 SortItem。
+ *
+ * 参数：
+ *   dim - 要比较的维度下标。
+ *   a, b - 两个 SortItem。
+ *   mss - 多维排序支持。
+ *
+ * 返回值：
+ *   int - 第 dim 维的比较结果。
+ * ============================================================================
+ */
 int
 multi_sort_compare_dim(int dim, const SortItem *a, const SortItem *b,
 					   MultiSortSupport mss)
@@ -985,6 +1178,23 @@ multi_sort_compare_dim(int dim, const SortItem *a, const SortItem *b,
 							   &mss->ssup[dim]);
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】multi_sort_compare_dims —— 比较 start..end 这一区间的维度
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   按维度 start..end（含端点）依次比较两个 SortItem，用于"忽略某些维度"的比较
+ *   （例如函数依赖检测中只比较决定方各列）。
+ *
+ * 参数：
+ *   start, end - 参与比较的维度区间。
+ *   a, b       - 两个 SortItem。
+ *   mss        - 多维排序支持。
+ *
+ * 返回值：
+ *   int - 区间内第一个不等的维度的比较结果；全等返回 0。
+ * ============================================================================
+ */
 int
 multi_sort_compare_dims(int start, int end,
 						const SortItem *a, const SortItem *b,
@@ -1005,6 +1215,21 @@ multi_sort_compare_dims(int start, int end,
 	return 0;
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】compare_scalars_simple —— 简单标量比较器（qsort 包装）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 compare_datums_simple() 包装成 qsort 回调：a/b 是指向 Datum 的指针。
+ *
+ * 参数：
+ *   a, b - 指向 Datum 的指针。
+ *   arg  - SortSupport。
+ *
+ * 返回值：
+ *   int - 两个标量的比较结果。
+ * ============================================================================
+ */
 int
 compare_scalars_simple(const void *a, const void *b, void *arg)
 {
@@ -1013,6 +1238,21 @@ compare_scalars_simple(const void *a, const void *b, void *arg)
 								 (SortSupport) arg);
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】compare_datums_simple —— 用 SortSupport 比较两个标量 Datum
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   直接用 ApplySortComparator 比较两个非 NULL 的标量 Datum（不涉及 isNull）。
+ *
+ * 参数：
+ *   a, b - 待比较的 Datum。
+ *   ssup - 排序支持。
+ *
+ * 返回值：
+ *   int - 比较结果（<0 / 0 / >0）。
+ * ============================================================================
+ */
 int
 compare_datums_simple(Datum a, Datum b, SortSupport ssup)
 {
@@ -1020,12 +1260,26 @@ compare_datums_simple(Datum a, Datum b, SortSupport ssup)
 }
 
 /*
- * build_attnums_array
- *		Transforms a bitmap into an array of AttrNumber values.
+ * ============================================================================
+ * 【中文注释】build_attnums_array —— 把位图转换成属性号数组
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把位图 attrs 中的每个成员转换成 AttrNumber 数组。位图用于扩展统计，其中
+ *   普通列与表达式混合存放（表达式用负号区分），nexprs 指示表达式的个数。
  *
- * This is used for extended statistics only, so all the attributes must be
- * user-defined. That means offsetting by FirstLowInvalidHeapAttributeNumber
- * is not necessary here (and when querying the bitmap).
+ * 参数：
+ *   attrs    - 属性位图（成员为"偏移后的编号"，见下）。
+ *   nexprs   - 表达式个数（普通列从 0 开始，表达式从 -nexprs 开始）。
+ *   numattrs - 可选输出参数：返回数组长度。
+ *
+ * 返回值：
+ *   AttrNumber* - 转换后的属性号数组。
+ *
+ * 设计思想：
+ *   仅用于扩展统计，所有属性都是用户自定义列，无需按
+ *   FirstLowInvalidHeapAttributeNumber 偏移（查询位图时也一致）。位图成员 j 对应
+ *   属性号 (j - nexprs)。由于位图不能存负数，断言所有属性号合法且在上界内。
+ * ============================================================================
  */
 AttrNumber *
 build_attnums_array(Bitmapset *attrs, int nexprs, int *numattrs)
@@ -1066,11 +1320,31 @@ build_attnums_array(Bitmapset *attrs, int nexprs, int *numattrs)
 }
 
 /*
- * build_sorted_items
- *		build a sorted array of SortItem with values from rows
+ * ============================================================================
+ * 【中文注释】build_sorted_items —— 从采样行构建排序好的 SortItem 数组
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 StatsBuildData 中的每行按指定列（attnums）的值打包成 SortItem（每行一个，
+ *   含 numattrs 个 Datum 及其 NULL 标志），并按 mss 多维排序后返回。
  *
- * Note: All the memory is allocated in a single chunk, so that the caller
- * can simply pfree the return value to release all of it.
+ * 参数：
+ *   data     - 采样数据（含 exprvals/exprnulls 或按 attnums 取行内值）。
+ *   nitems   - 输出参数：SortItem 个数（= 行数）。
+ *   mss      - 多维排序支持。
+ *   numattrs - 参与排序的列数。
+ *   attnums  - 参与排序的列号数组（长度 numattrs）。
+ *
+ * 返回值：
+ *   SortItem* - 排序后的数组；无行可处理时返回 NULL。
+ *
+ * 设计思想：
+ *   1. 全部内存一次性分配（items + values + isnull 三块连续），调用方一次 pfree
+ *      即可整体释放，减少分配开销。
+ *   2. 每个 SortItem 的 values/isnull 指向各自维度的 Datum/布尔数组。
+ *   3. 取值方式：若行数据来自 tuple 数组，则用 fetch 函数按列号取；否则直接用
+ *      exprvals（表达式统计场景，Datum 已按行×列排布）。
+ *   4. 用 qsort_interruptible() + multi_sort_compare() 排序。
+ * ============================================================================
  */
 SortItem *
 build_sorted_items(StatsBuildData *data, int *nitems,
@@ -1202,8 +1476,19 @@ build_sorted_items(StatsBuildData *data, int *nitems,
 }
 
 /*
- * has_stats_of_kind
- *		Check whether the list contains statistic of a given kind
+ * ============================================================================
+ * 【中文注释】has_stats_of_kind —— 列表中是否存在指定种类的统计
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历统计对象信息列表，检查是否存在 kind 等于 requiredkind 的对象。
+ *
+ * 参数：
+ *   stats        - StatisticExtInfo 列表。
+ *   requiredkind - 要求的统计种类（STATS_EXT_*）。
+ *
+ * 返回值：
+ *   bool - 存在返回 true，否则 false。
+ * ============================================================================
  */
 bool
 has_stats_of_kind(List *stats, char requiredkind)
@@ -1222,11 +1507,22 @@ has_stats_of_kind(List *stats, char requiredkind)
 }
 
 /*
- * stat_find_expression
- *		Search for an expression in statistics object's list of expressions.
+ * ============================================================================
+ * 【中文注释】stat_find_expression —— 在统计对象表达式列表中查找表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在统计对象的表达式列表中查找与给定表达式结构相等的项。
  *
- * Returns the index of the expression in the statistics object's list of
- * expressions, or -1 if not found.
+ * 参数：
+ *   stat - 统计对象信息（含 exprs 列表）。
+ *   expr - 待查找的表达式。
+ *
+ * 返回值：
+ *   int - 表达式在列表中的下标；未找到返回 -1。
+ *
+ * 设计思想：
+ *   逐个用 equal()（结构相等比较）匹配。
+ * ============================================================================
  */
 static int
 stat_find_expression(StatisticExtInfo *stat, Node *expr)
@@ -1249,11 +1545,23 @@ stat_find_expression(StatisticExtInfo *stat, Node *expr)
 }
 
 /*
- * stat_covers_expressions
- * 		Test whether a statistics object covers all expressions in a list.
+ * ============================================================================
+ * 【中文注释】stat_covers_expressions —— 统计对象是否覆盖全部表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判断统计对象是否定义了列表中所有的表达式（即每个表达式都能在对象中找到）。
  *
- * Returns true if all expressions are covered.  If expr_idxs is non-NULL, it
- * is populated with the indexes of the expressions found.
+ * 参数：
+ *   stat     - 统计对象信息。
+ *   exprs    - 待检查的表达式列表。
+ *   expr_idxs- 可选输出参数：收集所有表达式在对象中的下标位图。
+ *
+ * 返回值：
+ *   bool - 全部覆盖返回 true，否则 false。
+ *
+ * 设计思想：
+ *   逐个调用 stat_find_expression() 匹配；任一个找不到即返回 false。
+ * ============================================================================
  */
 static bool
 stat_covers_expressions(StatisticExtInfo *stat, List *exprs,
@@ -1279,22 +1587,33 @@ stat_covers_expressions(StatisticExtInfo *stat, List *exprs,
 }
 
 /*
- * choose_best_statistics
- *		Look for and return statistics with the specified 'requiredkind' which
- *		have keys that match at least two of the given attnums.  Return NULL if
- *		there's no match.
+ * ============================================================================
+ * 【中文注释】choose_best_statistics —— 挑选最适合当前子句的统计对象
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在给定列表中查找具有 requiredkind 种类、且其 keys（列）能匹配至少两个给定
+ *   属性/表达式的统计对象，返回其中"最合适"的一个；找不到返回 NULL。
  *
- * The current selection criteria is very simple - we choose the statistics
- * object referencing the most attributes in covered (and still unestimated
- * clauses), breaking ties in favor of objects with fewer keys overall.
+ * 参数：
+ *   stats         - 候选统计对象列表。
+ *   requiredkind  - 需要的统计种类。
+ *   inh           - 是否针对继承树（用于加载统计）。
+ *   clause_attnums- 每个子句覆盖的属性位图数组；NULL 元素表示该子句不兼容或已被
+ *                   估计。
+ *   clause_exprs  - 每个子句匹配到的表达式列表。
+ *   nclauses      - 子句个数。
  *
- * The clause_attnums is an array of bitmaps, storing attnums for individual
- * clauses. A NULL element means the clause is either incompatible or already
- * estimated.
+ * 返回值：
+ *   StatisticExtInfo* - 选中的统计对象；无匹配时 NULL。
  *
- * XXX If multiple statistics objects tie on both criteria, then which object
- * is chosen depends on the order that they appear in the stats list. Perhaps
- * further tiebreakers are needed.
+ * 设计思想：
+ *   选择准则很简单：
+ *   目标1【最大化】：统计对象在"被覆盖且尚未估计"的子句中引用的属性数最多；
+ *   目标2【最小化】：平局时选 keys（列+表达式）总数更少的对象。
+ *   实现为贪心扫描：计算每个对象匹配的子句属性并集大小，按上述两级目标比较。
+ *   XXX 若多个对象两项都打平，则选中的是列表中先出现的那个；未来可能需要更多
+ *   平局裁决规则。
+ * ============================================================================
  */
 StatisticExtInfo *
 choose_best_statistics(List *stats, char requiredkind, bool inh,
@@ -1379,44 +1698,36 @@ choose_best_statistics(List *stats, char requiredkind, bool inh,
 }
 
 /*
- * statext_is_compatible_clause_internal
- *		Determines if the clause is compatible with MCV lists.
+ * ============================================================================
+ * 【中文注释】statext_is_compatible_clause_internal —— 判断子句是否适用于 MCV（内部）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   递归检查一个子句是否可用于 MCV 列表的选择性估算。兼容的子句必须是"由受支持
+ *   的子句组合而成"，这些子句由 Var 或子表达式（能精确匹配统计对象中表达式的
+ *   表达式）构成。函数同时提取出需要与统计匹配的所有子表达式。
  *
- * To be compatible, the given clause must be a combination of supported
- * clauses built from Vars or sub-expressions (where a sub-expression is
- * something that exactly matches an expression found in statistics objects).
- * This function recursively examines the clause and extracts any
- * sub-expressions that will need to be matched against statistics.
+ * 参数：
+ *   clause - 待检查的（子）子句（裸子句，不是 RestrictInfo）。
+ *   relid  - 子句中所有 Var 必须属于的关系。
+ *   attnums- in/out：收集所有出现 Var 的属性号（不偏移，因此不支持系统列）。
+ *   exprs  - in/out：收集子句树中的基本子表达式。
+ *   leakproof - in/out：记录子句树是否为防泄漏的；初始应为 true，若某个 OpExpr
+ *               使用非防泄漏的操作符函数则置 false。
  *
- * Currently, we only support the following types of clauses:
+ * 返回值：
+ *   bool - 遇到确定无法处理的子句返回 false；返回 true 时可继续用 *exprs 与统计
+ *          匹配。
  *
- * (a) OpExprs of the form (Var/Expr op Const), or (Const op Var/Expr), where
- * the op is one of ("=", "<", ">", ">=", "<=")
- *
- * (b) (Var/Expr IS [NOT] NULL)
- *
- * (c) combinations using AND/OR/NOT
- *
- * (d) ScalarArrayOpExprs of the form (Var/Expr op ANY (Const)) or
- * (Var/Expr op ALL (Const))
- *
- * In the future, the range of supported clauses may be expanded to more
- * complex cases, for example (Var op Var).
- *
- * Arguments:
- * clause: (sub)clause to be inspected (bare clause, not a RestrictInfo)
- * relid: rel that all Vars in clause must belong to
- * *attnums: input/output parameter collecting attribute numbers of all
- *		mentioned Vars.  Note that we do not offset the attribute numbers,
- *		so we can't cope with system columns.
- * *exprs: input/output parameter collecting primitive subclauses within
- *		the clause tree
- * *leakproof: input/output parameter recording the leakproofness of the
- *		clause tree.  This should be true initially, and will be set to false
- *		if any operator function used in an OpExpr is not leakproof.
- *
- * Returns false if there is something we definitively can't handle.
- * On true return, we can proceed to match the *exprs against statistics.
+ * 设计思想（支持的子句类型）：
+ *   (a) OpExpr：(Var/Expr op Const) 或 (Const op Var/Expr)，op 为 =、<、>、>=、<=；
+ *   (b) (Var/Expr IS [NOT] NULL)；
+ *   (c) AND / OR / NOT 组合（递归展开，NOT 反转 leakproof 语义并调换等值处理）；
+ *   (d) ScalarArrayOpExpr：(Var/Expr op ANY (Const)) 或 (Var/Expr op ALL (Const))，
+ *       数组展开后要求元素为等值比较。
+ *   其余类型一律当作"裸表达式"加入 exprs，交由上层决定是否匹配（对简单 Var 要
+ *   校验其属于 relid 且非系统列/整行）。
+ *   （未来可能扩展支持更复杂的情况，例如 (Var op Var)。）
+ * ============================================================================
  */
 static bool
 statext_is_compatible_clause_internal(PlannerInfo *root, Node *clause,
@@ -1626,24 +1937,28 @@ statext_is_compatible_clause_internal(PlannerInfo *root, Node *clause,
 }
 
 /*
- * statext_is_compatible_clause
- *		Determines if the clause is compatible with MCV lists.
+ * ============================================================================
+ * 【中文注释】statext_is_compatible_clause —— 判断子句是否适用于 MCV（外层封装）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 statext_is_compatible_clause_internal() 规则相同，但这一层处理 RestrictInfo
+ *   外包装，并做权限检查，确认允许查看子句提到的所有 Var 的列。
  *
- * See statext_is_compatible_clause_internal, above, for the basic rules.
- * This layer deals with RestrictInfo superstructure and applies permissions
- * checks to verify that it's okay to examine all mentioned Vars.
+ * 参数：
+ *   clause - 待检查的子句（RestrictInfo 形式）。
+ *   relid  - 子句中所有 Var 必须属于的关系。
+ *   attnums- in/out：收集所有出现 Var 的属性号。
+ *   exprs  - in/out：收集子句树中的基本子表达式。
  *
- * Arguments:
- * clause: clause to be inspected (in RestrictInfo form)
- * relid: rel that all Vars in clause must belong to
- * *attnums: input/output parameter collecting attribute numbers of all
- *		mentioned Vars.  Note that we do not offset the attribute numbers,
- *		so we can't cope with system columns.
- * *exprs: input/output parameter collecting primitive subclauses within
- *		the clause tree
+ * 返回值：
+ *   bool - 遇到无法处理的子句返回 false；返回 true 时可继续匹配。
  *
- * Returns false if there is something we definitively can't handle.
- * On true return, we can proceed to match the *exprs against statistics.
+ * 设计思想：
+ *   1. 拆开 RestrictInfo 取 clause，剥离伪常量。
+ *   2. 委托内部函数完成结构兼容性判断。
+ *   3. 若收集到了 attnums/exprs，用 pull_varattnos() 从这些节点再收集属性号，并
+ *      调用 all_rows_selectable() 校验用户对这些列有 SELECT 权限（防信息泄漏）。
+ * ============================================================================
  */
 static bool
 statext_is_compatible_clause(PlannerInfo *root, Node *clause, Index relid,
@@ -1744,38 +2059,32 @@ statext_is_compatible_clause(PlannerInfo *root, Node *clause, Index relid,
 }
 
 /*
- * statext_mcv_clauselist_selectivity
- *		Estimate clauses using the best multi-column statistics.
+ * ============================================================================
+ * 【中文注释】statext_mcv_clauselist_selectivity —— 用 MCV 统计估计子句列表选择性
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   使用表上可用的多列 MCV 统计来估计子句列表的选择性。若存在多个可用统计对象，
+ *   采用贪心策略：每轮选择"从子句中提取并被其覆盖的属性数最多"的统计对象进行
+ *   估算，然后对剩余子句重复，直到没有可用的统计。
  *
- * Applies available extended (multi-column) statistics on a table. There may
- * be multiple applicable statistics (with respect to the clauses), in which
- * case we use greedy approach. In each round we select the best statistic on
- * a table (measured by the number of attributes extracted from the clauses
- * and covered by it), and compute the selectivity for the supplied clauses.
- * We repeat this process with the remaining clauses (if any), until none of
- * the available statistics can be used.
+ * 参数：
+ *   root / varRelid / jointype / sjinfo / rel - 规划上下文。
+ *   estimatedclauses - in/out 位图：对本函数估算过的子句（按 0 基下标）置位，
+ *                      同时跳过已有位的子句。
+ *   is_or - 子句是否为 OR 连接。
  *
- * One of the main challenges with using MCV lists is how to extrapolate the
- * estimate to the data not covered by the MCV list. To do that, we compute
- * not only the "MCV selectivity" (selectivities for MCV items matching the
- * supplied clauses), but also the following related selectivities:
+ * 返回值：
+ *   Selectivity - 估计的选择性。
  *
- * - simple selectivity:  Computed without extended statistics, i.e. as if the
- * columns/clauses were independent.
- *
- * - base selectivity:  Similar to simple selectivity, but is computed using
- * the extended statistic by adding up the base frequencies (that we compute
- * and store for each MCV item) of matching MCV items.
- *
- * - total selectivity: Selectivity covered by the whole MCV list.
- *
- * These are passed to mcv_combine_selectivities() which combines them to
- * produce a selectivity estimate that makes use of both per-column statistics
- * and the multi-column MCV statistics.
- *
- * 'estimatedclauses' is an input/output parameter.  We set bits for the
- * 0-based 'clauses' indexes we estimate for and also skip clause items that
- * already have a bit set.
+ * 设计思想（MCV 外推问题）：
+ *   使用 MCV 列表的难点在于把估计外推到 MCV 未覆盖的数据。为此不仅计算"MCV
+ *   选择性"（匹配子句的 MCV 项频率之和），还计算：
+ *   - simple 选择性：不使用扩展统计、假设列/子句独立时得到的选择性；
+ *   - base 选择性：与 simple 类似，但用扩展统计计算——把匹配 MCV 项的
+ *     base_frequency（构建时算好并存下）累加；
+ *   - total 选择性：整个 MCV 列表覆盖的选择性。
+ *   三者交给 mcv_combine_selectivities() 合成，兼顾单列统计与多列 MCV 统计。
+ * ============================================================================
  */
 static Selectivity
 statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varRelid,
@@ -2061,8 +2370,30 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 }
 
 /*
- * statext_clauselist_selectivity
- *		Estimate clauses using the best multi-column statistics.
+ * ============================================================================
+ * 【中文注释】statext_clauselist_selectivity —— 用最佳多列统计估计子句列表选择性
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对给定子句列表，先用多变量 MCV 列表估算（对每个适用的统计对象），再用函数
+ *   依赖统计补充估算剩余子句，返回综合选择性。这是规划器在 clauselist_selectivity
+ *   中调用扩展统计的主入口。
+ *
+ * 参数：
+ *   root / varRelid / jointype / sjinfo / rel - 规划上下文。
+ *   estimatedclauses - in/out 位图：已被估算的子句下标置位，避免重复估算。
+ *   is_or - 子句是否为 OR 连接。
+ *
+ * 返回值：
+ *   Selectivity - 估计的选择性（初始为 1.0，依次与各统计的估计相乘）。
+ *
+ * 设计思想：
+ *   1. 先调用 statext_mcv_clauselist_selectivity() 用 MCV 统计估算（该函数内部会
+ *      用 mcv_combine_selectivities() 结合单列统计与 MCV 修正）。
+ *   2. 再用 dependencies_clauselist_selectivity() 用函数依赖统计估算——MCV 与
+ *      函数依赖互补：MCV 能给出两列取值的精确选择性，函数依赖只反映依赖的整体
+ *      强度。
+ *   3. 每步都通过 estimatedclauses 标记已估算子句，避免重复计算。
+ * ============================================================================
  */
 Selectivity
 statext_clauselist_selectivity(PlannerInfo *root, List *clauses, int varRelid,
@@ -2104,16 +2435,26 @@ statext_clauselist_selectivity(PlannerInfo *root, List *clauses, int varRelid,
 }
 
 /*
- * examine_opclause_args
- *		Split an operator expression's arguments into Expr and Const parts.
+ * ============================================================================
+ * 【中文注释】examine_opclause_args —— 拆解操作符子句的参数（Expr 与 Const）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   尝试把操作符表达式的参数匹配为 (Expr op Const) 或 (Const op Expr) 两种形态
+ *   （上层可能包着 RelabelType）。匹配成功返回 true，否则 false。
  *
- * Attempts to match the arguments to either (Expr op Const) or (Const op
- * Expr), possibly with a RelabelType on top. When the expression matches this
- * form, returns true, otherwise returns false.
+ * 参数：
+ *   args        - OpExpr 的参数列表（两个参数）。
+ *   exprp       - 可选输出：提取出的表达式节点。
+ *   cstp        - 可选输出：提取出的常量节点。
+ *   expronleftp - 可选输出：表达式是否在操作符左边。
  *
- * Optionally returns pointers to the extracted Expr/Const nodes, when passed
- * non-null pointers (exprp, cstp and expronleftp). The expronleftp flag
- * specifies on which side of the operator we found the expression node.
+ * 返回值：
+ *   bool - 参数符合上述形态返回 true，否则 false。
+ *
+ * 设计思想：
+ *   去掉 RelabelType（二进制兼容的重标注）后，检查两个操作数是否一个是表达式而
+ *   另一个是常量（不要求顺序）；把常量放在固定一侧便于后续统一比较。
+ * ============================================================================
  */
 bool
 examine_opclause_args(List *args, Node **exprp, Const **cstp,
@@ -2168,7 +2509,30 @@ examine_opclause_args(List *args, Node **exprp, Const **cstp,
 
 
 /*
- * Compute statistics about expressions of a relation.
+ * ============================================================================
+ * 【中文注释】compute_expr_stats —— 计算关系的表达式统计
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对统计对象定义的全部表达式，用采样行逐行计算表达式的值，然后调用各表达式
+ *   类型的 compute_stats（由 typanalyze 设置）完成单表达式统计。
+ *
+ * 参数：
+ *   onerel   - 目标关系。
+ *   exprdata - 每个表达式的分析数据（含 VacAttrStats 与表达式）。
+ *   nexprs   - 表达式个数。
+ *   rows     - 采样元组数组。
+ *   numrows  - 采样行数。
+ *
+ * 返回值：无。
+ *
+ * 设计思想：
+ *   1. 为表达式求值创建独立内存上下文，用 EState/ExprContext 逐行求值所有表达式，
+ *      结果放入 exprdata[i].exprvals/exprnulls（按行×表达式个数排布）。
+ *   2. 由于表达式统计不直接挂在列上，需要"伪造" fetch 函数（expr_fetch_func）
+ *      从 Datum 数组取数据，代替通常的元组列取数。
+ *   3. 收集足够行数后，对每个表达式调用其 compute_stats 计算统计，并释放求值
+ *      上下文。
+ * ============================================================================
  */
 static void
 compute_expr_stats(Relation onerel, AnlExprData *exprdata, int nexprs,
@@ -2308,10 +2672,25 @@ compute_expr_stats(Relation onerel, AnlExprData *exprdata, int nexprs,
 
 
 /*
- * Fetch function for analyzing statistics object expressions.
+ * ============================================================================
+ * 【中文注释】expr_fetch_func —— 表达式统计的"取数"函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为表达式统计的 compute_stats 提供取数回调：从 Datum 数组直接取第 rownum 行
+ *   的值，而不是构造元组再取列。
  *
- * We have not bothered to construct tuples from the data, instead the data
- * is just in Datum arrays.
+ * 参数：
+ *   stats  - VacAttrStats（含 exprvals/exprnulls/rowstride）。
+ *   rownum - 行号。
+ *   isNull - 输出参数：该值是否 NULL。
+ *
+ * 返回值：
+ *   Datum - 该行该表达式的值。
+ *
+ * 设计思想：
+ *   exprvals/exprnulls 已按列偏移排布（每行 stride 个值），直接用
+ *   i = rownum * rowstride 定位。
+ * ============================================================================
  */
 static Datum
 expr_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull)
@@ -2325,9 +2704,24 @@ expr_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull)
 }
 
 /*
- * Build analyze data for a list of expressions. As this is not tied
- * directly to a relation (table or index), we have to fake some of
- * the fields in examine_expression().
+ * ============================================================================
+ * 【中文注释】build_expr_data —— 为表达式列表构建分析数据
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对统计对象的所有表达式逐一调用 examine_expression() 构建 VacAttrStats，
+ *   组装成 AnlExprData 数组返回。
+ *
+ * 参数：
+ *   exprs     - 表达式列表。
+ *   stattarget- 统计目标（透传给 examine_expression）。
+ *
+ * 返回值：
+ *   AnlExprData* - 长度为表达式个数的数组。
+ *
+ * 设计思想：
+ *   表达式统计不直接绑定关系（表/索引），因此 examine_expression() 里有些字段是
+ *   伪造的（如 tupattnum=InvalidAttrNumber）。
+ * ============================================================================
  */
 static AnlExprData *
 build_expr_data(List *exprs, int stattarget)
@@ -2353,7 +2747,30 @@ build_expr_data(List *exprs, int stattarget)
 	return exprdata;
 }
 
-/* form an array of pg_statistic rows (per update_attstats) */
+/*
+ * ============================================================================
+ * 【中文注释】serialize_expr_stats —— 把表达式统计序列化为 pg_statistic 行数组
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对每个表达式，把计算好的统计按 update_attstats() 的方式构造为一条
+ *   pg_statistic 元组（复合类型），最后聚合成一个数组 Datum，供写入
+ *   pg_statistic_ext_data.stxdexpr。
+ *
+ * 参数：
+ *   exprdata - 表达式分析数据数组。
+ *   nexprs   - 表达式个数。
+ *
+ * 返回值：
+ *   Datum - 以 pg_statistic 复合类型构成的数组。
+ *
+ * 设计思想：
+ *   1. 打开 pg_statistic 并取其复合类型 OID（pg_statistic[]）。
+ *   2. 对每个表达式：starelid 用统计对象 OID 无效化处理（表达式不挂具体列），
+ *      staattnum 用 1..nexprs 序号标识，stainherit 为 false；stavalues1..5 等由
+ *      表达式统计里的 stavalues 复制，同时记录 nulls。
+ *   3. 逐条 heap_form_tuple 构造 pg_statistic 元组并聚成数组。
+ * ============================================================================
+ */
 static Datum
 serialize_expr_stats(AnlExprData *exprdata, int nexprs)
 {
@@ -2481,11 +2898,27 @@ serialize_expr_stats(AnlExprData *exprdata, int nexprs)
 }
 
 /*
- * Loads pg_statistic record from expression statistics for expression
- * identified by the supplied index.
+ * ============================================================================
+ * 【中文注释】statext_expressions_load —— 加载某表达式的 pg_statistic 记录
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从 pg_statistic_ext_data.stxdexpr（表达式统计数组）中取出第 idx 个表达式
+ *   对应的 pg_statistic 记录。
  *
- * Returns the pg_statistic record found, or NULL if there is no statistics
- * data to use.
+ * 参数：
+ *   stxoid - 统计对象 OID。
+ *   inh    - 是否针对继承树。
+ *   idx    - 表达式序号。
+ *
+ * 返回值：
+ *   HeapTuple - 对应的 pg_statistic 记录；没有可用统计时返回 NULL。
+ *
+ * 设计思想：
+ *   1. 按 syscache（STATEXTDATASTXOID）取 stxdexpr 列（ExpandedArrayHeader）。
+ *   2. 若列为 NULL 或长度不足（下标越界）返回 NULL。
+ *   3. 取第 idx 个元素，若该元素为 NULL 返回 NULL；否则把元素展开为 HeapTupleHeader
+ *      并组装成 HeapTupleData 返回（注意展开内存生命周期由调用方/上下文管理）。
+ * ============================================================================
  */
 HeapTuple
 statext_expressions_load(Oid stxoid, bool inh, int idx)
@@ -2537,9 +2970,33 @@ statext_expressions_load(Oid stxoid, bool inh, int idx)
 }
 
 /*
- * Evaluate the expressions, so that we can use the results to build
- * all the requested statistics types. This matters especially for
- * expensive expressions, of course.
+ * ============================================================================
+ * 【中文注释】make_build_data —— 评估表达式并构建统计构建数据
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为构建一个统计对象的所有请求类型准备 StatsBuildData：把普通列的值与所有
+ *   表达式的求值结果组织成统一的按"行×列"排布的 Datum 数组，供 ndistinct/
+ *   dependencies/MCV 各构建函数使用。
+ *
+ * 参数：
+ *   rel        - 目标关系。
+ *   stat       - 统计对象信息（含列位图与表达式）。
+ *   numrows    - 采样行数。
+ *   rows       - 采样元组数组。
+ *   stats      - 各列/表达式的 VacAttrStats 数组。
+ *   stattarget - 统计目标。
+ *
+ * 返回值：
+ *   StatsBuildData* - 构建好的数据。
+ *
+ * 设计思想：
+ *   1. 若对象有表达式，用 EState/ExprContext 对每行求值所有表达式（结果集中存
+ *      exprvals/exprnulls），昂贵表达式只求值一次即可供所有统计类型复用。
+ *   2. result 里各字段：nattnums（列+表达式总数）、attnums（列号，表达式为负）、
+ *      numrows、stats 数组、typcache（各列 typcache 条目）、values/isnull（列值）、
+ *      exprvals/exprnulls（表达式值）等。
+ *   3. 单列值也统一拷贝进 values/isnull，方便下游统一用 SortItem 处理。
+ * ============================================================================
  */
 static StatsBuildData *
 make_build_data(Relation rel, StatExtEntry *stat, int numrows, HeapTuple *rows,
