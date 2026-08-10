@@ -2418,36 +2418,46 @@ map_variable_attnos(Node *node,
 
 
 /*
- * ReplaceVarsFromTargetList - replace Vars with items from a targetlist
+ * ============================================================================
+ * 【中文注释】ReplaceVarsFromTargetList —— 用目标列表中的项替换 Var（对外入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历（并拷贝）查询/表达式树，把引用 target_varno 且处于指定层的 Var 替换为
+ *   targetlist 中 resno 匹配的项；整行 Var 展开为 RowExpr；处理 OLD/NEW RETURNING
+ *   语义与未命中选项。这是视图展开与规则动作（尤其 UPDATE/DELETE 的 NEW/OLD
+ *   替换）的重要基础工具。
  *
- * Vars matching target_varno and sublevels_up are replaced by the
- * entry with matching resno from targetlist, if there is one.
+ * 参数：
+ *   node             - 树根（Query 或表达式）。
+ *   target_varno     - 要被替换的 RTE 编号。
+ *   sublevels_up     - 目标查询层。
+ *   target_rte       - 目标 RTE（用于展开整行 Var 的列清单）。
+ *   targetlist       - 提供替换项的 SELECT 目标列表。
+ *   result_relation  - 改写后查询中结果关系的编号（处理 OLD/NEW RETURNING Var 用；
+ *                      非 DML 场景可传 0）。
+ *   nomatch_option   - 未命中时的策略（见下）。
+ *   nomatch_varno    - REPLACEVARS_CHANGE_VARNO 时要改成的编号。
+ *   outer_hasSubLinks- 同 replace_rte_variables。
  *
- * If there is no matching resno for such a Var, the action depends on the
- * nomatch_option:
- *	REPLACEVARS_REPORT_ERROR: throw an error
- *	REPLACEVARS_CHANGE_VARNO: change Var's varno to nomatch_varno
- *	REPLACEVARS_SUBSTITUTE_NULL: replace Var with a NULL Const of same type
+ * 返回值：
+ *   Node* - 替换后的新树。
  *
- * The caller must also provide target_rte, the RTE describing the target
- * relation.  This is needed to handle whole-row Vars referencing the target.
- * We expand such Vars into RowExpr constructs.
- *
- * In addition, for INSERT/UPDATE/DELETE/MERGE queries, the caller must
- * provide result_relation, the index of the result relation in the rewritten
- * query.  This is needed to handle OLD/NEW RETURNING list Vars referencing
- * target_varno.  When such Vars are expanded, their varreturningtype is
- * copied onto any replacement Vars referencing result_relation.  In addition,
- * if the replacement expression from the targetlist is not simply a Var
- * referencing result_relation, it is wrapped in a ReturningExpr node (causing
- * the executor to return NULL if the OLD/NEW row doesn't exist).
- *
- * Note that ReplaceVarFromTargetList always generates the replacement
- * expression with varlevelsup = 0.  The caller is responsible for adjusting
- * the varlevelsup if needed.  This simplifies the caller's life if it wants to
- * cache the replacement expressions.
- *
- * outer_hasSubLinks works the same as for replace_rte_variables().
+ * 设计思想：
+ *   1. 未命中策略（nomatch_option）：
+ *      - REPORT_ERROR：直接报错（默认最严格）。
+ *      - CHANGE_VARNO：把 Var 的 varno 改为 nomatch_varno（用于把对 OLD 的引用
+ *        改到 OLD 对应 RTE、对 NEW 改到结果关系等）。
+ *      - SUBSTITUTE_NULL：用同类型 NULL 常量替换（含域类型需包 CoerceToDomain，
+ *        防止违反 NOT NULL 域约束）。
+ *   2. 整行 Var：通过 expandRTE 展开成各列 Var 的 RowExpr；命名行类型（普通表）
+ *      要补丢弃列的哑元项，RECORD 类型（JOIN 结果）则省略并附列名。生成结果
+ *      统一用 varlevelsup=0，调用方按需再提升——便于缓存替换表达式。
+ *   3. OLD/NEW RETURNING 语义：若被替换 Var 的 varreturningtype 非默认，把该标记
+ *      传播到引用 result_relation 的替换 Vars；若替换表达式不是"直接引用结果关系
+ *      的 Var"，包一层 ReturningExpr，使 executor 在 OLD/NEW 行不存在时返回 NULL。
+ *   4. 特殊检查：替换项里若含 PARAM_MULTIEXPR 则报错——ON UPDATE 规则里 NEW 引用
+ *      的列若属于原 UPDATE 的多值赋值（行式赋值），无法安全展开，按未实现处理。
+ * ============================================================================
  */
 
 typedef struct
@@ -2459,6 +2469,30 @@ typedef struct
 	int			nomatch_varno;
 } ReplaceVarsFromTargetList_context;
 
+/*
+ * ============================================================================
+ * 【中文注释】ReplaceVarsFromTargetList_callback —— 适配 replace_rte_variables 的回调
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 ReplaceVarFromTargetList 包装成 replace_rte_variables 需要的回调：对每个
+ *   命中的 Var 生成替换表达式，并修正 varlevelsup。
+ *
+ * 参数：
+ *   var     - 命中的 Var。
+ *   context - replace_rte_variables 的上下文，其 callback_arg 指向
+ *             ReplaceVarsFromTargetList_context。
+ *
+ * 返回值：
+ *   Node* - 替代表达式。
+ *
+ * 设计思想：
+ *   1. 从 context->callback_arg 解出 ReplaceVarsFromTargetList_context，然后委托
+ *      ReplaceVarFromTargetList 完成真正的替换逻辑。
+ *   2. 关键一步：ReplaceVarFromTargetList 生成的表达式 varlevelsup 固定为 0；若被
+ *      替换的 Var 位于子查询里（var->varlevelsup > 0），这里用
+ *      IncrementVarSublevelsUp 把替换表达式整体提升到对应层数，保证引用层级正确。
+ * ============================================================================
+ */
 static Node *
 ReplaceVarsFromTargetList_callback(const Var *var,
 								   replace_rte_variables_context *context)
@@ -2480,6 +2514,41 @@ ReplaceVarsFromTargetList_callback(const Var *var,
 	return newnode;
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】ReplaceVarFromTargetList —— 单个 Var 的目标列表替换（核心）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为一个 Var 生成其替换表达式：普通列去 targetlist 中按 resno 找对应项；整行
+ *   Var 展开为 RowExpr 并逐字段递归替换；同时处理未命中策略与 OLD/NEW RETURNING
+ *   语义。生成的表达式 varlevelsup 恒为 0（由调用方负责提升）。
+ *
+ * 参数：
+ *   var            - 待替换的 Var。
+ *   target_rte     - 目标 RTE（展开整行 Var 需要其列定义）。
+ *   targetlist     - 提供替换项的列表。
+ *   result_relation- 结果关系编号（RETURNING 语义用）。
+ *   nomatch_option - 未命中策略。
+ *   nomatch_varno  - CHANGE_VARNO 时的目标编号。
+ *
+ * 返回值：
+ *   Node* - 替换表达式。
+ *
+ * 设计思想：
+ *   1. 整行 Var（varattno == InvalidAttrNumber）：调用 expandRTE 展开成逐列 Var
+ *      列表。命名行类型（普通表 RTE）须含丢弃列哑元项；RECORD 类型（JOIN）省略
+ *      并附带列名。展开出的每个字段 Var 再递归调用本函数处理（这样字段级也可能
+ *      命中/未命中），最后组装成 RowExpr。展开时把 varreturningtype 复制到每个
+ *      字段 Var 上保证后续递归语义正确；需要时再包 ReturningExpr。
+ *   2. 普通列：get_tle_by_resno 找 resno 匹配的 TargetEntry；找不到或该项是
+ *      resjunk（内部条目）时按 nomatch_option 处理。找到时复制 tle->expr 返回，
+ *      并检查其中的 MULTIEXPR 参数（见上）。
+ *   3. 缓存友好设计：所有输出 varlevelsup=0，调用方可放心缓存（如视图展开中
+ *      对每个列的替换结果）。
+ *   4. 域类型注意：SUBSTITUTE_NULL 时若 Var 是域类型，用 coerce_null_to_domain
+ *      保证 NULL 满足域的 NOT NULL 约束检查结构。
+ * ============================================================================
+ */
 Node *
 ReplaceVarFromTargetList(const Var *var,
 						 RangeTblEntry *target_rte,
@@ -2649,6 +2718,35 @@ ReplaceVarFromTargetList(const Var *var,
 	}
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】ReplaceVarsFromTargetList —— 对整棵树执行目标列表替换（入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对外入口：把整个查询/表达式树中引用 target_varno 的 Var 替换为 targetlist
+ *   中对应项，具体策略见 ReplaceVarFromTargetList 与 ReplaceVarsFromTargetList
+ *   上方的注释。本质上就是把 replace_rte_variables 与上述回调组合起来。
+ *
+ * 参数：
+ *   node             - 树根。
+ *   target_varno     - 目标 RTE 编号。
+ *   sublevels_up     - 目标查询层。
+ *   target_rte       - 目标 RTE。
+ *   targetlist       - 替换项列表。
+ *   result_relation  - 结果关系编号。
+ *   nomatch_option   - 未命中策略。
+ *   nomatch_varno    - CHANGE_VARNO 目标编号。
+ *   outer_hasSubLinks- 同 replace_rte_variables。
+ *
+ * 返回值：
+ *   Node* - 替换后的新树。
+ *
+ * 设计思想：
+ *   薄封装：初始化 context 后直接调用 replace_rte_variables，把
+ *   ReplaceVarsFromTargetList_callback 与 context 一起传入。所有复杂的遍历、
+ *   层数维护、hasSubLinks 回填逻辑都复用 replace_rte_variables。
+ * ============================================================================
+ */
 Node *
 ReplaceVarsFromTargetList(Node *node,
 						  int target_varno, int sublevels_up,
