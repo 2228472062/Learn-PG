@@ -7,6 +7,39 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件是查询优化器的"路径节点"(Path)工厂,负责创建、维护、比较与裁剪
+ * 各种访问路径(Path)。路径是"尚未执行的具体方案",每个 Path 记录一种把
+ * 某关系扫描出来、或把若干关系连接起来的候选做法及其估计代价,供动态规划
+ * 的 join 搜索(见 optimizer/geqo、optimizer/joinpath)逐层挑选。
+ *
+ * 【主要职责】
+ * - 路径代价比较:compare_path_costs / compare_fractional_path_costs /
+ *   compare_path_costs_fuzzily 给出"启动代价优先 / 总代价优先 / 模糊相等"
+ *   的比较语义,是路径去重与择优的基础;
+ * - 路径集维护:set_cheapest 选出 parent_rel 中最便宜的启动/总代价路径,
+ *   add_path 把新路径加入路径表并修剪被支配路径(add_path_precheck 提供
+ *   免构造的快速预筛),add_partial_path 对应并行 partial 路径;
+ * - 各类扫描路径工厂:create_seqscan_path / create_index_path /
+ *   create_bitmap_*_path / create_tidscan_path / create_append_path /
+ *   create_material_path 等,每种访问方法一个工厂,内部填充 Path 结构并
+ *   调用 cost_* 函数估算代价;
+ * - 连接路径工厂:create_nestloop_path / create_mergejoin_path /
+ *   create_hashjoin_path,分别对应三种连接实现,借助 cost_nestloop 等
+ *   cost 模块计算代价并记录 required_outer(参数化所需外层 rels);
+ * - 上层(Upper)路径工厂:create_projection_path / create_sort_path /
+ *   create_group_path / create_agg_path / create_windowagg_path /
+ *   create_setop_path / create_limit_path 等,对应查询处理树中排序、分组、
+ *   聚合、窗口、集合操作、LIMIT 等"扫描/连接之后"的处理阶段;
+ * - 子路径重参数化:reparameterize_path / reparameterize_path_by_child 把
+ *   路径按新的 required_outer 或按 child rel 重新生成,配合参数化 NestLoop
+ *   与分区裁剪使用。
+ *
+ * 文件整体约定:绝大多数工厂函数形如 create_*_path(root, rel, ...):
+ * 先 makeNode 分配对应 Path 子类节点,逐字段赋值,再调用 set_cheapest /
+ * add_path 把结果交给上层;路径去重与支配关系由 add_path 依据
+ * compare_path_costs_fuzzily 的模糊比较统一处理。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/util/pathnode.c
  *

@@ -5668,6 +5668,10 @@ get_relids_for_join(Query *query, int joinrelid)
 }
 
 /*
+ * find_jointree_node_for_rel: locate jointree node for a base or join RT index
+ *
+ * Returns NULL if not found
+ */
 /*
  * find_jointree_node_for_rel - (中文)在连接树中定位包含指定 RT 索引的节点
  *
@@ -5729,6 +5733,12 @@ find_jointree_node_for_rel(Node *jtnode, int relid)
 }
 
 /*
+ * get_nullingrels: collect info about which outer joins null which relations
+ *
+ * The result struct contains, for each leaf relation used in the query,
+ * the set of relids of outer joins that potentially null that rel.
+ */
+/*
  * get_nullingrels - (中文)收集"哪些外连接会置空哪些关系"的信息
  *
  * 【作用】为每个在查询中使用的叶子关系记录"可能把它置空的外连接 relid
@@ -5754,6 +5764,15 @@ get_nullingrels(Query *parse)
 	return result;
 }
 
+/*
+ * Recursive guts of get_nullingrels().
+ *
+ * Note: at any recursion level, the passed-down upper_nullingrels must be
+ * treated as a constant, but it can be stored directly into *info
+ * if we're at leaf level.  Upper recursion levels do not free their mutated
+ * copies of the nullingrels, because those are probably referenced by
+ * at least one leaf rel.
+ */
 /*
  * get_nullingrels_recurse - (中文)get_nullingrels 的递归核心
  *

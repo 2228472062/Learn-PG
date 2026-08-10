@@ -7,6 +7,35 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件负责"关系节点"(RelOptInfo)的建立与查找,是优化器表示"一组基表
+ * 的某种组合"的统一数据结构的核心。RelOptInfo 既代表单个基表/子查询等
+ * 扫描源(baserel / otherrel),也代表若干关系的连接结果(joinrel),还代表
+ * 扫描与连接之后的处理阶段(upper rel,如排序、聚合)。
+ *
+ * 【主要职责】
+ * - 基表关系构建:build_simple_rel 按 RT 索引建立 RelOptInfo(含属性范围、
+ *   统计信息、分区信息等),支持把继承/分区子表作为 otherrel 挂到父关系下;
+ *   setup_simple_rel_arrays / expand_planner_arrays 维护按 RT 索引快速定位
+ *   基表与 AppendRelInfo 的数组;
+ * - 连接关系构建:build_join_rel 为给定 relids 集合建立 joinrel:构造目标列
+ *   (build_joinrel_tlist)、汇总限制与连接条件(build_joinrel_restrictlist /
+ *   build_joinrel_joinlist)、估算行数、记录并行/外键/分区属性;find_join_rel
+ *   负责按 relids 集合查(数量多时自动切换到哈希表 build_join_rel_hash);
+ * - 分区连接支持:build_joinrel_partition_info / have_partkey_equi_join /
+ *   match_expr_to_partition_keys / set_joinrel_partition_key_exprs 判断能否
+ *   做 partitionwise join 并记录连接关系的分区键表达式;
+ * - 参数化路径支持:get_baserel_parampathinfo / get_joinrel_parampathinfo /
+ *   get_appendrel_parampathinfo 为参数化路径建立 ParamPathInfo(缓存行数、
+ *   下推子句与 enforcement 序列号),find_param_path_info 做复用查找;
+ * - 主动聚合(eager aggregation):create_rel_agg_info /
+ *   eager_aggregation_possible_for_relation / init_grouping_targets 等判断
+ *   能否把部分聚合下推到某关系层并构造分组目标。
+ *
+ * 文件整体约定:基表与连接关系的所有字段在建立时逐个初始化;find_* 系列
+ * 查找失败时按需 elog(ERROR);对外暴露的构建接口(build_* / fetch_* /
+ * get_* / find_* / create_rel_agg_info)与内部 static 辅助函数分层清晰。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/util/relnode.c
  *
@@ -111,6 +140,23 @@ static Index get_expression_sortgroupref(PlannerInfo *root, Expr *expr);
  *	  and AppendRelInfos.
  */
 void
+/*
+ * setup_simple_rel_arrays - (中文)准备按 RT 索引快速访问基表的数组
+ *
+ * 【作用】初始化 PlannerInfo 中三个并行数组:simple_rel_array(按 relid 存放
+ * RelOptInfo,先全部置 NULL,后续由 build_simple_rel 填充)、simple_rte_array
+ * (按 relid 存放 RangeTblEntry)、append_rel_array(按 child_relid 存放
+ * AppendRelInfo)。
+ *
+ * 【设计思想】RT 索引从 1 开始,故数组长度取 rtable 长度 + 1,下标 0 位置
+ * 留空(relid 0 不代表任何真实关系,上层可约定特殊用途)。append_rel_array
+ * 仅在存在 AppendRelInfo(例如 UNION ALL 扁平化产生的)时才分配,避免没有
+ * 继承/分区时的内存浪费;后续继承展开代码负责向该数组补充新条目。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文,其 parse->rtable 提供 RT 条目来源。
+ * 【返回值】无。
+ */
 setup_simple_rel_arrays(PlannerInfo *root)
 {
 	int			size;
@@ -180,6 +226,22 @@ setup_simple_rel_arrays(PlannerInfo *root)
  * this when adding child relations, which always have AppendRelInfos.
  */
 void
+/*
+ * expand_planner_arrays - (中文)扩容 PlannerInfo 的按 RT 索引数组
+ *
+ * 【作用】把 simple_rel_array / simple_rte_array / append_rel_array 三个数组
+ * 分别扩展 add_size 个元素,并把新增条目初始化为 NULL,同时更新
+ * simple_rel_array_size。
+ *
+ * 【设计思想】继承/分区展开时子关系会引入新的 RT 索引,超出原先按 parse 时
+ * 计算的长度,因此需要动态扩容。注意:即使调用前 append_rel_array 尚未分配,
+ * 本函数也会为它分配,因为调用场景(添加子关系)必然会产生 AppendRelInfo。
+ *
+ * 【参数】
+ *   root     —— 查询规划上下文;
+ *   add_size —— 需要增加的元素个数(必须 > 0)。
+ * 【返回值】无。
+ */
 expand_planner_arrays(PlannerInfo *root, int add_size)
 {
 	int			new_size;
@@ -209,6 +271,28 @@ expand_planner_arrays(PlannerInfo *root, int add_size)
  *	  Construct a new RelOptInfo for a base relation or 'other' relation.
  */
 RelOptInfo *
+/*
+ * build_simple_rel - (中文)为基表或 otherrel(继承/分区子表)构建 RelOptInfo
+ *
+ * 【作用】根据 RT 索引 relid 在 simple_rel_array 中建立一个新的 RelOptInfo,
+ * 完成全部字段初始化:对于真实表(RTE_RELATION)从系统目录抓取统计信息
+ * (get_relation_info),其余 RTE 类型按列数设置属性范围;若 parent 非空则
+ * 表示这是继承/分区子关系(otherrel),会从父关系继承 lateral/外连接信息并
+ * 应用父关系下推的限制条件(apply_child_basequals)。返回建好的 rel。
+ *
+ * 【设计思想】本函数是基表关系节点的唯一构造点,承担"尽量一次把结构备齐"
+ * 的职责,避免后续各处再补字段。子关系把父关系的 lateral 引用(包括最小
+ * 参数化)整体继承,因为 Append 路径要求各 child 参数化一致;权限检查方面
+ * 优先用自己的 RTEPermissionInfo,子关系则回落到父关系的 userid。构建完成
+ * 后还允许插件通过 build_simple_rel_hook 对 rel 做"编辑"(如改大小、加
+ * 索引、调整 pgs_mask)。
+ *
+ * 【参数】
+ *   root   —— 查询规划上下文;
+ *   relid  —— 目标 RT 索引(1..simple_rel_array_size-1),且该位置此前必须为空;
+ *   parent —— 若非空,表示该 rel 是 parent 的继承/分区子关系(otherrel)。
+ * 【返回值】新建并已填充完毕的 RelOptInfo。
+ */
 build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 {
 	RelOptInfo *rel;
@@ -445,6 +529,24 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
  *	  simple relation.
  */
 RelOptInfo *
+/*
+ * build_simple_grouped_rel - (中文)为简单关系构建"分组版"RelOptInfo
+ *
+ * 【作用】对给定简单关系(基表或 joinrel)尝试创建其主动聚合(grouped)版本
+ * 的关系节点:先构造 RelAggInfo(create_rel_agg_info),判定该关系上做部分
+ * 聚合是否有价值,有则调用 build_grouped_rel 复制出分组关系并挂上聚合目标、
+ * 行数估计与 RelAggInfo,再记录 rel->grouped_rel 以便上层复用。
+ *
+ * 【设计思想】这是 eager aggregation(主动聚合下推)的入口之一:把聚合提前
+ * 到更底层的关系执行以压缩行数。若输入关系是 dummy(无行)、聚合信息缺失
+ * 或被认为无价值(平均组大小低于 min_eager_agg_group_size)则直接返回 NULL,
+ * 表示"本关系不做提前聚合"。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文(要求 agg_clause_list / group_expr_list 已就绪);
+ *   rel  —— 待分组的简单关系。
+ * 【返回值】建好的分组关系;无法/不值得分组时返回 NULL。
+ */
 build_simple_grouped_rel(PlannerInfo *root, RelOptInfo *rel)
 {
 	RelOptInfo *grouped_rel;
@@ -496,6 +598,22 @@ build_simple_grouped_rel(PlannerInfo *root, RelOptInfo *rel)
  *	  the necessary fields.
  */
 RelOptInfo *
+/*
+ * build_grouped_rel - (中文)复制输入关系并清空路径/分区/大小字段
+ *
+ * 【作用】用 memcpy 扁平复制输入 RelOptInfo 得到分组关系,然后把与"待重新
+ * 规划"相关的字段清零:路径列表与最廉价路径、分区信息、行数估计等,使新
+ * 关系可以独立地重新填充路径。
+ *
+ * 【设计思想】分组关系与输入关系共享绝大多数结构(relids、reltarget 等),
+ * 但路径集必须从零开始重新生成,故采用"复制 + 定向清理"而非逐字段重建;
+ * 清零分区信息是因为分组后关系不再适合 partitionwise join。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文;
+ *   rel  —— 被复制的输入关系。
+ * 【返回值】已复制的分组关系 RelOptInfo。
+ */
 build_grouped_rel(PlannerInfo *root, RelOptInfo *rel)
 {
 	RelOptInfo *grouped_rel;
@@ -541,6 +659,20 @@ build_grouped_rel(PlannerInfo *root, RelOptInfo *rel)
  *	  Find a base or otherrel relation entry, which must already exist.
  */
 RelOptInfo *
+/*
+ * find_base_rel - (中文)查找必须已存在的基表/otherrel 关系节点
+ *
+ * 【作用】按 relid 从 simple_rel_array 取出 RelOptInfo 并返回;若该位置为空
+ * 则 elog(ERROR)。用无符号比较防止负 relid 造成数组越界访问。
+ *
+ * 【设计思想】这是"按 RT 索引取基表关系"的权威入口,调用方假定 relid 对应
+ * 的关系必然已由 build_simple_rel 建立,否则视为内部错误。
+ *
+ * 【参数】
+ *   root  —— 查询规划上下文;
+ *   relid —— 目标 RT 索引。
+ * 【返回值】对应的 RelOptInfo(不存在时报错)。
+ */
 find_base_rel(PlannerInfo *root, int relid)
 {
 	RelOptInfo *rel;
@@ -563,6 +695,20 @@ find_base_rel(PlannerInfo *root, int relid)
  *	  Find a base or otherrel relation entry, returning NULL if there's none
  */
 RelOptInfo *
+/*
+ * find_base_rel_noerr - (中文)查找基表关系节点,找不到时返回 NULL
+ *
+ * 【作用】与 find_base_rel 相同但绝不报错:relid 越界或该位置为空都返回
+ * NULL,由调用方自行决定如何处置。同样用无符号比较规避负数越界。
+ *
+ * 【设计思想】用于"关系可能存在也可能不存在"的探测场景,例如遍历 relids
+ * 位图时个别 relid 尚无对应关系。
+ *
+ * 【参数】
+ *   root  —— 查询规划上下文;
+ *   relid —— 目标 RT 索引。
+ * 【返回值】对应的 RelOptInfo;不存在则返回 NULL。
+ */
 find_base_rel_noerr(PlannerInfo *root, int relid)
 {
 	/* use an unsigned comparison to prevent negative array element access */
@@ -581,6 +727,22 @@ find_base_rel_noerr(PlannerInfo *root, int relid)
  * outer joins.
  */
 RelOptInfo *
+/*
+ * find_base_rel_ignore_join - (中文)查找基表关系节点,外连接 relid 视为不存在
+ *
+ * 【作用】与 find_base_rel 类似,但对"引用外连接的 RT 索引"这一特殊情况
+ * 放宽:若 relid 对应的是外连接(syn_righthand 等特例下 relids 位图可能含
+ * 有连接别名),则返回 NULL 而非报错;对非外连接的缺失项仍报错。
+ *
+ * 【设计思想】调用方常需要处理"同时包含基表与外连接"的 relids 集合,逐个
+ * 成员取关系时希望对外连接成员静默跳过;而真正的缺失(内部错误)仍需暴露。
+ * 调试上先核实该 relid 确为 RTE_JOIN 且非 INNER 再返回 NULL,便于发现问题。
+ *
+ * 【参数】
+ *   root  —— 查询规划上下文;
+ *   relid —— 目标 RT 索引。
+ * 【返回值】对应的 RelOptInfo;若为外连接 relid 返回 NULL,其余缺失报错。
+ */
 find_base_rel_ignore_join(PlannerInfo *root, int relid)
 {
 	/* use an unsigned comparison to prevent negative array element access */
@@ -613,6 +775,20 @@ find_base_rel_ignore_join(PlannerInfo *root, int relid)
  *	  Construct the auxiliary hash table for join relations.
  */
 static void
+/*
+ * build_join_rel_hash - (中文)为连接关系建立辅助哈希表
+ *
+ * 【作用】创建一个以 Relids(位图)为键、JoinHashEntry 为桶的哈希表,并把
+ * 当前 join_rel_list 中已存在的 joinrel 全部插入,最后挂到 root->join_rel_hash。
+ *
+ * 【设计思想】当 joinrel 数量变多后,线性扫描 join_rel_list 查找的开销不可
+ * 接受,故按需切换到哈希查找。位图用 bitmap_hash / bitmap_match 作为哈希与
+ * 匹配函数;哈希表建立在当前内存上下文,生命周期与查询规划期一致。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文,提供 join_rel_list 来源。
+ * 【返回值】无(结果存于 root->join_rel_hash)。
+ */
 build_join_rel_hash(PlannerInfo *root)
 {
 	HTAB	   *hashtab;
@@ -654,6 +830,22 @@ build_join_rel_hash(PlannerInfo *root)
  *	  or NULL if none exists.  This is for join relations.
  */
 RelOptInfo *
+/*
+ * find_join_rel - (中文)按 relids 集合查找连接关系
+ *
+ * 【作用】在连接关系集合中查找 relids 完全相等的 joinrel:若哈希表已建立则
+ * 用哈希查找,否则线性遍历 join_rel_list;找到返回该 RelOptInfo,找不到返回
+ * NULL。
+ *
+ * 【设计思想】采用"惰性升级"策略:列表长度超过 32 时才建立哈希表,兼顾
+ * 小查询的简单实现与大查询的查找效率。线性分支特意用一个局部变量保存
+ * relids 以避开取地址操作,避免把位图强制搬出寄存器拖慢比较。
+ *
+ * 【参数】
+ *   root   —— 查询规划上下文;
+ *   relids —— 标识目标连接关系的 RT 索引集合。
+ * 【返回值】匹配的 RelOptInfo;无则返回 NULL。
+ */
 find_join_rel(PlannerInfo *root, Relids relids)
 {
 	/*
@@ -716,6 +908,24 @@ find_join_rel(PlannerInfo *root, Relids relids)
  * called for the join relation.
  */
 static void
+/*
+ * set_foreign_rel_properties - (中文)设置 joinrel 的外键(外部表)相关字段
+ *
+ * 【作用】若 outer 与 inner 都是同一 foreign server、且权限检查用户一致的
+ * 外部表(或其连接),则把 joinrel 的 serverid / userid / fdwroutine 设为可
+ * 用值,并标记 useridiscurrent;否则保持 InvalidOid/NULL,使优化器不会为
+ * 该 joinrel 调用 GetForeignJoinPaths(即不做外连接下推)。
+ *
+ * 【设计思想】除 userid 完全一致外,还放宽允许"一边 userid 为 0(当前用户)
+ * 另一边恰为当前用户",此时 join 下推只对当前用户有效,故置 useridiscurrent。
+ * 字段仅在满足条件时被赋值,避免误报外连接能力。
+ *
+ * 【参数】
+ *   joinrel  —— 目标连接关系;
+ *   outer_rel —— 连接左侧关系;
+ *   inner_rel —— 连接右侧关系。
+ * 【返回值】无。
+ */
 set_foreign_rel_properties(RelOptInfo *joinrel, RelOptInfo *outer_rel,
 						   RelOptInfo *inner_rel)
 {
@@ -752,6 +962,21 @@ set_foreign_rel_properties(RelOptInfo *joinrel, RelOptInfo *outer_rel,
  * add_join_rel
  *		Add given join relation to the list of join relations in the given
  *		PlannerInfo. Also add it to the auxiliary hashtable if there is one.
+ */
+/*
+ * add_join_rel - (中文)把连接关系登记到 PlannerInfo
+ *
+ * 【作用】把 joinrel 追加到 root->join_rel_list 末尾;若辅助哈希表已存在则
+ * 同时以 relids 为键插入哈希桶。不处理去重——调用方保证同一 relids 的
+ * joinrel 只被添加一次。
+ *
+ * 【设计思想】追加到链表末尾是 GEQO(遗传算法连接搜索)的要求,它依赖列表
+ * 顺序记录生成次序;哈希表分支用 Assert(!found) 验证唯一性。
+ *
+ * 【参数】
+ *   root    —— 查询规划上下文;
+ *   joinrel —— 待登记的连接关系。
+ * 【返回值】无。
  */
 static void
 add_join_rel(PlannerInfo *root, RelOptInfo *joinrel)
@@ -792,6 +1017,29 @@ add_join_rel(PlannerInfo *root, RelOptInfo *joinrel)
  * duplicated calculation of the restrictlist...
  */
 RelOptInfo *
+/*
+ * build_join_rel - (中文)构建(或复用)两个关系并集对应的连接关系
+ *
+ * 【作用】为 joinrelids 标识的关系集合返回(必要时新建)RelOptInfo。新建时
+ * 完成字段初始化、外键属性设置、目标列构建(build_joinrel_tlist + PHV)、
+ * 限制条件与连接条件列表构建(build_joinrel_restrictlist/joinlist)、行数
+ * 估计(set_joinrel_size_estimates)、并行安全判定、分区信息,并登记到
+ * PlannerInfo;若已存在则只需按当前 (outer,inner) 对重新计算 restrictlist。
+ *
+ * 【设计思想】joinrel 与"由哪两个子关系生成"解耦:relids 相同即视为同一
+ * 关系,所以先查后建、只建一次。restrictlist 依赖具体输入对(某些子句在子
+ * 关系内已被处理),而 joinlist 只依赖 relids 集合本身,故前者每次现算、
+ * 后者建一次即可。restrictlist_ptr 参数把计算复用到调用方,避免重复求值。
+ *
+ * 【参数】
+ *   root              —— 查询规划上下文;
+ *   joinrelids        —— 唯一标识该连接关系的 RT 索引集合;
+ *   outer_rel/inner_rel —— 参与连接的左右两个关系;
+ *   sjinfo            —— 连接上下文信息(类型、可空侧等);
+ *   pushed_down_joins —— 已完成下推的外连接列表;
+ *   restrictlist_ptr  —— 出参:若非 NULL 则接收适用于该输入对的 RestrictInfo。
+ * 【返回值】新建或已有的连接关系 RelOptInfo。
+ */
 build_join_rel(PlannerInfo *root,
 			   Relids joinrelids,
 			   RelOptInfo *outer_rel,
@@ -1023,6 +1271,28 @@ build_join_rel(PlannerInfo *root,
  * 'nappinfos' and 'appinfos': AppendRelInfo array for child relids
  */
 RelOptInfo *
+/*
+ * build_child_join_rel - (中文)构建两个分区子关系之间的连接关系
+ *
+ * 【作用】用于 partitionwise join:把父(分区级)连接关系 parent_joinrel 的
+ * 结构按 AppendRelInfo 翻译成子关系(RELOPT_OTHER_JOINREL),包括 relids、
+ * 目标列(build_child_join_reltarget)、joininfo、lateral 信息等,并对子关系
+ * 重新做行数估计,最后登记到 PlannerInfo。
+ *
+ * 【设计思想】子连接关系沿父连接关系"抄一份再翻译",避免了重复推导:继承
+ * 父关系的并行安全与 eclass 判断,仅 relids/reltarget/joininfo/行数随子表
+ * 替换。若父有可用的 eclass 连接或 pathkeys,还需为该子连接补充 eclass 成员
+ * 以支持归并连接与排序路径。
+ *
+ * 【参数】
+ *   root            —— 查询规划上下文;
+ *   outer_rel/inner_rel —— 参与连接的两个子关系(必须都是 otherrel);
+ *   parent_joinrel  —— 对应的父连接关系(须已设 consider_partitionwise_join);
+ *   restrictlist    —— 适用于该子关系的限制条件列表;
+ *   sjinfo          —— 子连接的类型细节;
+ *   nappinfos/appinfos —— 用于变量翻译的 AppendRelInfo 数组。
+ * 【返回值】新建的子连接关系 RelOptInfo。
+ */
 build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 					 RelOptInfo *inner_rel, RelOptInfo *parent_joinrel,
 					 List *restrictlist, SpecialJoinInfo *sjinfo,
@@ -1178,6 +1448,24 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
  * because join_is_legal() needs the value to check a prospective join.
  */
 Relids
+/*
+ * min_join_parameterization - (中文)计算 joinrel 的最小参数化集合
+ *
+ * 【作用】返回该连接关系包含的 LATERAL 引用集合(即为了执行它必须先完成
+ * 哪些外层关系),作为 joinrel->lateral_relids 保存,并供 join_is_legal 在
+ * 评估候选连接时使用。
+ *
+ * 【设计思想】结果 = 输入双方 lateral_relids 的并集,再减去本连接已含的
+ * relids。看似简单但其实正确:create_lateral_join_info 已把本层要计算的
+ * PlaceHolderVar 的 lateral 引用"分摊"给了每个成员基表,因此不必再单独
+ * 累加;传递闭包也已在基表级完成,无需在此重复。
+ *
+ * 【参数】
+ *   root        —— 查询规划上下文;
+ *   joinrelids  —— 目标连接关系的 relids;
+ *   outer_rel/inner_rel —— 连接左右输入关系。
+ * 【返回值】最小参数化 relids(Relids)。
+ */
 min_join_parameterization(PlannerInfo *root,
 						  Relids joinrelids,
 						  RelOptInfo *outer_rel,
@@ -1254,6 +1542,32 @@ min_join_parameterization(PlannerInfo *root,
  * The C columns emitted by the B/C join need to be shown as nulled by both
  * the B/C and A/B joins, even though they've not physically traversed the
  * A/B join.
+ */
+/*
+ * build_joinrel_tlist - (中文)从输入关系构建 joinrel 的目标列
+ *
+ * 【作用】把输入关系 targetlist 中"本连接之后仍被需要"的 Var 与
+ * PlaceHolderVar 加入 joinrel->reltarget,并累加输出宽度。对外连接,按
+ * can_null 决定是否给上浮的 Var/PHV 追加本连接的 nulling 位(需要时复制
+ * 节点)。本函数对左右输入各调用一次。
+ *
+ * 【设计思想】"仍被需要"用两个途径判断:Var 依据其所在基表的 attr_needed
+ * 是否包含本连接之外的关系;PHV 依据 phinfo->ph_needed。对外连接空值标记
+ * 的处理要兼容优化器对外连接的换位(identity 3,见 optimizer/README):
+ * - 只有外连接已"完成"且 Var 来自其可空侧才加 ojrelid;
+ * - 对 pushed_down_joins 里的已下推外连接补上它们的 nulling;
+ * - 对 commute_above_r 中已并入本连接的 relid 也补 nulling,还原语法顺序
+ *   下应有的空值位图,保证与上层查询树的 Var 匹配。行身份 Var
+ *   (ROWID_VAR) 一律保留且不加 nulling 位。
+ *
+ * 【参数】
+ *   root             —— 查询规划上下文;
+ *   joinrel          —— 目标连接关系;
+ *   input_rel        —— 本侧输入关系;
+ *   sjinfo           —— 连接上下文;
+ *   pushed_down_joins —— 已下推外连接列表;
+ *   can_null         —— 本输入是否可能被该连接置 NULL(外连接可空侧)。
+ * 【返回值】无(结果写入 joinrel->reltarget)。
  */
 static void
 build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
@@ -1440,6 +1754,26 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
  * RestrictInfo nodes are no longer context-dependent.  Instead, just include
  * the original nodes in the lists made for the join relation.
  */
+/*
+ * build_joinrel_restrictlist - (中文)构建 joinrel 的限制条件列表
+ *
+ * 【作用】收集所有"应在该连接层求值"的 RestrictInfo:即 required_relids 已
+ * 全部落在 joinrel 内、但尚未在输入子关系内被处理的子句。先分别从 outer 与
+ * inner 的 joininfo 收集(去掉重复),再并入 EquivalenceClass 推导出的等值
+ * 条件(generate_join_implied_equalities)。
+ *
+ * 【设计思想】限制条件列表与"具体输入对"相关,因此每考虑一对新的输入关系
+ * 都要重新计算;joininfo 列表里既包含本层可变成限制条件的子句,也包含还要
+ * 继续上浮的连接子句,区分标准是 required_relids 是否已含于 joinrel。克隆
+ * (clone)子句需额外检查求值时机是否已过、与输入组合是否兼容。
+ *
+ * 【参数】
+ *   root       —— 查询规划上下文;
+ *   joinrel    —— 目标连接关系;
+ *   outer_rel / inner_rel —— 连接左右输入关系;
+ *   sjinfo     —— 连接上下文信息。
+ * 【返回值】适用于该输入对的 RestrictInfo 列表。
+ */
 static List *
 build_joinrel_restrictlist(PlannerInfo *root,
 						   RelOptInfo *joinrel,
@@ -1477,6 +1811,23 @@ build_joinrel_restrictlist(PlannerInfo *root,
 	return result;
 }
 
+/*
+ * build_joinrel_joinlist - (中文)构建 joinrel 的连接子句列表
+ *
+ * 【作用】把输入双方 joininfo 中"仍引用 joinrel 之外关系"的子句收集起来,
+ * 去重后存入 joinrel->joininfo,供更高层连接时使用。
+ *
+ * 【设计思想】连接列表只由 joinrel 的 relids 集合决定,与具体输入对无关,
+ * 所以每个 joinrel 只需计算一次(这是它与 restriction list 的关键区别);
+ * 判断标准与 build_joinrel_restrictlist 互补:required_relids 未被 joinrel
+ * 完全覆盖的就是仍待上浮的连接子句。
+ *
+ * 【参数】
+ *   joinrel   —— 目标连接关系;
+ *   outer_rel —— 连接左侧输入;
+ *   inner_rel —— 连接右侧输入。
+ * 【返回值】无(结果写入 joinrel->joininfo)。
+ */
 static void
 build_joinrel_joinlist(RelOptInfo *joinrel,
 					   RelOptInfo *outer_rel,
@@ -1495,6 +1846,26 @@ build_joinrel_joinlist(RelOptInfo *joinrel,
 	joinrel->joininfo = result;
 }
 
+/*
+ * subbuild_joinrel_restrictlist - (中文)从单个输入关系的 joininfo 收集限制条件
+ *
+ * 【作用】遍历 input_rel->joininfo:凡 required_relids 已含于 joinrel 的子句,
+ * 校验(克隆子句要检查求值时机与输入组合兼容性,普通子句以断言把关)后加入
+ * new_restrictlist 并去重(list_append_unique_ptr);否则说明它仍属上层连接
+ * 子句,本层忽略。返回更新后的列表。
+ *
+ * 【设计思想】build_joinrel_restrictlist 对左右输入各调用一次本函数,第二次
+ * 传入第一次的结果以累计;重复子句必然来自两个输入共享的 joininfo,由于
+ * RestrictInfo 是共享指针而非副本,指针相等即足以判重。
+ *
+ * 【参数】
+ *   root              —— 查询规划上下文;
+ *   joinrel           —— 目标连接关系;
+ *   input_rel         —— 待扫描的输入关系;
+ *   both_input_relids —— 左右输入的 relids 并集(用于克隆子句的兼容性检查);
+ *   new_restrictlist  —— 累积结果列表。
+ * 【返回值】加入新子句后的限制条件列表。
+ */
 static List *
 subbuild_joinrel_restrictlist(PlannerInfo *root,
 							  RelOptInfo *joinrel,
@@ -1561,6 +1932,22 @@ subbuild_joinrel_restrictlist(PlannerInfo *root,
 	return new_restrictlist;
 }
 
+/*
+ * subbuild_joinrel_joinlist - (中文)从单个 joininfo 列表收集待上浮的连接子句
+ *
+ * 【作用】遍历 joininfo_list:required_relids 未被 joinrel 完全覆盖的子句,
+ * 即仍需在更高层连接中使用的,加入 new_joininfo 并去重;已被覆盖的变成限制
+ * 条件,本层忽略。返回更新后的列表。
+ *
+ * 【设计思想】与 subbuild_joinrel_restrictlist 构成互补对,这里只关心还要
+ * "上浮"的子句;调用方保证只用于 RELOPT_JOINREL(父关系之间的连接)。
+ *
+ * 【参数】
+ *   joinrel      —— 目标连接关系;
+ *   joininfo_list —— 待扫描的 joininfo 列表;
+ *   new_joininfo —— 累积结果列表。
+ * 【返回值】加入子句后的连接子句列表。
+ */
 static List *
 subbuild_joinrel_joinlist(RelOptInfo *joinrel,
 						  List *joininfo_list,
@@ -1614,6 +2001,24 @@ subbuild_joinrel_joinlist(RelOptInfo *joinrel,
  * care about fields that are of interest to add_path() and set_cheapest().
  */
 RelOptInfo *
+/*
+ * fetch_upper_rel - (中文)获取(必要时新建)一个 upper 关系
+ *
+ * 【作用】返回描述"扫描/连接之后处理阶段"的 RelOptInfo:按 (kind, relids)
+ * 在 root->upper_rels[kind] 中查找,找到直接返回;否则新建一个 RELOPT_UPPER_REL
+ * 节点、只初始化对 add_path/set_cheapest 有用的字段,登记后返回。
+ *
+ * 【设计思想】upper 关系标识处理阶段(排序、聚合、投影等)而非一组基表,
+ * relids 的具体含义由各调用方约定;该结构的多数字段不会被用到,makeNode 的
+ * 清零初始化已足够,故只显式设置路径相关字段。目前每类 upper rel 用一条
+ * List 存放,数量足够少时线性查找即可。
+ *
+ * 【参数】
+ *   root  —— 查询规划上下文;
+ *   kind  —— UpperRelationKind 枚举,标识处理阶段;
+ *   relids —— 该 upper 关系对应的 relids 集合。
+ * 【返回值】匹配的(或新建的)upper RelOptInfo。
+ */
 fetch_upper_rel(PlannerInfo *root, UpperRelationKind kind, Relids relids)
 {
 	RelOptInfo *upperrel;
@@ -1665,6 +2070,22 @@ fetch_upper_rel(PlannerInfo *root, UpperRelationKind kind, Relids relids)
  * parent relation IDs.
  */
 Relids
+/*
+ * find_childrel_parents - (中文)计算 appendrel 子关系的全部祖先父关系集合
+ *
+ * 【作用】沿 append_rel_array 从给定 child rel 一路向上追溯,把每层
+ * parent_relid 加入结果位图,直到到达真正的基表(parent rel),返回所有祖先
+ * 父关系的 relids 集合。
+ *
+ * 【设计思想】appendrel 可以嵌套(分区再分区),故用 do/while 沿
+ * RELOPT_OTHER_MEMBER_REL 逐级上行,循环终止于 RELOPT_BASEREL;每层都断言
+ * 有 AppendRelInfo 存在。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文;
+ *   rel  —— 作为起点的 appendrel 子关系(须为 RELOPT_OTHER_MEMBER_REL)。
+ * 【返回值】包含全部祖先父关系 relid 的 Relids 位图。
+ */
 find_childrel_parents(PlannerInfo *root, RelOptInfo *rel)
 {
 	Relids		result = NULL;
@@ -1701,6 +2122,24 @@ find_childrel_parents(PlannerInfo *root, RelOptInfo *rel)
  * be responsible for evaluating.
  */
 ParamPathInfo *
+/*
+ * get_baserel_parampathinfo - (中文)获取基表参数化路径的 ParamPathInfo
+ *
+ * 【作用】为 required_outer 参数化下的基表路径取得(必要时建立)ParamPathInfo:
+ * 找出可下推到该基表的连接子句(含 EC 等值条件)、计算其 rinfo_serial 集合、
+ * 估计参数化扫描行数,缓存进 baserel->ppilist 以便所有同参数化路径复用。
+ *
+ * 【设计思想】参数化路径的行数必须在"同 rel 同参数化"的所有路径间保持一致,
+ * 否则择优会失真,故以 (rel, required_outer) 为单位缓存;同时在此确定该路径
+ * 负责求值的可下推子句集合。无参数化(bms_is_empty)时返回 NULL,表示不需要
+ * ParamPathInfo;函数开头断言 lateral 引用已被 required_outer 覆盖。
+ *
+ * 【参数】
+ *   root           —— 查询规划上下文;
+ *   baserel        —— 目标基表;
+ *   required_outer —— 该路径所需的外部参数化关系集合。
+ * 【返回值】匹配的 ParamPathInfo;无参数化时返回 NULL。
+ */
 get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 						  Relids required_outer)
 {
@@ -1815,6 +2254,29 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
  * unnecessary for other join types.
  */
 ParamPathInfo *
+/*
+ * get_joinrel_parampathinfo - (中文)获取连接关系参数化路径的 ParamPathInfo
+ *
+ * 【作用】为 required_outer 参数化下的连接路径取得(必要时建立)ParamPathInfo,
+ * 并确定该路径求值的"下推子句":可移入本连接、但不能移入左右任何一侧输入
+ * 路径的连接子句(含 EC 生成子句),通过 *restrict_clauses 回传给调用方。
+ *
+ * 【设计思想】与基表情况不同,join 层可下推子句集合依赖"具体选中的输入路径
+ * 对",因此每次都要重新计算,即使 ParamPathInfo 已存在也须更新子句输出。EC
+ * 处理是难点:某些 EC 生成的子句可能已被下推到内层路径,需为被丢弃的 EC
+ * 尝试补一条"连接 required_outer 与 LHS"的等值子句,防止 EC 未被充分强制。
+ * 结果行数用 get_parameterized_joinrel_size 估计;ParamPathInfo 只缓存行数与
+ * required_outer,不缓存依赖输入对的子句列表。
+ *
+ * 【参数】
+ *   root             —— 查询规划上下文;
+ *   joinrel          —— 目标连接关系;
+ *   outer_path/inner_path —— 选中的左右输入路径;
+ *   sjinfo           —— 连接上下文;
+ *   required_outer   —— 该路径所需的外部参数化关系集合;
+ *   restrict_clauses —— 输入/输出参数:追加该路径需求值的下推子句。
+ * 【返回值】匹配的 ParamPathInfo;无参数化时返回 NULL。
+ */
 get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 						  Path *outer_path,
 						  Path *inner_path,
@@ -2012,6 +2474,21 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
  * the Append node isn't responsible for checking quals).
  */
 ParamPathInfo *
+/*
+ * get_appendrel_parampathinfo - (中文)获取 append 关系参数化路径的 ParamPathInfo
+ *
+ * 【作用】为 append 关系(如 UNION ALL、继承)的参数化路径取得(必要时建立)
+ * ParamPathInfo:行数估计即各子路径之和,本层只负责标记"路径需要参数",故
+ * ppi_rows 置 0、不保存任何子句。
+ *
+ * 【设计思想】Append 节点本身不求值限定条件,参数化只是"携带参数到子路径"
+ * 的标记,所以 ParamPathInfo 极为精简;真正的行数在子路径层面已有估计。
+ *
+ * 【参数】
+ *   appendrel      —— 目标 append 关系;
+ *   required_outer —— 该路径所需的外部参数化关系集合。
+ * 【返回值】匹配的 ParamPathInfo;无参数化时返回 NULL。
+ */
 get_appendrel_parampathinfo(RelOptInfo *appendrel, Relids required_outer)
 {
 	ParamPathInfo *ppi;
@@ -2045,6 +2522,20 @@ get_appendrel_parampathinfo(RelOptInfo *appendrel, Relids required_outer)
  * already available in the given rel. Returns NULL otherwise.
  */
 ParamPathInfo *
+/*
+ * find_param_path_info - (中文)按参数化集合查找已有的 ParamPathInfo
+ *
+ * 【作用】线性扫描 rel->ppilist,返回 ppi_req_outer 与 required_outer 位图
+ * 相等的 ParamPathInfo;没有则返回 NULL。
+ *
+ * 【设计思想】只是简单的复用查找,避免对同一 (rel, required_outer) 重复估计
+ * 行数;参数化集合不同的路径各自保留独立条目。
+ *
+ * 【参数】
+ *   rel            —— 目标关系;
+ *   required_outer —— 待匹配的参数化集合。
+ * 【返回值】匹配的 ParamPathInfo;无则返回 NULL。
+ */
 find_param_path_info(RelOptInfo *rel, Relids required_outer)
 {
 	ListCell   *lc;
@@ -2066,6 +2557,22 @@ find_param_path_info(RelOptInfo *rel, Relids required_outer)
  *		(identified by rinfo_serial numbers) enforced within the Path.
  */
 Bitmapset *
+/*
+ * get_param_path_clause_serials - (中文)汇总路径内强制执行的子句序列号
+ *
+ * 【作用】返回参数化路径中所有被下推/强制执行的子句的 rinfo_serial 位图:
+ * 基表路径直接用 param_info->ppi_serials;连接路径把左右输入递归合并再加本
+ * 路径 joinrestrictinfo;Append 路径取各子路径集合的交集(必须全部执行才算
+ * 强制)。未参数化的路径返回 NULL。
+ *
+ * 【设计思想】这些序列号用于判定"某子句是否已在路径内部被强制执行",上层
+ * (如外连接化简、重复路径去重)据此避免重复求值或重复下推。Append 取交集
+ * 因为只有所有子路径都执行过才算整条 Append 保证了该条件。
+ *
+ * 【参数】
+ *   path —— 目标路径。
+ * 【返回值】强制执行子句序列号构成的 Bitmapset;未参数化返回 NULL。
+ */
 get_param_path_clause_serials(Path *path)
 {
 	if (path->param_info == NULL)
@@ -2146,6 +2653,27 @@ get_param_path_clause_serials(Path *path)
  *		and if yes, initialize partitioning information of the resulting
  *		partitioned join relation.
  */
+/*
+ * build_joinrel_partition_info - (中文)初始化分区连接关系的分区信息
+ *
+ * 【作用】判断两个被连接关系是否满足 partitionwise join 条件:两边都是分区
+ * 关系、都开启 consider_partitionwise_join、分区方案相同、且对每个分区键都
+ * 有等值连接条件(have_partkey_equi_join)。满足则给 joinrel 挂上 part_scheme、
+ * 设置分区键表达式(set_joinrel_partition_key_exprs)并置 consider_partitionwise_join。
+ *
+ * 【设计思想】只有输入关系分区键能"一一对应等值连接"时,连接结果才仍然保持
+ * 分区结构,才能进一步做分区级连接。该判断对同一 joinrel 不应因连接顺序不同
+ * 而结果不同(由等值类推导与连接重排保证),否则本逻辑会出错。pgs_mask 关闭
+ * 该特性时直接返回。
+ *
+ * 【参数】
+ *   root         —— 查询规划上下文;
+ *   joinrel      —— 目标连接关系;
+ *   outer_rel/inner_rel —— 连接左右输入;
+ *   sjinfo       —— 连接上下文;
+ *   restrictlist —— 该连接的限制条件列表。
+ * 【返回值】无。
+ */
 static void
 build_joinrel_partition_info(PlannerInfo *root,
 							 RelOptInfo *joinrel, RelOptInfo *outer_rel,
@@ -2218,6 +2746,28 @@ build_joinrel_partition_info(PlannerInfo *root,
  * Returns true if there exist equi-join conditions involving pairs
  * of matching partition keys of the relations being joined for all
  * partition keys.
+ */
+/*
+ * have_partkey_equi_join - (中文)检查是否对全部分区键存在等值连接条件
+ *
+ * 【作用】返回 true 当且仅当两个输入关系(rel1/rel2,须同分区方案)的每一个
+ * 分区键位置,都能从 restrictlist 或等价类推导中找到一条把两侧该键约束为
+ * 相等的等值子句。这是 partitionwise join 可行的必要条件。
+ *
+ * 【设计思想】先把 restrictlist 中可作为连接条件的等值 OpExpr 与两侧分区键
+ * 匹配(match_expr_to_partition_keys),校验操作符族/排序规则后标记对应键为
+ * "已知相等";再用等价类(exprs_known_equal)兜底补查——某些 EC 可能没产生
+ * 显式子句或约束的是别的成员。对外连接只采用本连接自身的子句;任一键无法
+ * 证明相等即可提前返回 false。严格操作符下允许 NULL 键参与匹配(严格性保证
+ * NULL 不参与等值连接)。
+ *
+ * 【参数】
+ *   root        —— 查询规划上下文;
+ *   joinrel     —— 目标连接关系;
+ *   rel1/rel2   —— 被连接的两个分区关系;
+ *   jointype    —— 连接类型;
+ *   restrictlist —— 该连接的限定条件列表。
+ * 【返回值】true:全部分区键有等值连接;false:不满足。
  */
 static bool
 have_partkey_equi_join(PlannerInfo *root, RelOptInfo *joinrel,
@@ -2466,6 +3016,23 @@ have_partkey_equi_join(PlannerInfo *root, RelOptInfo *joinrel,
  * partition key using a strict operator.  This allows us to consider
  * nullable as well as nonnullable partition keys.
  */
+/*
+ * match_expr_to_partition_keys - (中文)把表达式匹配到关系的分区键
+ *
+ * 【作用】剥掉 RelabelType 装饰后,在 rel 的非空分区键列表(partexprs)中查找
+ * 与 expr 相等的项;strict_op 为 true 时还允许匹配可空分区键列表
+ * (nullable_partexprs)。返回命中的键序号(0 起),均未命中返回 -1。
+ *
+ * 【设计思想】严格连接操作符(如 =)在输入含 NULL 时不会产生匹配行,所以
+ * 用严格操作符比较 NULL 分区键与任何值都不会连接成功——因此把可空分区键
+ * 也视为合格是安全的;非严格操作符则只能匹配非空键。
+ *
+ * 【参数】
+ *   expr      —— 待匹配的表达式;
+ *   rel       —— 目标分区关系(须已设 part_scheme / partexprs);
+ *   strict_op —— 与分区键比较的操作符是否严格。
+ * 【返回值】匹配的分区键序号;未匹配返回 -1。
+ */
 static int
 match_expr_to_partition_keys(Expr *expr, RelOptInfo *rel, bool strict_op)
 {
@@ -2514,6 +3081,26 @@ match_expr_to_partition_keys(Expr *expr, RelOptInfo *rel, bool strict_op)
 /*
  * set_joinrel_partition_key_exprs
  *		Initialize partition key expressions for a partitioned joinrel.
+ */
+/*
+ * set_joinrel_partition_key_exprs - (中文)为分区 joinrel 初始化分区键表达式
+ *
+ * 【作用】按连接类型把左右输入的分区键表达式(及可空版本)组合成 joinrel 的
+ * partexprs / nullable_partexprs 数组,使 joinrel 能继续作为分区关系参与更
+ * 高层连接。
+ *
+ * 【设计思想】不同连接类型对分区键的"可见性"不同:
+ * - INNER:两侧键都可继续用(可空的仍算可空);
+ * - SEMI/ANTI:内层键不输出,只保留外层;
+ * - LEFT:外层键非空保留,内层键降级为可空;
+ * - FULL:两侧都可空;另为每种可能的全外连接输出变量生成 CoalesceExpr 作
+ *   为附加分区表达式,以便匹配 JOIN USING 产生的合并列等值条件。
+ *
+ * 【参数】
+ *   joinrel   —— 目标分区连接关系;
+ *   outer_rel/inner_rel —— 左右输入关系;
+ *   jointype  —— 连接类型。
+ * 【返回值】无。
  */
 static void
 set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
@@ -2658,6 +3245,22 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
  * build_child_join_reltarget
  *	  Set up a child-join relation's reltarget from a parent-join relation.
  */
+/*
+ * build_child_join_reltarget - (中文)从父连接关系构建子连接关系的 reltarget
+ *
+ * 【作用】把 parentrel->reltarget 的目标列表经 adjust_appendrel_attrs 做变量
+ * 替换后赋给 childrel,并原样复制代价与宽度估计。
+ *
+ * 【设计思想】partitionwise join 的子连接与父连接输出结构一致,只需把 Var 等
+ * 引用翻译到子表即可;代价与宽度沿用父估计(变量宽度已随翻译保持一致)。
+ *
+ * 【参数】
+ *   root      —— 查询规划上下文;
+ *   parentrel —— 父(分区级)连接关系;
+ *   childrel  —— 子连接关系;
+ *   nappinfos/appinfos —— 用于变量翻译的 AppendRelInfo 数组。
+ * 【返回值】无。
+ */
 static void
 build_child_join_reltarget(PlannerInfo *root,
 						   RelOptInfo *parentrel,
@@ -2688,6 +3291,26 @@ build_child_join_reltarget(PlannerInfo *root,
  * planning overhead.
  */
 RelAggInfo *
+/*
+ * create_rel_agg_info - (中文)为关系创建主动聚合信息 RelAggInfo
+ *
+ * 【作用】若给定关系能产生"分组路径"(提前部分聚合),则构建并返回
+ * RelAggInfo:构造分组路径目标 target、聚合输入目标 agg_input、分组子句与
+ * 分组表达式;可选的按 calculate_grouped_rows 估计分组行数并判定聚合是否有
+ * 价值(平均组大小 >= min_eager_agg_group_size)。
+ *
+ * 【设计思想】eager aggregation 把聚合下推到基表/连接层以压缩行数。对 otherrel
+ * 直接翻译父关系的 RelAggInfo 并重估分组行数;对普通关系则先做可行性检查
+ * (eager_aggregation_possible_for_relation)再初始化目标。分组表达式来自
+ * reltarget 中能对应到原 GROUP BY(或可经等价类推导)的 Var;目标里同时加入
+ * 标记为 partial 的 Aggref,供上层 final 聚合合并。
+ *
+ * 【参数】
+ *   root                 —— 查询规划上下文(要求 agg_clause_list / group_expr_list 就绪);
+ *   rel                  —— 目标关系;
+ *   calculate_grouped_rows —— 是否计算分组行数估计与 agg_useful 判定。
+ * 【返回值】新建的 RelAggInfo;无法/不值得聚合时返回 NULL。
+ */
 create_rel_agg_info(PlannerInfo *root, RelOptInfo *rel,
 					bool calculate_grouped_rows)
 {
@@ -2817,6 +3440,24 @@ create_rel_agg_info(PlannerInfo *root, RelOptInfo *rel,
  * eager_aggregation_possible_for_relation
  * 	  Check if it's possible to produce grouped paths for the given relation.
  */
+/*
+ * eager_aggregation_possible_for_relation - (中文)判定关系能否提前做部分聚合
+ *
+ * 【作用】检查把部分聚合下推到 rel 层是否安全可行:排除位于外连接可空侧、
+ * 位于 semi/anti 内层、目标列含 PlaceHolderVar 的关系,并要求所有聚合表达式
+ * 都只依赖本关系(agg_eval_at 含于 rel->relids)。全部通过返回 true。
+ *
+ * 【设计思想】下推部分聚合必须保证"行数压缩不改变结果语义":
+ * - 外连接可空侧会被 NULL 扩展,提前聚合会丢失扩展行、得到错误分组;
+ * - semi/anti 内层行不会进入连接输出,提前聚合结果无法被最终聚合合并;
+ * - 聚合若还依赖别的关系,下推会让上游输入行减少、破坏最终结果;
+ * - 当前实现刻意不支持 PlaceHolderVar(需求复杂)。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文;
+ *   rel  —— 候选关系(基表或连接关系)。
+ * 【返回值】true:可以提前聚合;false:不可以。
+ */
 static bool
 eager_aggregation_possible_for_relation(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -2922,6 +3563,29 @@ eager_aggregation_possible_for_relation(PlannerInfo *root, RelOptInfo *rel)
  * and *group_exprs.
  *
  * Return true if the targets could be initialized, false otherwise.
+ */
+/*
+ * init_grouping_targets - (中文)初始化分组路径与聚合输入路径的目标
+ *
+ * 【作用】遍历 rel->reltarget->exprs,把每个 Var 分门别类填入分组目标
+ * (target)与聚合输入目标(agg_input),同时构造分组 SortGroupClause 列表与
+ * 分组表达式列表(*group_clauses / *group_exprs)。返回 true 表示初始化成功。
+ *
+ * 【设计思想】分类依据:能匹配到原 GROUP BY(含经等价类推导)的作为分组键并
+ * 带 sortgroupref;虽不是分组键但被上层连接需要(join Var)的,为其新建带
+ * 等值图像检查(BTEQUALIMAGE_PROC,排除不可安全分组的数据类型)的
+ * SortGroupClause 并入组,保证"同组行在连接另一侧命运一致";只在聚合参数里
+ * 出现的不入 target;其余留待函数依赖检查(check_functional_grouping)判定是
+ * 否冗余,无法证明依赖则放弃。
+ *
+ * 【参数】
+ *   root          —— 查询规划上下文;
+ *   rel           —— 目标关系;
+ *   target        —— 分组路径的目标(输出);
+ *   agg_input     —— 分组路径输入路径的目标;
+ *   group_clauses —— 输出:分组 SortGroupClause 列表;
+ *   group_exprs   —— 输出:分组表达式列表。
+ * 【返回值】true:成功;false:存在不可分组的表达式,放弃。
  */
 static bool
 init_grouping_targets(PlannerInfo *root, RelOptInfo *rel,
@@ -3135,6 +3799,22 @@ init_grouping_targets(PlannerInfo *root, RelOptInfo *rel,
  *	  Check whether the given Var appears in aggregate expressions and not
  *	  elsewhere in the targetlist or havingQual.
  */
+/*
+ * is_var_in_aggref_only - (中文)判断 Var 是否只出现在聚合表达式里
+ *
+ * 【作用】遍历 root->agg_clause_list,查看 var 是否作为某个(会在本关系层
+ * 求值的)聚合 Aggref 的输入出现;返回 true 当且仅当它出现在某聚合中且不在
+ * 最终 tlist 的 Var 集合(root->tlist_vars)里。
+ *
+ * 【设计思想】"只在聚合里出现、不在 tlist/havingQual 直接输出"的 Var 只需
+ * 由聚合输入路径提供、不必出现在分组输出 target 中,从而让分组路径更精简;
+ * tlist_vars 检查用于排除"聚合参数里出现但也在目标列出现"的 Var。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文;
+ *   var  —— 待检查的 Var。
+ * 【返回值】true:只出现在聚合参数中;false:否则。
+ */
 static bool
 is_var_in_aggref_only(PlannerInfo *root, Var *var)
 {
@@ -3174,6 +3854,22 @@ is_var_in_aggref_only(PlannerInfo *root, Var *var)
  * is_var_needed_by_join
  *	  Check if the given Var is needed by joins above the current rel.
  */
+/*
+ * is_var_needed_by_join - (中文)判断 Var 是否被 rel 之上的连接需要
+ *
+ * 【作用】检查 var 所在基表的 attr_needed 集合中,是否包含"本关系之外的
+ * 关系或关系 0(最终输出)"——是则说明该 Var 在上层连接或输出中仍被使用。
+ *
+ * 【设计思想】把关系 0 也并入比较集合是为了排除"仅在最终 tlist 需要"的
+ * 情形,精确区分"被上层连接需要"(必须参与分组,否则连接正确性受损)与
+ * "仅被最终输出需要"(可只由聚合输入携带)。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文;
+ *   var  —— 待检查的 Var;
+ *   rel  —— 当前关系(其 relids 作为排除集合)。
+ * 【返回值】true:上层连接需要该 Var;false:否则。
+ */
 static bool
 is_var_needed_by_join(PlannerInfo *root, Var *var, RelOptInfo *rel)
 {
@@ -3201,6 +3897,22 @@ is_var_needed_by_join(PlannerInfo *root, Var *var, RelOptInfo *rel)
  *	  original grouping expressions, or is known equal to any of the original
  *	  grouping expressions due to equivalence relationships.  Return 0 if no
  *	  match is found.
+ */
+/*
+ * get_expression_sortgroupref - (中文)为表达式查找其分组引用编号
+ *
+ * 【作用】在 root->group_expr_list 中查找与 expr 相同、或经等价类(ec)证明
+ * 等价的表达式,返回其 sortgroupref;找不到返回 0。
+ *
+ * 【设计思想】group_expr_list 记录了原 GROUP BY 各表达式及其 sortgroupref。
+ * 若 reltarget 中的 Var 与某个分组表达式直接相等可直接命中;否则若该 Var
+ * 属于某分组表达式的 EquivalenceClass,则在 EC 成员中找匹配(忽略 child
+ * 成员)。这样从等价关系推导出的分组键也能被正确识别。
+ *
+ * 【参数】
+ *   root —— 查询规划上下文;
+ *   expr —— 待查找的表达式(须为 Var)。
+ * 【返回值】对应的 sortgroupref;未找到返回 0。
  */
 static Index
 get_expression_sortgroupref(PlannerInfo *root, Expr *expr)

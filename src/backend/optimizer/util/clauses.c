@@ -7,6 +7,34 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件是查询优化器中"子句"(qualification / expression)处理工具的核心
+ * 集合,负责对 WHERE / JOIN / HAVING 等子句做各种语义分析与改写,是整个
+ * 优化流程中"先理解表达式、再化简表达式"的关键一环。
+ *
+ * 【主要职责】
+ * - 语义探测:判定一个表达式里是否包含聚合(contain_agg_clause)、窗口函数
+ *   (contain_window_function)、子计划(contain_subplans)、易变/易失函数
+ *   (contain_mutable/volatile_functions)、执行期参数(contain_exec_param)
+ *   等,优化器据此决定能否把子句下推、能否并行、能否当作常量处理;
+ * - 并行与稳定性分析:max_parallel_hazard 系列判定表达式是否会在并行
+ *   worker 内产生不可接受的副作用(如 nextval),is_parallel_safe 据此决定
+ *   并行安全边界;
+ * - 可空性分析:find_nonnullable_rels / find_nonnullable_vars 在已知某子句为真
+ *   时推导哪些 rel / Var 不可能为 NULL,为连接顺序优化与外连接化简提供依据;
+ * - 常量折叠:eval_const_expressions 及其庞大的 mutator 体系把可提前求值的
+ *   子表达式折叠成 Const,并支持把 IMMUTABLE 的 SQL/PLpgSQL 函数内联
+ *   (inline_function)、按参数默认值补全等;
+ * - 常量识别:is_pseudo_constant_clause 判断子句是否"伪常量"(可在外层
+ *   只求值一次),is_strict_saop 判断严格 ScalarArrayOp 等;
+ * - GROUP BY 冲突检测:expression_has_grouping_conflict 等用于校验表达式的
+ *   分组一致性(如 HAVING 中引用未分组列)。
+ *
+ * 文件整体风格:多数探测类函数采用"外层函数 + *_walker 递归回调"结构,
+ * 外层负责准备上下文并初始化遍历,walker 按 nodeTag 分派、逐节点深挖;
+ * 常量折叠则以 eval_const_expressions_mutator 为主干、多个 simplify_*
+ * 助手函数分工,并借助 expression_tree_mutator 递归处理子节点。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/util/clauses.c
  *

@@ -6,6 +6,63 @@
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * 【模块总览(中文)】
+ * 本文件实现 PostgreSQL 查询优化器的"初始化计划"阶段,它是把分析器/重写器
+ * 产出的原始查询树(Query + jointree)加工成后续路径生成阶段所需的各种
+ * 规划器内部数据结构的关键模块。其核心目标可以概括为三件事:建立所有基础
+ * 关系(基表)的信息、把连接树(Jointree)拆解为连接关系与限制条件(qual),
+ * 以及为 GROUP BY、LATERAL、外连接等构造必要的辅助结构。
+ *
+ * 【职责与主要阶段】
+ * 1. 建立基础关系:add_base_rels_to_query() 递归扫描 jointree,为每个出现在
+ *    FROM 中的基表/子查询/函数 RTE 调用 build_simple_rel() 创建 RelOptInfo;
+ *    add_other_rels_to_query() 随后为继承/分区父表扩展出子关系(otherrel)。
+ * 2. 目标列收集:build_base_rel_tlists() 从最终目标列与 HAVING 子句中提取
+ *    需要的 Var 与 PlaceHolderVar,并通过 add_vars_to_targetlist() 把每个
+ *    Var 登记进其所属基础关系的 reltarget 与 attr_needed,保证后续计划树
+ *    每一层都能拿到该列(顶层用"关系 0"标记表示必须一直向上传递)。
+ * 3. 连接树拆解:deconstruct_jointree() 是本模块的中枢。它先调用
+ *    deconstruct_recurse() 深度优先遍历 jointree,为每个节点建立 JoinTreeItem
+ *    (记录 qualscope、inner_join_rels、左右 Relids 等),同时给外连接分配
+ *    JoinDomain 并标记被外连接置空的 rel;随后 deconstruct_distribute() 对
+ *    每个节点把 WHERE/JOIN ON 条件分发(distribute_qual_to_rels)到相应关系
+ *    的 baserestrictinfo / joininfo,并为每个外连接构造 SpecialJoinInfo 加入
+ *    root->join_info_list。带 LATERAL 引用而需推迟的条件会挂在父节点的
+ *    lateral_clauses 中,可交换的左连接条件则推迟到第三遍
+ *    deconstruct_distribute_oj_quals() 处理。
+ * 4. 限制条件的等价类(EquivalenceClass)加工:distribute_qual_to_rels() 对
+ *    可 mergejoin 的等式条件调用 process_equivalence() 把左右表达式送入 EC
+ *    机制;外连接等式则登记到 left/right/full_join_clauses 列表供后续使用。
+ * 5. GROUP BY 化简:remove_useless_groupby_columns() 利用唯一索引的函数依赖
+ *    关系删掉冗余的 GROUP BY 列;setup_eager_aggregation() 及相关辅助函数
+ *    尝试把聚合下推(eager aggregation)到连接之下。
+ * 6. LATERAL 引用处理:find_lateral_references() 提取子查询对外层 Var 的
+ *    引用并登记 where_needed,create_lateral_join_info() 计算每个基表的
+ *    direct_lateral_relids / lateral_relids / lateral_referencers。
+ * 7. 外键匹配:match_foreign_keys_to_quals() 把查询中的连接条件与 pg_constraint
+ *    中的外键约束匹配,用于更可靠的选择率估算。
+ *
+ * 【核心数据结构】
+ * - RelOptInfo:每个关系(基表或连接结果)的规划信息,含 targetlist、
+ *   baserestrictinfo、joininfo、attr_needed 等;
+ * - RestrictInfo:一个限制条件,记录所需关系集合 required_relids、安全级别、
+ *   is_pushed_down、以及 merge/hash join 能力;
+ * - SpecialJoinInfo:一个外连接的语义约束,记录 syn_lefthand/syn_righthand、
+ *   min_lefthand/min_righthand、lhs_strict、以及可交换性信息
+ *   (commute_above_l/r、commute_below_l/r);
+ * - JoinDomain:一组其条件可以自由重排的连接的"域",用于约束等价类与
+ *   伪常量条件的求值位置;
+ * - EquivalenceClass:若干被等号相连的表达式集合,是生成 join 路径、传递
+ *   相等性推导的核心;
+ * - JoinTreeItem:deconstruct_jointree 遍历过程中为每个 jointree 节点建立的
+ *   临时记录(本模块私有)。
+ *
+ * 【调用关系】
+ * 本模块各函数主要由 planner() 在规划一个查询的初期调用:先建关系,再建
+ * 目标列,然后 deconstruct_jointree() 分发所有条件,之后路径生成阶段
+ * (paths.c / joinpath.c)使用 RestrictInfo 与 SpecialJoinInfo 决定连接顺序;
+ * 在 join 被删除时 analyzejoins.c 会调用 rebuild_lateral_attr_needed()、
+ * rebuild_joinclause_attr_needed() 等重建 attr_needed 信息。
  *
  * IDENTIFICATION
  *	  src/backend/optimizer/plan/initsplan.c
@@ -174,6 +231,27 @@ static void check_memoizable(RestrictInfo *restrictinfo);
  * may be appendrel parents, which will require additional "otherrel"
  * RelOptInfos for their member rels, but those are added later.
  */
+/*
+ * add_base_rels_to_query - (中文)递归扫描连接树,为所有基础关系创建 RelOptInfo
+ *
+ * 【作用】查询规划的第一步:遍历整个 jointree(由 RangeTblRef / FromExpr /
+ * JoinExpr 三种节点组成的树),对每个 RangeTblRef 指向的非连接 RTE 调用
+ * build_simple_rel() 创建对应的 RelOptInfo,并把其指针存入
+ * root->simple_rel_array。由 planner() 在预处理器之后、构造目标列之前调用。
+ *
+ * 【设计思想】jointree 是 FROM 子句的结构化表示:RangeTblRef 是叶子(一个
+ * RTE),FromExpr 表示"多个项的内连接"(f->fromlist),JoinExpr 表示一个显式
+ * JOIN 节点。本函数只是按节点类型分类递归,对叶子节点建立关系信息。
+ * 处理结束后,查询中"每个被使用的非 join RTE"都应有一个 baserel
+ * RelOptInfo。注意:appendrel 父表(继承/分区)的子表 otherrel 此时还不建立,
+ * 留待 add_other_rels_to_query() 处理。
+ *
+ * 【参数】
+ *   root   —— 当前查询级的 PlannerInfo;
+ *   jtnode —— 当前待处理的 jointree 节点,初始调用时必须是
+ *             root->parse->jointree。
+ * 【返回值】无。
+ */
 void
 add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
 {
@@ -211,6 +289,24 @@ add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
  *
  * At the end of this process, there should be RelOptInfos for all relations
  * that will be scanned by the query.
+ */
+/*
+ * add_other_rels_to_query - (中文)为 appendrel(继承/分区)父表的子关系
+ * 创建 "otherrel" RelOptInfo
+ *
+ * 【作用】在 add_base_rels_to_query() 之后调用:扫描 simple_rel_array,
+ * 对每个标记了 rte->inh(可继承)的基础关系调用 expand_inherited_rtentry(),
+ * 为其所有子表/分区建立 reloptkind 为 RELOPT_OTHER_MEMBER_REL 的 otherrel
+ * RelOptInfo。处理完毕后,查询中所有可能被扫描的关系都具备了 RelOptInfo。
+ *
+ * 【设计思想】继承/分区表的每个子表虽然在执行时会作为独立扫描目标,但路径
+ * 生成时要以父表为入口、在 Append/MergeAppend 下枚举子表,因此必须为子表
+ * 单独建立 RelOptInfo 才能计算各自路径。本函数只关心 reloptkind ==
+ * RELOPT_BASEREL 的父关系,跳过空洞槽位(非 baserel RTE)与已生成的
+ * otherrel,避免重复展开。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无。
  */
 void
 add_other_rels_to_query(PlannerInfo *root)
@@ -250,6 +346,28 @@ add_other_rels_to_query(PlannerInfo *root)
  *
  * We mark such vars as needed by "relation 0" to ensure that they will
  * propagate up through all join plan steps.
+ */
+/*
+ * build_base_rel_tlists - (中文)把最终目标列与 HAVING 子句需要的 Var 加入
+ * 各基础关系的 targetlist
+ *
+ * 【作用】扫描查询的最终目标列 final_tlist(以及存在时的 HAVING 子句),
+ * 用 pull_var_clause() 抽出其中所有 Var 与 PlaceHolderVar,然后调用
+ * add_vars_to_targetlist() 把每个 Var 登记到其所属基础关系
+ * (rel->reltarget->exprs 与 rel->attr_needed)。由 planner() 在
+ * deconstruct_jointree() 之前调用。
+ *
+ * 【设计思想】顶层目标列与 HAVING 中的列是最晚才被消费的,必须保证它们能
+ * 一路从扫描节点向上传递到顶层计划节点。为此用 where_needed =
+ * bms_make_singleton(0),即"关系 0"(伪关系)来标记这些 Var,只要
+ * attr_needed 中包含了关系 0,计划树中每一层 join 都会继续带上该列。
+ * 对 HAVING 用 PVC_RECURSE_AGGREGATES | PVC_INCLUDE_PLACEHOLDERS 递归聚合
+ * 参数与占位符(HAVING 不会含 WindowFunc,故不递归 WindowFuncs)。
+ *
+ * 【参数】
+ *   root       —— 当前查询级的 PlannerInfo;
+ *   final_tlist —— 查询最终的目标列列表(processed_tlist)。
+ * 【返回值】无。
  */
 void
 build_base_rel_tlists(PlannerInfo *root, List *final_tlist)
@@ -297,6 +415,30 @@ build_base_rel_tlists(PlannerInfo *root, List *final_tlist)
  *	  PlaceHolderInfo entry, and update its ph_needed.
  *
  *	  See also add_vars_to_attr_needed.
+ */
+/*
+ * add_vars_to_targetlist - (中文)把一组 Var/PlaceHolderVar 加入其所属关系
+ * 的目标列,并标记需要它们的位置
+ *
+ * 【作用】对列表中的每个 Var:若其所属基础关系的 targetlist 里还没有这一列,
+ * 则加入 rel->reltarget->exprs(此时去掉 varnullingrels,因为扫描层取值尚未
+ * 被任何外连接置空),并把 where_needed 并入 rel->attr_needed[attno]。
+ * 对 PlaceHolderVar:查找/创建对应的 PlaceHolderInfo,把 where_needed 并入其
+ * ph_needed。由 build_base_rel_tlists()、extract_lateral_references()、
+ * distribute_qual_to_rels()、process_implied_equality() 等多处调用。
+ *
+ * 【设计思想】"某个 Var 在何处被需要"信息存放在 attr_needed 中:它是按
+ * 关系编号索引的 Bitmapset 数组,位 i 表示在编号 i 的连接(或最终输出)处
+ * 需要该列。连接顺序搜索时据此判断列的向上传递路径。PlaceHolderVar 没有
+ * 单一归属关系,故其需求单独存于 PlaceHolderInfo.ph_needed。若 where_needed
+ * 已是该关系自身的 relids 子集(即仅关系内部使用),则无需任何标记。
+ *
+ * 【参数】
+ *   root         —— 当前查询级的 PlannerInfo;
+ *   vars         —— 待处理的 Var / PlaceHolderVar 节点列表;
+ *   where_needed —— 一个非空 Relids 集合,指明这些值在哪些连接处被需要
+ *                   (包含关系 0 表示顶层输出需要)。
+ * 【返回值】无。
  */
 void
 add_vars_to_targetlist(PlannerInfo *root, List *vars,
@@ -369,6 +511,27 @@ add_vars_to_targetlist(PlannerInfo *root, List *vars,
  *	  inefficiency seems tiny enough to not be worth spending planner
  *	  cycles to get rid of it.
  */
+/*
+ * add_vars_to_attr_needed - (中文)只更新 Var/PlaceHolderVar 的需求集合
+ * (attr_needed / ph_needed),不向 targetlist 添加新列
+ *
+ * 【作用】add_vars_to_targetlist() 的子集操作:假定列表中所有 Var 已经在
+ * 其所属关系的 targetlist 中(由先前调用保证),此处仅把 where_needed 并入
+ * 各 Var 的 rel->attr_needed 与各 PHV 的 phinfo->ph_needed。
+ *
+ * 【设计思想】当 analyzejoins.c 移除了一个无用外连接后,被移除的连接条件
+ * 可能是某个 Var 的唯一上层使用点,因而需要重建 attr_needed/ph_needed 以便
+ * 缩小需求、为后续进一步的连接移除创造条件。与 add_vars_to_targetlist
+ * 不同的是本函数不复制节点也不改 targetlist——因为列已存在。若某 Var 的
+ * attr_needed 被缩成空,它仍会留在 targetlist 中,只是多输出一列、开销极小,
+ * 不值得为此消耗规划周期。
+ *
+ * 【参数】
+ *   root         —— 当前查询级的 PlannerInfo;
+ *   vars         —— 待处理节点列表(须已登记在 targetlist);
+ *   where_needed —— 非空 Relids,指明这些值在哪些连接处被需要。
+ * 【返回值】无。
+ */
 void
 add_vars_to_attr_needed(PlannerInfo *root, List *vars,
 						Relids where_needed)
@@ -427,6 +590,29 @@ add_vars_to_attr_needed(PlannerInfo *root, List *vars,
  * Relcache invalidations will ensure that cached plans become invalidated
  * when the underlying supporting indexes are dropped or if a column's NOT
  * NULL attribute is removed.
+ */
+/*
+ * remove_useless_groupby_columns - (中文)删除因函数依赖而冗余的 GROUP BY 列
+ *
+ * 【作用】若 GROUP BY 中有多个列,且某关系存在一个"列集是这些分组列的
+ * 真子集"的唯一索引,则由索引列即可唯一确定分组,其余列是函数依赖冗余,
+ * 应把它们从 root->processed_groupClause 中移除,从而避免多余的排序/哈希。
+ * 由 planner() 在目标列处理阶段调用。
+ *
+ * 【设计思想】
+ * - 先扫 GROUP BY 收集各关系的分组列号(groupbyattnos)与分组列兼容信息
+ *   (groupbycols,记录 attno、合并操作符族、排序规则);
+ * - 再对每个普通基表扫描其索引:要求索引唯一、立即(非 deferrable)、无
+ *   谓词、无表达式列,且各索引列均 NOT NULL(或索引声明 NULLS NOT
+ *   DISTINCT),并且每个索引列的等值操作符与排序规则能在某个 GROUP BY
+ *   项上找到一致匹配;
+ * - 选取"列数最少"的满足条件的索引,用它覆盖的列作为保留集合,其余
+ *   GROUP BY 项列为冗余(surplusvars);
+ * - 重建 GROUP BY 列表,保留非 Var、外层 Var 与非冗余项。被剔除项的
+ *   ressortgroupref 标记残留无害。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无。
  */
 void
 remove_useless_groupby_columns(PlannerInfo *root)
@@ -690,6 +876,25 @@ remove_useless_groupby_columns(PlannerInfo *root)
  *	  Check if eager aggregation is applicable, and if so collect suitable
  *	  aggregate expressions and grouping expressions in the query.
  */
+/*
+ * setup_eager_aggregation - (中文)检查"急切聚合"(把聚合下推到连接之下)
+ * 是否可用,若可用则收集合适的聚合表达式与分组表达式
+ *
+ * 【作用】由 planner() 在 deconstruct_jointree() 之前调用。先用一连串快速
+ * 检查排除不适用急切聚合的情况(如用户关闭开关、无 GROUP BY、分组集、
+ * 有序/去重聚合、非 partial 聚合、SRF 目标列、单基表查询、聚合状态内存
+ * 可能无界等),随后用 create_agg_clause_infos() 从 targetlist 与 havingQual
+ * 收集 Aggref 与普通 Var,再用 create_grouping_expr_infos() 收集分组表达式,
+ * 结果分别存于 root->agg_clause_list / root->tlist_vars / root->group_expr_list。
+ *
+ * 【设计思想】急切聚合是在 GROUP BY 列经过外连接侧保持"非空"时,把聚合放到
+ * 连接之前(对连接输入先做部分聚合),大幅缩小连接输入规模。判断聚合能否下推、
+ * 是否安全(等价于"相等必同像",防止丢失精度)由被收集的信息支撑;后续
+ * setup_eager_agg_path() 才真正生成路径。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无。
+ */
 void
 setup_eager_aggregation(PlannerInfo *root)
 {
@@ -777,6 +982,19 @@ setup_eager_aggregation(PlannerInfo *root)
  * partial aggregation results might be stored in join hash tables or
  * materialized nodes.
  */
+/*
+ * is_partial_agg_memory_risky - (中文)检查是否存在使部分聚合内存占用无界的聚合
+ *
+ * 【作用】遍历 root->aggtransinfos,只要发现某个聚合的 aggtransspace 为负
+ * (表示其转移状态大小不可估量、可无限增长),即返回 true。
+ *
+ * 【设计思想】急切聚合会把部分聚合结果保存在 join 哈希表或物化节点中,
+ * 若某个聚合的转移状态可无界增长(aggtransspace < 0),内存风险过高,应禁止
+ * 急切聚合。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】任一聚合有内存风险则返回 true,否则 false。
+ */
 static bool
 is_partial_agg_memory_risky(PlannerInfo *root)
 {
@@ -797,6 +1015,26 @@ is_partial_agg_memory_risky(PlannerInfo *root)
  * create_agg_clause_infos
  *	  Search the targetlist and havingQual for Aggrefs and plain Vars, and
  *	  create an AggClauseInfo for each Aggref node.
+ */
+/*
+ * create_agg_clause_infos - (中文)在目标列与 HAVING 中搜索 Aggref 与普通 Var,
+ * 为每个可下推的 Aggref 创建 AggClauseInfo
+ *
+ * 【作用】用 pull_var_clause() 抽出 targetlist(含 window func 递归)与
+ * havingQual 中的聚合/Var/占位符,遍历处理:遇到 GroupingFunc、含 volatile
+ * 函数的聚合、非 leakproof 聚合(存在 securityQuals 时)、或聚合引用了全部
+ * 基表(无处可下推)等情况时,整体放弃急切聚合;否则为该聚合创建
+ * AggClauseInfo(记录 aggref 与 agg_eval_at 涉及的关系集合)。结果存入
+ * root->agg_clause_list 与 root->tlist_vars。
+ *
+ * 【设计思想】急切聚合要保证语义不变:volatile 函数在部分聚合时会减少求值
+ * 次数、可能改变结果;安全级别下推要求聚合函数 leakproof,否则会绕过行级
+ * 安全过滤把不该透露的中间结果暴露到 join 中。agg_eval_at 用于判断聚合涉及
+ * 哪些关系,以便在正确的连接层次进行部分聚合。若中途失败则清空列表
+ * (deep free)。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无,结果写入 root。
  */
 static void
 create_agg_clause_infos(PlannerInfo *root)
@@ -927,6 +1165,25 @@ create_agg_clause_infos(PlannerInfo *root)
  * If any grouping expression is not suitable, we will just return with
  * root->group_expr_list being NIL.
  */
+/*
+ * create_grouping_expr_infos - (中文)为每个可作分组键的表达式创建
+ * GroupingExprInfo
+ *
+ * 【作用】遍历 root->processed_groupClause,对每个分组项取出其 targetlist
+ * 表达式。仅当表达式是普通 Var、类型有 btree 操作族、且其
+ * BTEQUALIMAGE_PROC(等值即同像)过程返回真(以保证"等值分组"不丢失对上层
+ * 条件必要的字节级信息)时,才把它收入候选;否则函数直接返回、使
+ * group_expr_list 保持 NIL(表示急切聚合不可用)。最终为每个候选表达式构造
+ * GroupingExprInfo(记录 expr 副本、sortgroupref 及所属等价类 ec)。
+ *
+ * 【设计思想】急切聚合的关键约束是"相等⇒同像":如 NUMERIC 的 0 与 0.0
+ * 等值但字节不同,若被放入同一组,上层 quals 可能依赖被丢弃的精度。
+ * BTEQUALIMAGE_PROC 正是检测该属性的标准接口,调用时须传递表达式实际
+ * 排序规则,正确处理非确定性 collation。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无,候选结果写入 root->group_expr_list。
+ */
 static void
 create_grouping_expr_infos(PlannerInfo *root)
 {
@@ -1018,6 +1275,25 @@ create_grouping_expr_infos(PlannerInfo *root)
  *	  Given a group clause and an expression, find an existing equivalence
  *	  class that the expression is a member of; return NULL if none.
  */
+/*
+ * get_eclass_for_sortgroupclause - (中文)根据分组子句与表达式查找其所属的
+ * 现有等价类;无则返回 NULL
+ *
+ * 【作用】create_grouping_expr_infos() 的辅助函数:由分组子句的排序操作符
+ * 得到操作族(opfamily)与输入类型,再取该操作族的等值操作符、由其得到完整
+ * 的 mergejoin 操作族集合,最后委托 get_eclass_for_sort_expr() 查找/创建
+ * 等价类。
+ *
+ * 【设计思想】SortGroupClause 只携带 sortop 而不携带 collation,排序规则须
+ * 从表达式本身获取。等价类的操作族列表必须基于等值操作符所属的全部操作族
+ * (一个等值操作符可同时属于多个 opfamily),故不能直接用 sortop 所在操作族。
+ *
+ * 【参数】
+ *   root —— 当前查询级的 PlannerInfo;
+ *   sgc  —— 分组/排序子句;
+ *   expr —— 对应的分组表达式。
+ * 【返回值】匹配的 EquivalenceClass;若分组子句不可排序则返回 NULL。
+ */
 static EquivalenceClass *
 get_eclass_for_sortgroupclause(PlannerInfo *root, SortGroupClause *sgc,
 							   Expr *expr)
@@ -1092,6 +1368,25 @@ get_eclass_for_sortgroupclause(PlannerInfo *root, SortGroupClause *sgc,
  * This has to run before deconstruct_jointree, since it might result in
  * creation of PlaceHolderInfos.
  */
+/*
+ * find_lateral_references - (中文)为每个 LATERAL 子查询提取其对当前查询级
+ * Var/PlaceHolderVar 的引用,并确保这些值在求值时可用
+ *
+ * 【作用】在 deconstruct_jointree() 之前运行:若查询含 LATERAL RTE,遍历所有
+ * baserel(仅 RELOPT_BASEREL,忽略 otherrel),对每个 LATERAL 关系调用
+ * extract_lateral_references() 提取其引用并把 where_needed 设为该 LATERAL
+ * 关系本身,保证被引用的 Var/PHV 能传播到嵌套循环的连接层。
+ *
+ * 【设计思想】后续规划步骤会确保 Var/PHV 的源关系位于 LATERAL 子查询的外层
+ * (nestloop 外侧),这里则需为它们设置合适的 where_needed 使其一路传到
+ * nestloop join 层。仅处理未被扁平化的 LATERAL 子查询;被拉平后其引用成为
+ * 普通 Var,必要时包进 PlaceHolderVar 的置空处理在别处完成。忽略 otherrel
+ * 是因为继承/UNION ALL 拉平场景下规划以父表 relid 为准,父表 RTE 已含全部
+ * 所需引用信息。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无。
+ */
 void
 find_lateral_references(PlannerInfo *root)
 {
@@ -1140,6 +1435,30 @@ find_lateral_references(PlannerInfo *root)
 	}
 }
 
+/*
+ * extract_lateral_references - (中文)提取单个 LATERAL 关系对外层 Var/PHV 的
+ * 引用,调整层级并登记到源关系的 targetlist
+ *
+ * 【作用】find_lateral_references() 的辅助函数。根据 RTE 类型(RTE_RELATION
+ * 的 tablesample、RTE_SUBQUERY 的 subquery、RTE_FUNCTION、RTE_TABLEFUNC、
+ * RTE_VALUES)用 pull_vars_of_level() 抽出指定 levelsup(子查询为 1,其余
+ * 为 0)的 Var/PHV;对每个引用做副本:Var 直接把 varlevelsup 清零,PHV 则用
+ * IncrementVarSublevelsUp() 降级并(若来自子查询)对其 phexpr 执行
+ * preprocess_phv_expression()。最后把 where_needed 设为 LATERAL RTE 自身的
+ * relids,调用 add_vars_to_targetlist() 登记,并把结果保存到
+ * brel->lateral_vars 供后续重建与连接信息计算使用。
+ *
+ * 【设计思想】"needed at LATERAL RTE"是一种取巧但正确的标记:形式化地应标记
+ * 在 LATERAL RTE 与其源 RTE 的连接处,但统一标在 LATERAL RTE 上能保证在
+ * 到达该连接时列必然已向上传递,且实现简单。PHV 调整比 Var 复杂,因其内部
+ * 表达式也可能含子层引用。
+ *
+ * 【参数】
+ *   root    —— 当前查询级的 PlannerInfo;
+ *   brel    —— LATERAL 关系对应的 RelOptInfo;
+ *   rtindex —— 该关系在 simple_rte_array 中的索引。
+ * 【返回值】无。
+ */
 static void
 extract_lateral_references(PlannerInfo *root, RelOptInfo *brel, Index rtindex)
 {
@@ -1241,6 +1560,22 @@ extract_lateral_references(PlannerInfo *root, RelOptInfo *brel, Index rtindex)
  * useless outer join.  It should match what find_lateral_references did,
  * except that we call add_vars_to_attr_needed not add_vars_to_targetlist.
  */
+/*
+ * rebuild_lateral_attr_needed - (中文)在删除无用外连接后,为 LATERAL 引用
+ * 涉及的 Var/PHV 重建 attr_needed/ph_needed 位
+ *
+ * 【作用】效果与 find_lateral_references() 一致,但调用的是
+ * add_vars_to_attr_needed() 而非 add_vars_to_targetlist():直接复用各 baserel
+ * 已保存的 lateral_vars,把 where_needed(bms_make_singleton(rti))并入其
+ * attr_needed / ph_needed。由 analyzejoins.c 在移除无用外连接后调用。
+ *
+ * 【设计思想】连接被移除后,某个 Var 原本由被删条件提供的上层需求消失,其
+ * attr_needed 需要收缩,才可能让后续更激进的连接消除继续进行;而 LATERAL
+ * 引用的需求始终存在,必须原样补回。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无。
+ */
 void
 rebuild_lateral_attr_needed(PlannerInfo *root)
 {
@@ -1278,6 +1613,28 @@ rebuild_lateral_attr_needed(PlannerInfo *root)
  * create_lateral_join_info
  *	  Fill in the per-base-relation direct_lateral_relids, lateral_relids
  *	  and lateral_referencers sets.
+ */
+/*
+ * create_lateral_join_info - (中文)计算每个基表的 direct_lateral_relids、
+ * lateral_relids 与 lateral_referencers 集合
+ *
+ * 【作用】在 placeholdersFrozen 之后、连接规划之前调用。第一步:遍历所有
+ * baserel,从其 lateral_vars 中直接收集被引用的 Var 的 varno 与 PHV 的
+ * ph_eval_at,填入 direct_lateral_relids 与 lateral_relids。第二步:检查每个
+ * 含横向引用(ph_lateral)的 PlaceHolderVar:求值点在单基表时,把其源关系
+ * 并入该基表的 direct+lateral 集合;求值点是连接时,则仅并入各基表的
+ * lateral_relids(间接依赖)。第三步:用 Warshall 算法求 lateral_relids 的
+ * 传递闭包;第四步:构造反向映射,把"谁引用了我"写入各基表的
+ * lateral_referencers。若无任何实际横向引用,把 hasLateralRTEs 复位以免
+ * 后续做无用功。
+ *
+ * 【设计思想】direct vs indirect 区分:若 X 被置于 Y 的 nestloop 内侧,则 X
+ * 的所有间接依赖(Z)也必须在外侧,故传递闭包必须存在;而 indirect(经由
+ * join 求值点)不能直接把两表单独相接,只能靠连接顺序约束满足。外连接
+ * (eval_at 中的 OJ 伪 relid)不进入求值点集合,避免连接顺序重排后失效。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无,各 RelOptInfo 的字段被填充。
  */
 void
 create_lateral_join_info(PlannerInfo *root)
@@ -1518,6 +1875,31 @@ create_lateral_join_info(PlannerInfo *root)
  * sub-joinlists arise only from FULL OUTER JOIN or when collapsing of
  * subproblems is stopped by join_collapse_limit or from_collapse_limit.
  */
+/*
+ * deconstruct_jointree - (中文)递归扫描查询连接树,分发 WHERE 与 JOIN/ON
+ * 条件到限制/连接列表,并为外连接建立 SpecialJoinInfo,返回连接顺序决策表
+ *
+ * 【作用】由 planner() 在目标列建立之后调用,是连接条件加工的中枢。整体分
+ * 三遍完成:
+ *   1) 置 placeholdersFrozen(此后不得再创建 PlaceHolderInfo),取顶层
+ *      JoinDomain,调用 deconstruct_recurse() 深度优先遍历 jointree,为每个
+ *      节点建立 JoinTreeItem 加入 item_list(深搜顺序),同时累积
+ *      all_baserels、outer_join_rels、为外连接分配 JoinDomain;
+ *   2) 对每个 JoinTreeItem 调用 deconstruct_distribute() 把条件分发到
+ *      baserestrictinfo / joininfo,并生成/注册各外连接的 SpecialJoinInfo;
+ *   3) 若存在被推迟的可交换左连接条件(oj_joinclauses),调用
+ *      deconstruct_distribute_oj_quals() 做第三遍处理。
+ * 最后释放 item_list 并返回 root->joinlist。
+ *
+ * 【返回值语义】返回的 "joinlist" 是嵌套列表:元素要么是 RangeTblRef
+ * jointree 节点,要么是子 joinlist。同一层级的项必须由 make_one_rel() 决定
+ * 连接顺序(合法顺序受 SpecialJoinInfo 约束);子 joinlist 代表需单独规划
+ * 的子问题(目前仅 FULL OUTER JOIN 或超过 join_collapse_limit /
+ * from_collapse_limit 时产生)。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】joinlist,见上述语义。
+ */
 List *
 deconstruct_jointree(PlannerInfo *root)
 {
@@ -1599,6 +1981,38 @@ deconstruct_jointree(PlannerInfo *root)
  * (Hence, after each call, the last list item corresponds to its jtnode.)
  *
  * Return value is the appropriate joinlist for this jointree node.
+ */
+/*
+ * deconstruct_recurse - (中文)deconstruct_jointree 初始扫描的每一层递归
+ *
+ * 【作用】按节点类型递归处理 jointree,同时完成:
+ * - 为当前节点创建 JoinTreeItem(palloc0_object,先不入 item_list,结束时
+ *   按深度优先顺序追加),记录 jti_parent;
+ * - RangeTblRef(叶子):把 varno 加入 root->all_baserels 与 parent_domain 的
+ *   jd_relids,设置 qualscope 为单元素集合,inner_join_rels 为空;
+ * - FromExpr:所有子节点属于 parent_domain,递归处理子节点并拼接 joinlist
+ *   (不超过 from_collapse_limit 时折叠子问题,单元素子问题总是折叠);
+ * - JoinExpr:按连接类型处理——INNER/SEMI 属于 parent_domain;LEFT/ANTI
+ *   为 RHS 新建 JoinDomain(child_domain)并把自身 relids(含 rtindex)并入
+ *   parent_domain;FULL 为自身 ON 条件新建专属 fj_domain 且左右各建独立
+ *   child_domain,自身 relids 同时并入父域。同时更新 outer_join_rels、
+ *   调用 mark_rels_nulled_by_join() 记录被置空的关系,计算每个域的
+ *   jd_relids 以及 left_rels / right_rels / nonnullable_rels。
+ * - 依 join_collapse_limit 折叠/分隔输出 joinlist(FULL 强制精确顺序)。
+ *
+ * 【设计思想】JoinDomain 把"条件可自由重排的连接"划为一个域:域内条件可
+ * 下推重排,跨域不可。LEFT/ANTI 的 RHS 条件与 JOIN ON 必须留在 RHS 域内
+ * (防止条件错误地下推到外连接外侧),故为 RHS 单独建域;FULL 的 ON 条件
+ * 则更需要完全独立的域。这些域约束将在 deconstruct_distribute() 及后续
+ * 等价类/伪常量处理中被遵守。
+ *
+ * 【参数】
+ *   root          —— 当前查询级的 PlannerInfo;
+ *   jtnode        —— 当前待处理的 jointree 节点;
+ *   parent_domain —— 本节点所属的外层 JoinDomain;
+ *   parent_jtitem —— 父节点的 JoinTreeItem(顶层为 NULL);
+ *   item_list     —— 入/出参数,按深度优先顺序累积 JoinTreeItem。
+ * 【返回值】本节点的 joinlist(见 deconstruct_jointree 的语义)。
  */
 static List *
 deconstruct_recurse(PlannerInfo *root, Node *jtnode,
@@ -1898,6 +2312,33 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
  * Distribute quals of the node to appropriate restriction and join lists.
  * In addition, entries will be added to root->join_info_list for outer joins.
  */
+/*
+ * deconstruct_distribute - (中文)deconstruct_jointree 第二遍:处理一个
+ * jointree 节点,分发其条件并登记外连接
+ *
+ * 【作用】对每个 JoinTreeItem:
+ * - RangeTblRef:若存在安全隔离条件(qual_security_level > 0),调用
+ *   process_security_barrier_quals() 处理 RTE 上的 securityQuals;
+ * - FromExpr:先把子节点推迟上来的 lateral_clauses、再处理本层 top-level
+ *   quals,均委托 distribute_quals_to_rels() 分发;
+ * - JoinExpr:合并本层推迟的 lateral_clauses 与 j->quals 作为 my_quals;对
+ *   非内连接先用 make_outerjoininfo() 构造 SpecialJoinInfo(存于
+ *   jtitem->sjinfo),并计算 ojscope(SEMI 特例为 NULL);对 lhs_strict 的
+ *   LEFT JOIN 把非退化连接条件推迟到 oj_joinclauses(补回被移除的
+ *   commute_below relids 以通过 ojscope 交叉检查);最后用
+ *   distribute_quals_to_rels() 分发 my_quals,并把 SpecialJoinInfo 加入
+ *   root->join_info_list。
+ *
+ * 【设计思想】条件推迟(oj_joinclauses)服务于连接恒等式 3 的交换:当左连接
+ * 的 ON 条件对 LHS 严格(lhs_strict)时,该左连接可能与另一个左连接交换,
+ * 故其非退化条件应推迟到第三遍重新决策放置位置;退化条件(只依赖左侧)会
+ * 自然下坠无需推迟。
+ *
+ * 【参数】
+ *   root    —— 当前查询级的 PlannerInfo;
+ *   jtitem  —— 本遍要处理的 JoinTreeItem。
+ * 【返回值】无。
+ */
 static void
 deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
 {
@@ -2050,6 +2491,26 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
  * them for purposes like equivalence class creation.  Quals attached to
  * individual child rels will be dealt with during path creation.
  */
+/*
+ * process_security_barrier_quals - (中文)把安全屏障条件(securityQuals)转移
+ * 到关系的 baserestrictinfo
+ *
+ * 【作用】重写器已把相关安全屏障条件放入 RTE 的 securityQuals 字段,现在把它们
+ * 复制进该关系(以 rti 标识)的 baserestrictinfo。securityQuals 是隐式 AND
+ * 的子列表列表:同一子列表内所有条件同一安全级别,后续子列表级别递增
+ * (security_level 从 0 起逐次加一)。
+ *
+ * 【设计思想】ojscope 取qualscope 而非更合理的 NULL 是一种"作弊":其唯一效果
+ * 是强制"无 Var 条件"在该关系处求值而非上推到树顶,这正是安全屏障需要的
+ * (不能把 RLS 条件提到可被绕过的位置)。继承场景只考虑挂在父表上的条件,
+ * 它们对所有子表同样有效,可用于等价类等;子表自身的条件在路径生成期处理。
+ *
+ * 【参数】
+ *   root   —— 当前查询级的 PlannerInfo;
+ *   rti    —— 基础关系的 RTE 索引;
+ *   jtitem —— 该关系所属的 JoinTreeItem(提供 qualscope)。
+ * 【返回值】无。
+ */
 static void
 process_security_barrier_quals(PlannerInfo *root,
 							   int rti, JoinTreeItem *jtitem)
@@ -2100,6 +2561,27 @@ process_security_barrier_quals(PlannerInfo *root,
  *	ojrelid: RT index of the join RTE (must not be 0)
  *	lower_rels: the base+OJ Relids syntactically below nullable side of join
  */
+/*
+ * mark_rels_nulled_by_join - (中文)为被本外连接置空(放到 nullable 侧)的
+ * 基础关系填充 RelOptInfo.nulling_relids
+ *
+ * 【作用】遍历 lower_rels(该外连接 nullable 侧语法下属的所有 base+OJ relids),
+ * 对每个基础关系在其 nulling_relids 中加入 ojrelid,表示"当这个外连接丢弃
+ * 一行时,该关系会被置空"。由 deconstruct_recurse() 在遍历 LEFT/FULL join
+ * 时调用(LEFT 只标记 RHS,FULL 两侧都标记)。
+ *
+ * 【设计思想】nulling_relids 是现代 PostgreSQL(14+ 引入,替代老式
+ * nullable_relids 语义)用于执行期 varnullingrels 与 PlaceHolderVar 置空计算
+ * 的基础:上层在引用被置空关系的列时,需据此在 Var 上标注
+ * varnullingrels,以便 EvalPlanQual / 外连接下推等场景正确判断空值。忽略
+ * RTE_GROUP 特殊 RTE;遇到 OJ 伪 relid 时跳过(外连接本身不在此列)。
+ *
+ * 【参数】
+ *   root       —— 当前查询级的 PlannerInfo;
+ *   ojrelid    —— 外连接 RTE 的 RT 索引(不能为 0);
+ *   lower_rels —— nullable 侧语法下属的 base+OJ Relids。
+ * 【返回值】无。
+ */
 static void
 mark_rels_nulled_by_join(PlannerInfo *root, Index ojrelid,
 						 Relids lower_rels)
@@ -2141,6 +2623,44 @@ mark_rels_nulled_by_join(PlannerInfo *root, Index ojrelid,
  * Note: we assume that this function is invoked bottom-up, so that
  * root->join_info_list already contains entries for all outer joins that are
  * syntactically below this one.
+ */
+/*
+ * make_outerjoininfo - (中文)为当前外连接构建 SpecialJoinInfo,计算其最小
+ * 左右侧集合、严格性与可交换性约束
+ *
+ * 【作用】由 deconstruct_distribute() 对每个非内连接(LEFT/FULL/SEMI/ANTI)
+ * 自底向上调用。核心步骤:
+ * 1) 检查 FOR [KEY] UPDATE/SHARE 是否落到外连接 nullable 侧,若是则报错
+ *    (执行器不支持在 nullable 侧做行锁定;解析器信息不足,只能在此发现);
+ * 2) 填入 syn_lefthand/syn_righthand/jointype/ojrelid,初始化可交换字段;
+ * 3) 调用 compute_semijoin_info() 分析半/反连接内部连接信息;FULL JOIN
+ *    特例直接取左右语法的完整集合、lhs_strict 置 false;
+ * 4) 计算 clause_relids 与 strict_relids(find_nonnullable_rels),
+ *    lhs_strict 表示条件对任一 LHS 关系严格;
+ * 5) min_lefthand = 条件涉及 ∩ 语法 LHS;min_righthand = (条件涉及 ∪
+ *    下层 inner_join_rels) ∩ 语法 RHS(把下层内连接并入以禁止与它们交换);
+ * 6) 遍历已存在的下层外连接,维护连接顺序约束:遇到 FULL JOIN 作为屏障把
+ *    整个 FULL join 扩展进 min_lefthand/min_righthand;遇到含不安全 PHV、
+ *    SEMI/ANTI 或条件不严格的 LHS 下层 OJ 时保留顺序(把其语法集合并入
+ *    min_lefthand);满足外连接恒等式 3 时把下层 ojrelid 从 min_lefthand
+ *    移除以允许交换;RHS 侧遇到外连接时同样并入 min_righthand。
+ *
+ * 【设计思想】SpecialJoinInfo 决定连接顺序搜索的合法性。min_lefthand/
+ * min_righthand 分别表示"本外连接之前必须已完成的集合";commute_below_l/r
+ * 记录允许交换的下层外连接;恒等式 3(A LEFT JOIN B LEFT JOIN C,当 ON 对 B
+ * 严格且不涉及 A 时,A 可与 B 交换)是连接树重排的重要理论依据。PHV 的不
+ * 安全性:若条件引用了必须在某下层外连接之上求值的 PlaceHolderVar,则不得
+ * 与它交换。
+ *
+ * 【参数】
+ *   root            —— 当前查询级的 PlannerInfo;
+ *   left_rels       —— 连接外侧语法上的 base+OJ Relids;
+ *   right_rels      —— 连接内侧语法上的 base+OJ Relids;
+ *   inner_join_rels —— 本连接之下参与内连接的 base+OJ Relids;
+ *   jointype        —— JOIN_LEFT/FULL/SEMI/ANTI 之一;
+ *   ojrelid         —— 外连接 RTE 的 RT 索引(SEMI 为 0);
+ *   clause          —— 外连接的连接条件(隐式 AND 格式)。
+ * 【返回值】新建的 SpecialJoinInfo(不加入 join_info_list,由调用者加入)。
  */
 static SpecialJoinInfo *
 make_outerjoininfo(PlannerInfo *root,
@@ -2482,6 +3002,35 @@ make_outerjoininfo(PlannerInfo *root,
  * Note: this relies on only the jointype and syn_righthand fields of the
  * SpecialJoinInfo; the rest may not be set yet.
  */
+/*
+ * compute_semijoin_info - (中文)填充新 SpecialJoinInfo 的半连接相关字段
+ *
+ * 【作用】由 make_outerjoininfo() 调用。对非 SEMI 连接,初始化
+ * semi_can_btree=false、semi_can_hash=false、semi_operators=NIL、
+ * semi_rhs_exprs=NIL 后即返回。对 SEMI 连接,扫描其语法关联的(IN 的合成
+ * 比较列表或 EXISTS 的 WHERE)条件列表,逐个检查:
+ * - 条件只涉及一侧(单边引用):忽略之,但若含 volatile 函数则整体放弃
+ *   (不能安全地用于去重推导);
+ * - 非二元操作符但涉及两侧:放弃;
+ * - 二元等值操作符:若 RHS 变量恰在某一边(必要时取交换算子把 RHS 换到
+ *   右侧),记录该操作符与 RHS 表达式;要求所有条件均为 btree 兼容(检查
+ *   排序操作族)和/或 hash 兼容(enable_hashagg 才考虑哈希),据此置
+ *   all_btree / all_hash,最终把结果写入 sjinfo。
+ *
+ * 【设计思想】半连接的 RHS 若能"去重(unique-ify)",执行时可把 SEMI 变成
+ * 内连接+去重,显著提升性能。判断依据:连接条件全为等值、且每个等值条件
+ * 一侧只含 RHS 变量,即可用该 RHS 表达式集合做 btree/hash 去重。
+ * semi_operators 存的是连接算子本身(必要时已交换),交叉类型算子可能没有
+ * 对应的单类型去重算子——这里假设届时 btree/hash 操作类能提供,否则
+ * create_unique_plan() 会失败报错。语法关联条件可能含语义上不相关(单侧)
+ * 的子句,它们会自然下坠到单侧处理,故只需考虑语法关联条件即可。
+ *
+ * 【参数】
+ *   root   —— 当前查询级的 PlannerInfo;
+ *   sjinfo —— 待填充的 SpecialJoinInfo(须已设置 jointype 与 syn_righthand);
+ *   clause —— 与半连接语法关联的条件列表。
+ * 【返回值】无。
+ */
 static void
 compute_semijoin_info(PlannerInfo *root, SpecialJoinInfo *sjinfo, List *clause)
 {
@@ -2659,6 +3208,32 @@ compute_semijoin_info(PlannerInfo *root, SpecialJoinInfo *sjinfo, List *clause)
  * This runs immediately after we've completed the deconstruct_distribute scan.
  * jtitems contains all the JoinTreeItems (in depth-first order), and jtitem
  * is one that has postponed oj_joinclauses to deal with.
+ */
+/*
+ * deconstruct_distribute_oj_quals - (中文)第三遍处理被推迟的可交换左连接
+ * 条件:调整 nullingrels 标记后推入连接条件列表与等价类
+ *
+ * 【作用】在 deconstruct_distribute() 完成后运行,对每个含 oj_joinclauses
+ * 的节点处理其被推迟的条件。先由 SpecialJoinInfo 重新计算语法与语义作用域
+ * (qualscope/ojscope/nonnullable_rels)。若该连接可按恒等式 3 与其他连接
+ * 交换(commute_above_r 或 commute_below_l 非空),则须生成同一连接条件的
+ * 多种 nullingrels 变体:先剥掉 commute_below 连接的置空位,然后沿
+ * jtitems(深度优先=语法嵌套顺序)逐个处理参与交换的连接,在"下方/上方"
+ * 判定后按当前栈把对应的置空位逐层加回,每生成一批 RestrictInfo 就重置
+ * root->last_rinfo_serial,使同一条件派生的 RestrictInfo 共享相同 serial
+ * (用于后续去重检测)。同时用 incompatible_joins 标记不能把克隆条件应用
+ * 到其上的连接,防止错误层次求值;否则直接把推迟的条件原样分发。
+ *
+ * 【设计思想】恒等式 3 交换后,同一连接条件可能在若干不同连接层次被
+ * 求值,而 Var/PHV 上的 varnullingrels 必须与该层次一致,否则外连接空值
+ * 语义错误。为每种"交换组合"生成带不同置空标记的条件变体(clone),
+ * 并让不同变体共享 serial 号,既覆盖了所有合法放置,又便于检测重复使用。
+ *
+ * 【参数】
+ *   root    —— 当前查询级的 PlannerInfo;
+ *   jtitems —— 全部 JoinTreeItem 列表(深度优先顺序);
+ *   jtitem  —— 有待处理 oj_joinclauses 的节点。
+ * 【返回值】无。
  */
 static void
 deconstruct_distribute_oj_quals(PlannerInfo *root,
@@ -2901,6 +3476,18 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
  *	  Convenience routine to apply distribute_qual_to_rels to each element
  *	  of an AND'ed list of clauses.
  */
+/*
+ * distribute_quals_to_rels - (中文)便捷封装:把一条 AND 连接的条件列表逐项
+ * 交给 distribute_qual_to_rels() 处理
+ *
+ * 【作用】distribute_qual_to_rels() 的参数集被多处(deconstruct_distribute、
+ * deconstruct_distribute_oj_quals、process_security_barrier_quals)使用,
+ * 本函数仅循环调用,避免重复展开这些参数。
+ *
+ * 【参数】与 distribute_qual_to_rels() 完全一致,仅把单个 clause 换成
+ * clauses 列表。
+ * 【返回值】无。
+ */
 static void
 distribute_quals_to_rels(PlannerInfo *root, List *clauses,
 						 JoinTreeItem *jtitem,
@@ -2978,6 +3565,48 @@ distribute_quals_to_rels(PlannerInfo *root, List *clauses,
  * At the time this is called, root->join_info_list must contain entries for
  * at least those special joins that are syntactically below this qual.
  * (We now need that only for detection of redundant IS NULL quals.)
+ */
+/*
+ * distribute_qual_to_rels - (中文)把单个连接/过滤条件分发到各基础关系的
+ * baserestrictinfo 或 joininfo(必要时送入等价类/推迟列表)
+ *
+ * 【作用】分发单个条件的核心例程,流程如下:
+ * 1. pull_varnos() 取出条件涉及的关系集合 relids;
+ * 2. 若 relids 超出本节点语法作用域(拉平的 LATERAL 情形),沿父链寻找能
+ *    覆盖全部 relids 的最近祖先,把条件挂到其 lateral_clauses 推迟处理;
+ * 3. 外连接条件须满足 relids ⊆ ojscope,否则报错;
+ * 4. 无 Var 条件:外连接条件强制在 ojscope 求值;含 volatile 的条件留在
+ *    原语法层次;否则按是否位于顶层 JoinDomain 决定推到树顶(标记
+ *    pseudoconstant 与 hasPseudoConstantQuals,供 createplan 生成 gating
+ *    Result)还是留在原层次;
+ * 5. 依据是否提及非空侧判断外连接条件是否退化(degenerate):
+ *    - 非退化且调用者要求推迟:加入 postponed_oj_qual_list 返回;
+ *    - 非退化:is_pushed_down=false,可能进入"预留的外连接条件"列表;
+ *    - 退化:当作普通过滤条件,is_pushed_down=true;
+ *    - WHERE/内连接条件:is_pushed_down=true;
+ * 6. 对合并可连接(mergejoinable)的等值条件,依 may_equivalence 等标志
+ *    调用 process_equivalence() 进入等价类机制,或 process_implied_equality();
+ *    其余条件用 make_restrictinfo() 构造 RestrictInfo,并按 relids 中基表
+ *    数量决定放入单个关系的 baserestrictinfo 还是多个关系的 joininfo,
+ *    且为"等值可下推的惰性条件"复制到每个含相关列的 rel(惰性复制);
+ * 7. 处理安全级别 security_level、克隆标记(has_clone/is_clone)、以及
+ *    incompatible_relids(克隆条件不得应用到其下的外连接)。
+ *
+ * 【设计思想】is_pushed_down 标志区分外连接 ON 条件与下推的普通条件:
+ * WHERE/内连接=true、非退化外连接=false、退化外连接=true。退化条件
+ * (不提非空侧)可在 nullable 侧内求值而不改变结果。外连接等值条件的
+ * 上下两侧在外连接之后可能不等,故不能直接进入等价类,只登记到
+ * left_join_clauses / right_join_clauses / full_join_clauses 供 joinpath
+ * 使用(若满足 hashable/mergejoinable 再尝试推导)。
+ *
+ * 【参数】见函数定义处的英文注释;关键者:
+ *   clause               —— 待分发条件;
+ *   jtitem               —— 所属 jointree 节点的 JoinTreeItem;
+ *   sjinfo               —— 所属外连接的 SpecialJoinInfo(内连接/WHERE 为 NULL);
+ *   qualscope/ojscope    —— 语法/语义作用域;
+ *   outerjoin_nonnullable—— 非空侧集合;
+ *   postponed_oj_qual_list—— 非 NULL 时把非退化外连接条件加入其中推迟。
+ * 【返回值】无。
  */
 static void
 distribute_qual_to_rels(PlannerInfo *root, Node *clause,
@@ -3369,6 +3998,25 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
  * redundancy is detected here, distribute_qual_to_rels() just throws away
  * the qual.
  */
+/*
+ * check_redundant_nullability_qual - (中文)检查 IS NULL 条件是否与下层
+ * ANTI JOIN 冗余
+ *
+ * 【作用】对下推条件,先 find_forced_null_var() 找到被强制为 NULL 的 Var;
+ * 若其 varnullingrels 非空,则扫描 root->join_info_list,若某 JOIN_ANTI 且
+ * 其 ojrelid(非 0)正好出现在该 Var 的置空集合中,则返回 true——该
+ * IS NULL 条件必然成立,可整体丢弃。
+ *
+ * 【设计思想】抑制冗余 IS NULL 条件的动机主要是避免为它生成虚高的选择率
+ * 估计(而非省计算量):被反连接置空的列再做 IS NULL 是恒真条件,保留它
+ * 会让后续估算错误。由 SEMI 转换而来的 ANTI 可能 ojrelid 为 0,但此时
+ * Var 不可能来自其 nullable 侧,故需先排除。
+ *
+ * 【参数】
+ *   root   —— 当前查询级的 PlannerInfo;
+ *   clause —— 待检查的 IS NULL 条件。
+ * 【返回值】冗余时返回 true。
+ */
 static bool
 check_redundant_nullability_qual(PlannerInfo *root, Node *clause)
 {
@@ -3413,6 +4061,29 @@ check_redundant_nullability_qual(PlannerInfo *root, Node *clause)
  *		qual is always true, in which case we ignore it rather than add it.
  *		If we detect the qual is always false, we replace it with
  *		constant-FALSE.
+ */
+/*
+ * add_base_clause_to_rel - (中文)把 RestrictInfo 加入基础关系的
+ * baserestrictinfo,并做恒真/恒假的常量化简
+ *
+ * 【作用】distribute_restrictinfo_to_rels() 的辅助:把单关系条件加入
+ * rel->baserestrictinfo,同时更新 baserestrict_min_security。加入前做检查:
+ * - 恒真条件(restriction_is_always_true)直接忽略不加入;
+ * - 恒假条件(restriction_is_always_false)用常量 FALSE 替换后再加入。
+ * 特例:对继承父表(rte->inh 且非分区表)必须原样记录条件,因为
+ * apply_child_basequals() 需要原始条件推给子表,不能变换或跳过。
+ *
+ * 【设计思想】恒假→FALSE 替换可让上层把查询判定为空结果;替换时保持
+ * rinfo_serial 不变(同一条件应序列号相同,供克隆去重检测使用),并复位
+ * root->last_rinfo_serial。对分区表恒真/恒假变换总是安全:子分区同列集
+ * 必继承同样的真值。继承父表有 inh=true/false 两个 RTE,inh=false 那个
+ * 用于最终扫描节点,仍可享受化简。
+ *
+ * 【参数】
+ *   root         —— 当前查询级的 PlannerInfo;
+ *   relid        —— 目标基础关系的 RTE 索引;
+ *   restrictinfo —— 待加入的 RestrictInfo(required_relids 须为单元素)。
+ * 【返回值】无。
  */
 static void
 add_base_clause_to_rel(PlannerInfo *root, Index relid,
@@ -3489,6 +4160,23 @@ add_base_clause_to_rel(PlannerInfo *root, Index relid,
  * Currently we only check for NullTest quals and OR clauses that include
  * NullTest quals.  We may extend it in the future.
  */
+/*
+ * restriction_is_always_true - (中文)检查 RestrictInfo 是否恒真
+ *
+ * 【作用】add_base_clause_to_rel() 的辅助。克隆条件(has_clone/is_clone)一律
+ * 返回 false——其置空位可能不代表真实情况,不能据其判断非空。对
+ * IS_NOT_NULL 的 NullTest(排除行表达式 argisrow),若其参数表达式可证明
+ * 非空(expr_is_nonnullable)则恒真;对 OR 条件,任一分支可证明恒真则整个
+ * OR 恒真。
+ *
+ * 【设计思想】简化目标是避免在计划里保留必然成立的过滤条件,省执行与估算
+ * 成本。当前仅覆盖 NullTest 与含 NullTest 的 OR,未来可扩展。
+ *
+ * 【参数】
+ *   root         —— 当前查询级的 PlannerInfo;
+ *   restrictinfo —— 待检查的条件。
+ * 【返回值】恒真返回 true。
+ */
 bool
 restriction_is_always_true(PlannerInfo *root,
 						   RestrictInfo *restrictinfo)
@@ -3553,6 +4241,21 @@ restriction_is_always_true(PlannerInfo *root,
  *
  * Currently we only check for NullTest quals and OR clauses that include
  * NullTest quals.  We may extend it in the future.
+ */
+/*
+ * restriction_is_always_false - (中文)检查 RestrictInfo 是否恒假
+ *
+ * 【作用】add_base_clause_to_rel() 的辅助。克隆条件一律返回 false。对
+ * IS_NULL 的 NullTest(排除行表达式),若参数可证明非空则恒假;对 OR 条件,
+ * 仅当所有分支都恒假时才返回 true。
+ *
+ * 【设计思想】与恒真检查互为补充。OR 情形目前只做"全部恒假"判定,未来
+ * 可扩展为剔除恒假分支(这可能把 OR 化简成单参数甚至允许用索引)。
+ *
+ * 【参数】
+ *   root         —— 当前查询级的 PlannerInfo;
+ *   restrictinfo —— 待检查的条件。
+ * 【返回值】恒假返回 true。
  */
 bool
 restriction_is_always_false(PlannerInfo *root,
@@ -3624,6 +4327,23 @@ restriction_is_always_false(PlannerInfo *root,
  * This is the last step of distribute_qual_to_rels() for ordinary qual
  * clauses.  Clauses that are interesting for equivalence-class processing
  * are diverted to the EC machinery, but may ultimately get fed back here.
+ */
+/*
+ * distribute_restrictinfo_to_rels - (中文)把已完成的 RestrictInfo 推入
+ * 恰当的限制/连接条件列表
+ *
+ * 【作用】distribute_qual_to_rels() 的收尾步骤:
+ * - required_relids 为单元素:该条件是某关系的限制条件,调用
+ *   add_base_clause_to_rel() 加入其 baserestrictinfo;
+ * - 多元素:是连接条件,先 check_hashjoinable()(仅真连接条件设置哈希信息)、
+ *   check_memoizable()(检查是否可用 Memoize 缓存参数化 nestloop 的内侧
+ *   元组),再 add_join_clause_to_rels() 把它加入所有相关关系的 joininfo;
+ * - 空集合:无关系可挂,报错(正常调用者不应出现)。
+ *
+ * 【参数】
+ *   root         —— 当前查询级的 PlannerInfo;
+ *   restrictinfo —— 待分发的条件。
+ * 【返回值】无。
  */
 void
 distribute_restrictinfo_to_rels(PlannerInfo *root,
@@ -3709,6 +4429,32 @@ distribute_restrictinfo_to_rels(PlannerInfo *root,
  *
  * Note: we do not do initialize_mergeclause_eclasses() here.  It is
  * caller's responsibility that left_ec/right_ec be set as necessary.
+ */
+/*
+ * process_implied_equality - (中文)创建表达"item1 op item2"的 RestrictInfo
+ * 并推入相应列表(实践中 opno 总是 btree 等值操作符)
+ *
+ * 【作用】由等价类机制生成"由传递性推导出的新等式"时调用:复制 item1/item2
+ * (避免与原始结构共享子结构,特别是有子查询时),构建 OpExpr 条件;若
+ * both_const 为真先对常量做 eval_const_expressions()——能约成恒真则返回
+ * NULL,恒假则直接返回 constant FALSE 条件;否则计算 relids,伪常量标记,
+ * 用 make_restrictinfo() 生成 RestrictInfo 交给
+ * distribute_restrictinfo_to_rels() 分发。
+ *
+ * 【设计思想】等价类在合并两个类、发现"某表达式在另一上下文中等值"时,
+ * 需要把隐含等式物化为真实条件供连接使用;both_const 时由于两常量可能
+ * 相等或不等,先化简可避免留下无意义的连接条件。
+ *
+ * 【参数】
+ *   root           —— 当前查询级的 PlannerInfo;
+ *   opno           —— 等值操作符 OID;
+ *   collation      —— 排序规则;
+ *   item1, item2   —— 等式两侧表达式;
+ *   qualscope      —— 应赋予新条件的名义语法层级(两个表达式都无 Var 时
+ *                     用它决定求值位置,否则取能覆盖全部变量的最低连接层);
+ *   security_level —— 安全级别;
+ *   both_const     —— 两个 item 是否都是已知伪常量。
+ * 【返回值】生成的 RestrictInfo;both_const 且成功化简为恒真时返回 NULL。
  */
 RestrictInfo *
 process_implied_equality(PlannerInfo *root,
@@ -3854,6 +4600,29 @@ process_implied_equality(PlannerInfo *root,
  * Note: we do not do initialize_mergeclause_eclasses() here.  It is
  * caller's responsibility that left_ec/right_ec be set as necessary.
  */
+/*
+ * build_implied_join_equality - (中文)为推导出的等式构建 RestrictInfo
+ *
+ * 【作用】与 process_implied_equality() 功能重叠,但本函数只构建
+ * RestrictInfo 并把 mergejoinable/hashjoinable/memoizable 标志设置好,
+ * 不把条件推入 joininfo 树。复制 item1/item2 保证无共享子结构,用
+ * make_restrictinfo() 生成 is_pushed_down=true、非伪常量、安全级别为
+ * security_level 的条件。
+ *
+ * 【设计思想】某些场合(如 lateral 引用处理)只需要"物化一个推导等式的
+ * 条件节点",而分发与放置由调用者另行完成,故不调用
+ * distribute_restrictinfo_to_rels()。init 左/右等价类(initialize_merge
+ * clause_eclasses)同样由调用者负责,此处成本更低。
+ *
+ * 【参数】
+ *   root           —— 当前查询级的 PlannerInfo;
+ *   opno           —— 等值操作符 OID;
+ *   collation      —— 排序规则;
+ *   item1, item2   —— 等式两侧表达式;
+ *   qualscope      —— 条件的名义作用域;
+ *   security_level —— 安全级别。
+ * 【返回值】新建的 RestrictInfo。
+ */
 RestrictInfo *
 build_implied_join_equality(PlannerInfo *root,
 							Oid opno,
@@ -3923,6 +4692,26 @@ build_implied_join_equality(PlannerInfo *root,
  *
  * The result is always freshly palloc'd; we do not modify domain_relids.
  */
+/*
+ * get_join_domain_min_rels - (中文)为属于给定 JoinDomain 的推导条件确定
+ * 恰当的连接层次(用于无 Var 的伪常量条件)
+ *
+ * 【作用】当从等价类推导出无 Var(伪常量)条件时,理想上应把它放在该
+ * 等价类所属 JoinDomain 的顶层求值;但若域内存在可被交换出去的下层左连接,
+ * 顶层可能没有合适位置。故这里把域内可交换的左连接(及其右侧)从 relid
+ * 集合中剔除,把条件应用到剩余关系上——由于条件为假时这些左连接的 LHS
+ * 为空、整个连接结果为空,结果仍然正确。若本身是查询顶层 JoinDomain
+ * (结果集等于 all_query_rels),则无需剔除(没有可交换的对象),直接返回。
+ *
+ * 【设计思想】这个"min rels"层级兼顾了正确性与尽量高位求值的愿望;不能
+ * 在 distribute_qual_to_rels() 中使用它,因为那时 SpecialJoinInfo 尚未
+ * 全部建立。返回的集合总是新分配的,不修改入参。
+ *
+ * 【参数】
+ *   root          —— 当前查询级的 PlannerInfo;
+ *   domain_relids —— JoinDomain 的关系集合。
+ * 【返回值】应用条件的层级集合。
+ */
 static Relids
 get_join_domain_min_rels(PlannerInfo *root, Relids domain_relids)
 {
@@ -3956,6 +4745,23 @@ get_join_domain_min_rels(PlannerInfo *root, Relids domain_relids)
  * This is used to rebuild attr_needed/ph_needed sets after removal of a
  * useless outer join.  It should match what distribute_qual_to_rels did,
  * except that we call add_vars_to_attr_needed not add_vars_to_targetlist.
+ */
+/*
+ * rebuild_joinclause_attr_needed - (中文)在删除无用外连接后,为连接条件涉及
+ * 的 Var/PHV 重建 attr_needed/ph_needed 位
+ *
+ * 【作用】与 distribute_qual_to_rels() 中"连接条件登记 Var 需求"的逻辑对应,
+ * 但调用 add_vars_to_attr_needed()(列已在 targetlist)。扫描所有 baserel
+ * 的 joininfo 列表,用 rinfo_serial 去重(克隆条件 serial 不唯一,须重复
+ * 处理),对 required_relids 为多元素的条件抽取 Var/PHV 并登记;克隆条件
+ * 的 where_needed 只取全部基表部分。由 analyzejoins.c 移除无用外连接后
+ * 调用。
+ *
+ * 【设计思想】连接被删除后,原本只被被删连接需要的列可能不再需要向上传递,
+ * 收缩 attr_needed 是后续进一步连接消除的前提。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无。
  */
 void
 rebuild_joinclause_attr_needed(PlannerInfo *root)
@@ -4028,6 +4834,27 @@ rebuild_joinclause_attr_needed(PlannerInfo *root)
  * In this function we annotate the ForeignKeyOptInfos in root->fkey_list
  * with info about which eclasses and join qual clauses they match, and
  * discard any ForeignKeyOptInfos that are irrelevant for the query.
+ */
+/*
+ * match_foreign_keys_to_quals - (中文)把外键约束与等价类/连接条件匹配,
+ * 供更可靠的选择率估算使用
+ *
+ * 【作用】对 root->fkey_list 中每个 ForeignKeyOptInfo:
+ * - 跳过无 RelOptInfo(不在 jointree、被连接消除移除)或非 BASEREL 的关系;
+ * - 逐列尝试两路匹配:①用 match_eclasses_to_foreign_key_col() 在等价类中
+ *   找匹配列(简单内连接通常走这条,统计 nmatched_ec、nconst_ec);②否则
+ *   扫描 con_rel 的 joininfo,找形如 ref_var = con_var(或反向,须检查交换
+ *   算子)且算子为外键等值算子的条件,记录到 fkinfo->rinfos[colno] 并累计
+ *   nmatched_ri / nmatched_rcols;
+ * - 仅保留完全匹配(nmatched_ec + nmatched_rcols == nkeys)的外键,其余丢弃,
+ *   以此替换 root->fkey_list。
+ *
+ * 【设计思想】外键匹配能让多列 FK 的选择率估计摆脱"各列独立"的强假设
+ * (对多列外键尤其失效),从而显著提升估算可靠性。匹配来源为等价类或
+ * "松散"条件(被外连接等拒绝进入 EC 的语法匹配条件)。
+ *
+ * 【参数】root —— 当前查询级的 PlannerInfo。
+ * 【返回值】无,更新 root->fkey_list 与各 fkinfo 字段。
  */
 void
 match_foreign_keys_to_quals(PlannerInfo *root)
@@ -4191,8 +5018,24 @@ match_foreign_keys_to_quals(PlannerInfo *root)
  *	  info fields in the restrictinfo.
  *
  *	  Currently, we support mergejoin for binary opclauses where
- *	  the operator is a mergejoinable operator.  The arguments can be
- *	  anything --- as long as there are no volatile functions in them.
+ *	 the operator is a mergejoinable operator.  The arguments can be
+ *	 anything --- as long as there are no volatile functions in them.
+ */
+/*
+ * check_mergejoinable - (中文)若条件可 mergejoin,设置 RestrictInfo 的
+ * mergejoin 相关字段
+ *
+ * 【作用】对非伪常量、二元 OpExpr 条件,检查操作符是否 mergejoinable
+ * (op_mergejoinable 且两侧无 volatile 函数);若是,用
+ * get_mergejoin_opfamilies() 取得操作族列表存入 mergeopfamilies。
+ *
+ * 【设计思想】mergejoin 只需要"等值且可比序";op_mergejoinable 只是提示,
+ * 若操作符最终不在任何 btree 操作族中,mergeopfamilies 保持 NIL,条件仍
+ * 视为不可 mergejoin。对每个条件(不限于连接条件)都检查,是为了发现同一
+ * 关系内 Var 之间、Var 与常量之间的等值关系。
+ *
+ * 【参数】restrictinfo —— 待检查的条件。
+ * 【返回值】无。
  */
 static void
 check_mergejoinable(RestrictInfo *restrictinfo)
@@ -4228,8 +5071,20 @@ check_mergejoinable(RestrictInfo *restrictinfo)
  *	  info fields in the restrictinfo.
  *
  *	  Currently, we support hashjoin for binary opclauses where
- *	  the operator is a hashjoinable operator.  The arguments can be
- *	  anything --- as long as there are no volatile functions in them.
+ *	 the operator is a hashjoinable operator.  The arguments can be
+ *	 anything --- as long as there are no volatile functions in them.
+ */
+/*
+ * check_hashjoinable - (中文)若条件可 hashjoin,设置 RestrictInfo 的
+ * hashjoin 相关字段
+ *
+ * 【作用】对非伪常量、二元 OpExpr 条件,检查操作符是否 hashjoinable
+ * (op_hashjoinable 且无 volatile 函数);若是,把操作符 OID 存入
+ * restrictinfo->hashjoinoperator。与 check_mergejoinable 类似,仅在真
+ * 连接条件上调用(distribute_restrictinfo_to_rels 中)。
+ *
+ * 【参数】restrictinfo —— 待检查的条件。
+ * 【返回值】无。
  */
 static void
 check_hashjoinable(RestrictInfo *restrictinfo)
@@ -4258,6 +5113,21 @@ check_hashjoinable(RestrictInfo *restrictinfo)
  *	  If the restrictinfo's clause is suitable to be used for a Memoize node,
  *	  set the left_hasheqoperator and right_hasheqoperator to the hash equality
  *	  operator that will be needed during caching.
+ */
+/*
+ * check_memoizable - (中文)若条件适合用于 Memoize 节点缓存,设置左右侧的
+ * 哈希等值操作符
+ *
+ * 【作用】对非伪常量、二元 OpExpr 条件,分别查左右操作数类型的类型缓存:
+ * 若该类型既有哈希过程(hash_proc)又有等值操作符(eq_opr),就把等值操作符
+ * 记入 left_hasheqoperator / right_hasheqoperator;两侧类型相同时复用同一
+ * TypeCacheEntry,否则为右类型单独查询。
+ *
+ * 【设计思想】Memoize 在参数化嵌套循环中缓存内侧元组,须按参数值哈希;
+ * 左右两侧的操作数类型都可能作为参数键,故各存一个等值操作符。
+ *
+ * 【参数】restrictinfo —— 待检查的条件。
+ * 【返回值】无。
  */
 static void
 check_memoizable(RestrictInfo *restrictinfo)

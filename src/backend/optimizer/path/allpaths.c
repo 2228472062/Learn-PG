@@ -7,6 +7,57 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件是 PostgreSQL 优化器路径生成的"顶层入口",负责为一个查询找出
+ * 所有可能的执行路径(Path)。路径生成大体分两层,本文件驱动的是"扫描/连接"
+ * 这一层:
+ *
+ * - 入口函数 make_one_rel() 按固定的四个阶段推进:
+ *   1) set_base_rel_consider_startup():标记哪些基础关系值得考虑"快速启动"
+ *      (fast-start)参数化路径(主要是 SEMI/ANTI 连接的内侧);
+ *   2) set_base_rel_sizes():为每个基础关系估算行数/宽度,并决定是否考虑
+ *      并行扫描(consider_parallel);
+ *   3) setup_simple_grouped_rels():对简单关系构建"分组的简单关系"
+ *      (grouped rel),为急切聚合(eager aggregation,即先做部分聚合)做准备;
+ *   4) set_base_rel_pathlists() + make_rel_from_joinlist():先为每个基础关系
+ *      生成扫描路径,再按 joinlist(连接树)用动态规划自底向上生成连接路径,
+ *      最终返回代表"所有基础关系连接结果"的一个 RelOptInfo。
+ *
+ * 【设计思想】
+ * - 基础关系按 RTE 类型分发:普通表(set_plain_rel_*)、继承/分区表
+ *   (set_append_rel_*,把每个子表当作成员逐个子计划后再合成 Append 路径)、
+ *   外表(set_foreign_*,委托 FDW)、子查询(set_subquery_*,递归调用
+ *   subquery_planner)、函数 / VALUES / CTE / 工作表 / Result 等。大小估算
+ *   (set_*_size)与路径生成(set_*_pathlist)分两遍完成:先全部估算完大小,
+ *   路径生成时才能利用统一的行数估计。
+ * - 继承/分区(Append 关系)是重点:子关系可能与父表有不同的大小;若某个子表
+ *   能被约束排除(constraint exclusion)则标记为 dummy 并跳过;所有存活子表
+ *   的路径被聚合成 Append 路径(无序),或当子表自带排序时聚合成 MergeAppend
+ *   路径,或当分区键天然有序时直接合成有序的 Append 路径;还支持并行 Append
+ *   (部分子路径用 worker 扫描、部分由 leader 扫描)。
+ * - 并行:create_plain_partial_paths() 等函数生成 partial 路径,
+ *   generate_gather_paths() / generate_useful_gather_paths() 在其上套一层
+ *   Gather / Gather Merge 变成完整路径;compute_parallel_worker() 按表大小
+ *   的对数估算 worker 数量。
+ * - 连接顺序搜索:make_rel_from_joinlist() 对 joinlist 中的每个节点递归,
+ *   单节点直接返回;多节点则按 levels_needed 走 standard_join_search() 的
+ *   动态规划(逐层生成 2 路、3 路……连接),也可以被 GEQO 或用户插件替换。
+ * - 本文件末尾还实现了两套"下推"支持:把上层限制条件下推进子查询
+ *   (subquery_is_pushdown_safe / qual_is_pushdown_safe / subquery_push_qual
+ *   等,逐条判断安全性、按 setop 树递归、最后改写子查询的 WHERE/HAVING),
+ *   以及删除子查询未使用的输出列(remove_unused_subquery_outputs)。
+ * - 急切聚合:eager aggregation 允许在连接之前就按 group 子句做部分聚合,
+ *   grouped rel(RelOptInfo->grouped_rel,配 RelAggInfo)承载这一信息,
+ *   generate_grouped_paths() 为它生成 AGG_SORTED / AGG_HASHED 的部分聚合路径。
+ *
+ * 【与其它模块的关系】
+ * - 所有路径的"构造"(把 Path 结构填好、加入 rel 的 pathlist)由 pathnode.c
+ *   完成,本文件只是调用它们;
+ * - 路径的成本由 costsize.c 估算、索引路径的细节由 indxpath.c 处理、
+ *   等价类/排序键信息由 equivclass.c 维护;
+ * - set_cheapest()(pathnode.c)在每个关系路径生成完毕后挑选最便宜路径,
+ *   供上层(planagg.c/planner.c)决定最终执行计划。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/path/allpaths.c
  *
@@ -179,6 +230,37 @@ static void remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel,
  *	  Finds all possible access paths for executing a query, returning a
  *	  single rel that represents the join of all base rels in the query.
  */
+/*
+ * make_one_rel - (中文)查询路径生成的顶层入口:为整个查询找出所有访问路径
+ *
+ * 【作用】由 planner.c 的 query_planner() 调用,负责生成整棵查询的路径集合。
+ * 它按顺序完成四件事:决定哪些基础关系要考虑快速启动路径;为所有基础关系
+ * 估算大小并决定是否允许并行;构建"分组的简单关系"(为急切聚合做准备);
+ * 为每个基础关系生成扫描路径、再按 joinlist 动态规划生成连接路径。最终返回
+ * 代表"所有基础关系(含被 SEMI/ANTI 连接特殊处理的外连接关系)连接结果"的
+ * 单一 RelOptInfo,它是本查询扫描/连接阶段路径搜索的终点。
+ *
+ * 【设计思想】这是整个"扫描+连接"路径生成阶段的分层骨架:
+ * - 大小估算(set_base_rel_sizes)必须先于路径生成(set_base_rel_pathlists),
+ *   因为参数化路径、并行判定、连接大小估计都需要行数;而
+ *   consider_parallel 又必须先于 set_rel_size,因为继承/分区父关系会复用并
+ *   修改子关系的该标志;
+ * - total_table_pages 在这里汇总:只统计"简单关系"(继承/分区父关系的
+ *   pages 保持为 0,避免重复计数),它用于后续 seq_page_cost 等整体成本计算;
+ * - 自连接的表会被重复计数一次(代码注释承认这是已知的不精确点);
+ * - 路径搜索在 make_rel_from_joinlist() 内部选择:只有一个 joinlist 节点时
+ *   直接返回;否则用 standard_join_search(动态规划)、GEQO 或插件钩子。
+ *
+ * 【参数】
+ *   root     —— 正在规划的查询级 PlannerInfo(含解析树、关系数组、
+ *               joininfo 等全部规划上下文);
+ *   joinlist —— 由 deconstruct_jointree() 生成的连接树扁平化表示,是嵌套
+ *               列表:RangeTblRef 代表单个基础关系,List 代表一个连接子问题。
+ * 【返回值】一个 RelOptInfo,其 relids 恰好等于 root->all_query_rels
+ *           (即全部基础关系 + 外连接关系)。其 pathlist 中包含到达最终
+ *           连接结果的全部候选路径;调用者从中挑选(通过 set_cheapest)
+ *           生成最终执行计划。
+ */
 RelOptInfo *
 make_one_rel(PlannerInfo *root, List *joinlist)
 {
@@ -261,6 +343,25 @@ make_one_rel(PlannerInfo *root, List *joinlist)
  * start with.  If that logic ever gets more complicated it would probably
  * be better to move it here.
  */
+/*
+ * set_base_rel_consider_startup - (中文)标记需要"快速启动"参数化路径的基础关系
+ *
+ * 【作用】在路径生成的第一个阶段(make_one_rel 中第一个调用)扫描
+ * root->join_info_list,对每个"右侧恰好只有一个基础关系"的 SEMI/ANTI 连接,
+ * 把该内侧重置为 rel->consider_param_startup = true。它不处理
+ * consider_startup(普通启动成本),因为 build_simple_rel() 已按简单规则初始化
+ * 好了那个标志。
+ *
+ * 【设计思想】参数化路径只能用作嵌套循环连接的内侧;对普通连接而言考虑
+ * "快速启动"方案价值不大。但 SEMI/ANTI 连接只要找到(或证明不存在)一个
+ * 匹配元组就停止,快速启动可以显著减少无谓扫描,因此对这类内侧重置该标志。
+ * 出于规划开销考虑,只限定"内侧是单个基础关系"(连接关系、appendrel 一律
+ * 不处理),且 costsize.c 的 nestloop semi/anti 成本公式也只覆盖这种情况。
+ *
+ * 【参数】
+ *   root —— PlannerInfo,其 join_info_list 保存所有 SpecialJoinInfo。
+ * 【返回值】无。
+ */
 static void
 set_base_rel_consider_startup(PlannerInfo *root)
 {
@@ -304,6 +405,24 @@ set_base_rel_consider_startup(PlannerInfo *root)
  * that each rel's consider_parallel flag is set correctly before we begin to
  * generate paths.
  */
+/*
+ * set_base_rel_sizes - (中文)为所有基础关系设置大小估算与并行标志
+ *
+ * 【作用】遍历 root->simple_rel_array 中每个 RELOPT_BASEREL 基础关系,依次
+ * 调用 set_rel_consider_parallel(决定能否并行扫描该关系)与 set_rel_size
+ * (估算行数、宽度等)。由 make_one_rel() 在路径生成之前调用。
+ *
+ * 【设计思想】分两件事、按固定先后做:先确定 consider_parallel,再估大小。
+ * 理由:继承/分区父关系在 set_append_rel_size() 中会读取(并可能改坏)子
+ * 关系的 consider_parallel,若大小先算则可能拿到过时值;另外某些 RTE 类型
+ * (如子查询、CTE)在 set_rel_size 内就立即生成路径了。大小估算集中先做完,
+ * 好处是所有关系的行数在生成参数化路径之前都已可用。数组里的空槽位
+ * (对应非基础 RTE)与"other rel"(继承子关系等)被跳过。
+ *
+ * 【参数】
+ *   root —— PlannerInfo,simple_rel_array 是其基础关系数组。
+ * 【返回值】无(通过修改各 RelOptInfo 返回结果)。
+ */
 static void
 set_base_rel_sizes(PlannerInfo *root)
 {
@@ -346,6 +465,27 @@ set_base_rel_sizes(PlannerInfo *root)
  *	  For each simple relation, build a grouped simple relation if eager
  *	  aggregation is possible and if this relation can produce grouped paths.
  */
+/*
+ * setup_simple_grouped_rels - (中文)为简单关系构建"分组的简单关系"
+ *
+ * 【作用】在 set_base_rel_sizes() 之后、set_base_rel_pathlists() 之前调用,
+ * 遍历所有简单关系(基础关系或继承子关系),对每个调用
+ * build_simple_grouped_rel(root, rel) 尝试构造 grouped rel。这是急切聚合
+ * (eager aggregation)的准备工作:把 group by / 聚合信息挂在关系上,后续
+ * generate_grouped_paths() 就能在连接之前先生成部分聚合路径。
+ *
+ * 【设计思想】只有当查询确实含有聚合表达式和分组表达式(即
+ * root->agg_clause_list 与 group_expr_list 均非空)时,急切聚合才有意义,
+ * 否则直接返回。build_simple_grouped_rel() 内部会判断该关系能否产生分组
+ * 路径(例如必须能排序或哈希分组),不能则留空。注意这里处理的是"简单"
+ * 关系;连接关系(joinrel)的 grouped rel 是在 standard_join_search() 里按层
+ * 生成的。
+ *
+ * 【参数】
+ *   root —— PlannerInfo,其中 agg_clause_list / group_expr_list 由
+ *           preprocess_agg_aggregates 等预处理阶段填充。
+ * 【返回值】无。
+ */
 static void
 setup_simple_grouped_rels(PlannerInfo *root)
 {
@@ -380,6 +520,23 @@ setup_simple_grouped_rels(PlannerInfo *root)
  *	  Sequential scan and any available indices are considered.
  *	  Each useful path is attached to its relation's 'pathlist' field.
  */
+/*
+ * set_base_rel_pathlists - (中文)为所有基础关系生成扫描路径
+ *
+ * 【作用】遍历 simple_rel_array 中每个 RELOPT_BASEREL 基础关系,逐个调用
+ * set_rel_pathlist() 为该关系生成所有可用的扫描路径(顺序扫描、索引扫描、
+ * 并行扫描、FDW 路径等),并挂到 rel->pathlist。由 make_one_rel() 在大小
+ * 估算与 grouped rel 准备之后调用。
+ *
+ * 【设计思想】大小与路径分两步走的核心原因:路径生成(尤其是参数化路径、
+ * 并行路径)依赖已经就绪的行数与 consider_parallel 标志。这里只处理
+ * RELOPT_BASEREL,继承子关系(RELOPT_OTHER_MEMBER_REL)等 "other rel" 由
+ * set_append_rel_pathlist() 递归处理,不会再在本函数重复。
+ *
+ * 【参数】
+ *   root —— PlannerInfo,simple_rel_array 是基础关系数组。
+ * 【返回值】无(路径写入各 rel->pathlist)。
+ */
 static void
 set_base_rel_pathlists(PlannerInfo *root)
 {
@@ -406,6 +563,32 @@ set_base_rel_pathlists(PlannerInfo *root)
 /*
  * set_rel_size
  *	  Set size estimates for a base relation
+ */
+/*
+ * set_rel_size - (中文)设置单个基础关系的大小估算
+ *
+ * 【作用】根据关系的类型为单个基础关系估算行数/宽度。被 set_base_rel_sizes()
+ * 对每个基础关系调用;也被 set_append_rel_size() 递归地对每个继承子关系调用。
+ * 内部先尝试约束排除(constraint exclusion):能证明关系为空则立即置为 dummy
+ * 关系;否则按 RTE 类型分发到具体的估算函数。
+ *
+ * 【设计思想】
+ * - 约束排除只对普通基础关系做(继承子关系的约束排除已在
+ *   set_append_rel_size() 里做过),证明为空时通过 set_dummy_rel_pathlist()
+ *   立刻生成 dummy 路径,这是"把关系标记为空"的唯一约定机制;
+ * - rte->inh 表示继承/分区:走 set_append_rel_size() 汇总所有子表大小;
+ * - 非继承时按 rtekind 分发:RTE_RELATION 再细分为外表(FDW 估算)、
+ *   分区表(带 ONLY 时不允许扫描分区,置 dummy)、采样表(TABLESAMPLE,
+ *   调用采样方法的估算例程)、普通表;子查询、CTE 等类型因不支持"参数化/
+ *   非参数化路径的选择",直接在估算阶段就生成路径(即不遵循"先估大小再
+ *   生成路径"的两阶段约定)。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 待估算的关系;
+ *   rti  —— rel 在 rtable 中的索引(用于约束排除等);
+ *   rte  —— 对应的 RangeTblEntry。
+ * 【返回值】无。结束时满足不变量:非 dummy 关系的 rel->rows > 0。
  */
 static void
 set_rel_size(PlannerInfo *root, RelOptInfo *rel,
@@ -515,6 +698,35 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 /*
  * set_rel_pathlist
  *	  Build access paths for a base relation
+ */
+/*
+ * set_rel_pathlist - (中文)为单个基础关系生成访问路径
+ *
+ * 【作用】为单个基础关系生成并注册所有访问路径。被 set_base_rel_pathlists()
+ * 对每个基础关系调用,也被 set_append_rel_pathlist() 对每个继承子关系调用。
+ * 完成后执行:调用 set_rel_pathlist_hook 让插件增删路径、对非顶层基础关系
+ * 生成 Gather 路径(把 partial 路径变成完整路径)、用 set_cheapest() 找出
+ * 最便宜路径、并为该关系的 grouped rel 生成部分聚合路径。
+ *
+ * 【设计思想】
+ * - 已证明为空(dummy)的关系直接跳过;
+ * - 继承关系走 set_append_rel_pathlist() 递归处理子表;
+ * - 其余按 rtekind 分发,子查询/CTE/工作表和 Result 等在估算阶段已经生成
+ *   过路径,这里无事可做;
+ * - set_rel_pathlist_hook 被设计成可以在核心代码之后增删路径(尤其可以添加
+ *   CustomPath),因此 Gather 生成必须放在 hook 调用之后,否则插件加入的
+ *   partial 路径不会被汇总;
+ * - 继承子关系本身不生成 Gather(否则每个子表都要抢一批 worker),统一留给
+ *   父 appendrel;顶层连接关系(relids == all_query_rels)也推迟到拿到最终
+ *   扫描/连接目标列表后再做(见 grouping_planner 的 apply_scanjoin_target_to_paths);
+ * - set_cheapest() 必须先于 generate_grouped_paths(),后者需要关系的最便宜路径。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 待生成路径的关系;
+ *   rti  —— rel 在 rtable 中的索引;
+ *   rte  —— 对应的 RangeTblEntry。
+ * 【返回值】无(路径写入 rel->pathlist / partial_pathlist)。
  */
 static void
 set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -628,6 +840,24 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
  * set_plain_rel_size
  *	  Set size estimates for a plain relation (no subquery, no inheritance)
  */
+/*
+ * set_plain_rel_size - (中文)估算普通表关系的大小
+ *
+ * 【作用】对普通表(无子查询、无继承)设置行数与宽度估算。先调用
+ * check_index_predicates() 检验部分索引(partial index)是否适用于该查询,
+ * 再调用 set_baserel_size_estimates()(costsize.c)完成最终估算。
+ *
+ * 【设计思想】部分唯一索引会影响大小估计(例如部分索引暗示某些行一定唯一,
+ * 影响行数下界),因此必须最先检查。set_baserel_size_estimates 会根据
+ * pg_class 的统计信息、限制条件的选择性估算 rel->rows、rel->tuples、
+ * rel->reltarget->width 等。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 普通表关系(RELOPT_BASEREL);
+ *   rte  —— 对应的 RangeTblEntry。
+ * 【返回值】无。
+ */
 static void
 set_plain_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
@@ -644,6 +874,33 @@ set_plain_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 /*
  * If this relation could possibly be scanned from within a worker, then set
  * its consider_parallel flag.
+ */
+/*
+ * set_rel_consider_parallel - (中文)判定一个关系能否被并行扫描并置标志
+ *
+ * 【作用】如果该关系理论上可以在并行 worker 中被扫描,则把
+ * rel->consider_parallel 置为 true。被 set_base_rel_sizes() 对每个基础关系
+ * 调用,也被 set_append_rel_size() 对继承子关系调用。调用前要求整个查询
+ * parallelModeOK 且 rel->consider_parallel 尚未被设置。
+ *
+ * 【设计思想】并行限制按 RTE 类型逐条检查:
+ * - RTE_RELATION:worker 不能访问 leader 的临时表(临时表直接拒绝);TABLESAMPLE
+ *   要求采样函数与其参数都并行安全;外表要求 FDW 声明 IsForeignScanParallelSafe;
+ * - RTE_SUBQUERY:子查询含 LIMIT/OFFSET 时行顺序不可保证,拒绝;
+ * - RTE_FUNCTION / RTE_VALUES:要求其中的函数并行安全;
+ * - RTE_TABLEFUNC、RTE_CTE(CTE tuplestore 无法共享)、RTE_NAMEDTUPLESTORE:
+ *   一律不并行;
+ * - RTE_JOIN、RTE_GROUP 等不该出现在这里(断言);
+ * 最后还要检查关系自身的 baserestrictinfo(限制条件)与 reltarget 表达式都
+ * 不含并行受限(parallel-restricted)元素。整体思路是"只要有一处不放心就
+ * 整体放弃",因为把受限条件上提再并行执行在多数场景下不是净收益,还可能
+ * 破坏等价类。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 基础关系或继承子关系(IS_SIMPLE_REL);
+ *   rte  —— 对应 RangeTblEntry。
+ * 【返回值】无(结果写入 rel->consider_parallel)。
  */
 static void
 set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
@@ -834,6 +1091,28 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
  * set_plain_rel_pathlist
  *	  Build access paths for a plain relation (no subquery, no inheritance)
  */
+/*
+ * set_plain_rel_pathlist - (中文)为普通表生成扫描路径
+ *
+ * 【作用】为普通表生成并注册候选扫描路径:按顺序考虑 TID 扫描、顺序扫描、
+ * 并行顺序扫描、索引扫描。被 set_rel_pathlist() 对 RTE_RELATION 的普通表
+ * 调用。
+ *
+ * 【设计思想】
+ * - required_outer 取 rel->lateral_relids:连接条件不会下推到顺序扫描的
+ *   quals 里,但 LATERAL 引用造成的参数化仍需保留;
+ * - create_tidscan_paths() 返回 true 表示"必须使用 TID 扫描"(因为限制条件
+ *   里有 CurrentOfExpr,执行器无法处理其它路径),此时直接返回,不再加别的
+ *   路径;
+ * - 并行顺序扫描要求 rel->consider_parallel 且无参数化;
+ * - 索引扫描交给 create_index_paths()(indxpath.c)负责。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 普通表关系;
+ *   rte  —— 对应 RangeTblEntry。
+ * 【返回值】无(路径写入 rel->pathlist / partial_pathlist)。
+ */
 static void
 set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
@@ -872,6 +1151,24 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * create_plain_partial_paths
  *	  Build partial access paths for parallel scan of a plain relation
  */
+/*
+ * create_plain_partial_paths - (中文)为普通表生成并行顺序扫描的 partial 路径
+ *
+ * 【作用】为普通表创建一个基于并行顺序扫描的无序 partial 路径,加入
+ * rel->partial_pathlist。由 set_plain_rel_pathlist() 在关系允许并行且无参数
+ * 化时调用。之后这些 partial 路径会被 generate_gather_paths() 等套上
+ * Gather 变成完整路径。
+ *
+ * 【设计思想】worker 数量由 compute_parallel_worker() 按表页数估算;若算出的
+ * worker 数 <= 0(表太小或 GUC 限制为 0),说明用户不想要并行扫描,直接返回。
+ * 本函数只生成最简单的无序 partial 顺序扫描;带排序的并行扫描由上层
+ * generate_useful_gather_paths() 用 Gather Merge 处理。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 普通表关系(已确定 consider_parallel 为真)。
+ * 【返回值】无。
+ */
 static void
 create_plain_partial_paths(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -891,6 +1188,24 @@ create_plain_partial_paths(PlannerInfo *root, RelOptInfo *rel)
 /*
  * set_tablesample_rel_size
  *	  Set size estimates for a sampled relation
+ */
+/*
+ * set_tablesample_rel_size - (中文)估算采样表(TABLESAMPLE)关系的大小
+ *
+ * 【作用】对使用 TABLESAMPLE 子句的表设置大小估算:先检查部分索引适用性,
+ * 然后调用采样方法的 SampleScanGetSampleSize 回调来估计将要读取的页数与
+ * 返回的元组数,最后用 set_baserel_size_estimates() 完成行数/宽度计算。
+ *
+ * 【设计思想】因为目前只为采样关系考虑 SampleScan 这一种路径,所以直接把
+ * 采样方法算出的 pages/tuples 覆盖写入 rel->pages/rel->tuples 是安全的
+ * (若将来支持多种路径类型就需要更精细的处理)。set_baserel_size_estimates
+ * 会在此基础上应用 baserestrictinfo 的选择性算出最终 rel->rows。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 采样表关系;
+ *   rte  —— 对应 RangeTblEntry,其 tablesample 字段给出采样子句。
+ * 【返回值】无。
  */
 static void
 set_tablesample_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
@@ -931,6 +1246,27 @@ set_tablesample_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 /*
  * set_tablesample_rel_pathlist
  *	  Build access paths for a sampled relation
+ */
+/*
+ * set_tablesample_rel_pathlist - (中文)为采样表生成访问路径
+ *
+ * 【作用】为采样表生成唯一的 SampleScan 路径并加入 rel->pathlist。由
+ * set_rel_pathlist() 对带 TABLESAMPLE 的关系调用。
+ *
+ * 【设计思想】
+ * - required_outer 取 rel->lateral_relids:采样扫描不支持下推连接条件,但
+ *   LATERAL 引用(在 tlist 或采样参数中)造成的参数化要保留;
+ * - 采样方法若不支持"可重复扫描"(repeatable_across_scans),同一关系被
+ *   多次扫描时会得到不一致的采样结果,因此只要查询可能做连接
+ *   (顶层有多个基础关系,或本函数位于子查询中无法确认外层),就用
+ *   Materialize 节点包一层,保证采样结果只计算一次;
+ * - 目前只为采样关系生成这一种路径。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 采样表关系;
+ *   rte  —— 对应 RangeTblEntry。
+ * 【返回值】无。
  */
 static void
 set_tablesample_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
@@ -980,6 +1316,25 @@ set_tablesample_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
  * set_foreign_size
  *		Set size estimates for a foreign table RTE
  */
+/*
+ * set_foreign_size - (中文)估算外表关系的大小
+ *
+ * 【作用】为外表设置大小估算:先用 set_foreign_size_estimates()(costsize.c)
+ * 做基本估算,再调用 FDW 的 GetForeignRelSize 回调让 FDW 根据远程统计信息
+ * 调整估算,最后做两处保护性修正。
+ *
+ * 【设计思想】
+ * - FDW 的估算结果可能不规范:行数(rel->rows)不允许为 0(用
+ *   clamp_row_est() 夹到最小合理值),否则后续成本公式会出错;
+ * - rel->tuples(表中总元组数)不能小于 rel->rows:防止 pg_class.reltuples
+ *   为 -1 且 FDW 没替换它时产生自相矛盾的估算。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 外表关系;
+ *   rte  —— 对应 RangeTblEntry(relkind == RELKIND_FOREIGN_TABLE)。
+ * 【返回值】无。
+ */
 static void
 set_foreign_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
@@ -1004,6 +1359,22 @@ set_foreign_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * set_foreign_pathlist
  *		Build access paths for a foreign table RTE
  */
+/*
+ * set_foreign_pathlist - (中文)为外表生成访问路径
+ *
+ * 【作用】委托 FDW 的 GetForeignPaths 回调为外表生成一条或多条 ForeignPath,
+ * 加入 rel->pathlist。由 set_rel_pathlist() 对外表调用。
+ *
+ * 【设计思想】外表的路径生成完全交给 FDW 定制:FDW 可能返回多种路径
+ * (如远程扫描 vs 本地扫描、并行与否),并自行调用 add_path()/add_partial_path()
+ * 注册。本函数只是薄薄的转发层。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 外表关系(rel->fdwroutine 已绑定);
+ *   rte  —— 对应 RangeTblEntry。
+ * 【返回值】无。
+ */
 static void
 set_foreign_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
@@ -1021,6 +1392,41 @@ set_foreign_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * case, the first member relation is actually the same table as is mentioned
  * in the parent RTE ... but it has a different RTE and RelOptInfo.  This is
  * a good thing because their outputs are not the same size.
+ */
+/*
+ * set_append_rel_size - (中文)估算继承/分区(append)关系的总大小
+ *
+ * 【作用】把整个 append 关系(父关系,可能对应一张分区表或继承表)的大小
+ * 估算为其所有"存活"子关系的大小之和:依次对每个子关系做约束排除、把父的
+ * 连接条件与目标列表改写并复制给子关系、建立子关系的等价类条目、估算子
+ * 关系大小,最后把各子关系的 tuples/rows/宽度按行数加权汇总到父关系。
+ * 由 set_rel_size() 对 rte->inh 的关系调用。
+ *
+ * 【设计思想】
+ * - 循环遍历 root->append_rel_list,只处理 parent_relid == 本关系的条目;
+ *   子关系 RelOptInfo 在 add_other_rels_to_query 阶段已创建;
+ * - 对每个子关系:先用 relation_excluded_by_constraints() 做约束排除,命中
+ *   则 set_dummy_rel_pathlist() 并跳过;否则把父的连接条件(childrinfos,
+ *   跳过会置空本关系的、来自外层外连接的连接条件,因为 nullingrels 无法套用)
+ *   和目标列表通过 adjust_appendrel_attrs() 变量替换后复制给子关系;若父
+ *   参与等价类连接或有用的排序键,还要 add_child_rel_equivalences() 建立子
+ *   关系在等价类中的成员;
+ * - tuples 累加的是各子关系"物理元组数",rows 累加的是"过滤后行数",两者
+ *   分开统计是为了让基于 appendrel 的 distinct 估计等能正确应用选择性;
+ *   宽度按"子关系行数"加权平均(宽度用于估算排序/哈希的整体占用);
+ * - 并行标志:任一存活子关系不并行则父整体不并行(将来可能部分子关系并行,
+ *   但现在不支持,所以全部或不);
+ * - 大小汇总完成后 rel->pages 保持为 0,避免在 total_table_pages 里把
+ *   append 树重复计数;
+ * - 全部子关系都被排除时把父标记为 dummy(set_dummy_rel_pathlist),这样
+ *   本阶段其它关系就能看到父为空。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— append 父关系(RELOPT_BASEREL 或继承子关系);
+ *   rti  —— rel 的 rtable 索引;
+ *   rte  —— 对应 RangeTblEntry(rte->inh 为真)。
+ * 【返回值】无。
  */
 static void
 set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
@@ -1317,6 +1723,30 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
  * set_append_rel_pathlist
  *	  Build access paths for an "append relation"
  */
+/*
+ * set_append_rel_pathlist - (中文)为继承/分区(append)关系生成访问路径
+ *
+ * 【作用】为 append 父关系生成路径:先递归为每个存活子关系生成各自的扫描
+ * 路径,然后把所有非 dummy 子关系收集进 live_childrels 列表,最后交给
+ * add_paths_to_append_rel() 合成各种 Append/MergeAppend/并行 Append 路径。
+ * 由 set_rel_pathlist() 对 rte->inh 的关系调用。
+ *
+ * 【设计思想】
+ * - 循环 append_rel_list 定位子关系后直接递归调用 set_rel_pathlist() 为子
+ *   生成路径;若父因 set_append_rel_size 已判定不并行,要把该标志向下传播到
+ *   子关系,避免为子生成无用 partial 路径;
+ * - dummy 子关系被忽略,不进入 live_childrels;
+ * - 具体的 Append 路径形态(无序 Append、并行 Append、有序 MergeAppend、
+ *   参数化 Append 等)都在 add_paths_to_append_rel() / generate_orderedappend_paths()
+ *   中根据子关系暴露的 pathkeys 与参数化集合决定。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— append 父关系;
+ *   rti  —— rel 的 rtable 索引;
+ *   rte  —— 对应 RangeTblEntry。
+ * 【返回值】无。
+ */
 static void
 set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 						Index rti, RangeTblEntry *rte)
@@ -1380,6 +1810,24 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
  *	  If a grouped relation for the given 'rel' exists, build partial
  *	  aggregation paths for it.
  */
+/*
+ * set_grouped_rel_pathlist - (中文)为基础关系的 grouped rel 生成部分聚合路径
+ *
+ * 【作用】若给定关系存在对应的 grouped rel(急切聚合信息),则调用
+ * generate_grouped_paths() 在其上生成部分聚合路径,并调用 set_cheapest()
+ * 选出最便宜路径。由 set_rel_pathlist() 在每个基础关系的路径生成完毕之后
+ * 调用。
+ *
+ * 【设计思想】急切聚合要求查询确实含聚合与分组表达式,否则直接返回。
+ * set_cheapest() 必须先于本函数调用(见 set_rel_pathlist 顺序),因为
+ * generate_grouped_paths() 需要用到关系的最便宜路径。连接关系(joinrel)的
+ * grouped rel 不在此处理,而在 standard_join_search() 里逐层处理。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 基础关系,rel->grouped_rel 可能是其 grouped rel。
+ * 【返回值】无。
+ */
 static void
 set_grouped_rel_pathlist(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -1415,6 +1863,39 @@ set_grouped_rel_pathlist(PlannerInfo *root, RelOptInfo *rel)
  * an append path collecting one path from each non-dummy child with given
  * parameterization or ordering. Similarly it collects partial paths from
  * non-dummy children to create partial append paths.
+ */
+/*
+ * add_paths_to_append_rel - (中文)为 append 关系合成各种 Append 路径
+ *
+ * 【作用】给定 append 父关系与非 dummy 子关系列表,收集各子关系支持的
+ * 参数化集合与排序键,据此生成:无序非参数化 Append 路径、快速启动
+ * (cheapest_startup) Append 路径、纯 partial 路径的并行 Append、混合
+ * partial 与非 partial 子路径的并行 Append、按每种排序键的 MergeAppend/
+ * 有序 Append(见 generate_orderedappend_paths())、以及每种参数化集合的
+ * 参数化 Append 路径。本函数同时是 partitionwise join 中
+ * generate_partitionwise_join_paths() 复用"把子连接合成父连接路径"的入口。
+ *
+ * 【设计思想】
+ * - 对每个 child:取 unparameterized cheapest-total 路径填进
+ *   unparameterized 输入;若父关系考虑快速启动,再取 cheapest-startup(或
+ *   按 tuple_fraction 取 cheapest-fractional)路径填进 startup 输入;取
+ *   partial_pathlist 的第一条(最便宜的)partial 路径填进 partial_only 输入;
+ *   并行 Append 的输入在"partial 路径更便宜"时用 partial 路径,否则用
+ *   parallel-safe 的非 partial 路径(两者都缺则放弃并行 Append);
+ * - 并行 Append 的 worker 数取各 partial 子路径的最大值,且至少要
+ *   log2(#children)+1 个(猜测公式,目的是分区表与同数据量的整表在并行度
+ *   上不至于差太多),并受 max_parallel_workers_per_gather 限制;
+ * - 参数化 Append 要求每个子路径参数化集合完全一致(Append 自身不检查
+ *   quals),不足的通过 get_cheapest_parameterized_child_path() 提升;因此
+ *   同一个参数化集合在所有子关系都凑齐时才生成路径;
+ * - 单子关系时 append 路径可继承子路径的排序,因此还会为带 pathkeys 的
+ *   有序 partial 路径(跳过已用过的第一条)各生成一个并行 Append。
+ *
+ * 【参数】
+ *   root           —— PlannerInfo;
+ *   rel            —— append 父关系(也可能是分区连接关系的父);
+ *   live_childrels —— 所有非 dummy 子关系的列表。
+ * 【返回值】无(路径通过 add_path/add_partial_path 注册到 rel)。
  */
 void
 add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
@@ -1848,6 +2329,36 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
  * parameterized paths here to feed such joins.  (See notes in
  * optimizer/README for why that might not ever happen, though.)
  */
+/*
+ * generate_orderedappend_paths - (中文)为 append 关系生成有序路径(MergeAppend/有序 Append)
+ *
+ * 【作用】对 all_child_pathkeys 里收集到的每种排序键,分别以 cheapest-startup、
+ * cheapest-total、cheapest-fractional(仅当 tuple_fraction > 0)三种口径收集
+ * 每个子关系的子路径,合成 MergeAppend 路径(或当分区键天然有序时合成直接
+ * 有序的 Append 路径),加入父关系的 pathlist。
+ *
+ * 【设计思想】
+ * - RANGE 分区表存在"分区排列顺序与排序键一致"的可能:先调用
+ *   build_partition_pathkeys() 构造正反两个方向的分区排序键,若查询的排序键
+ *   完全包含分区键(或分区键完整且包含于查询键),则按分区顺序直接 Append
+ *   即可得到有序结果,无需 MergeAppend 的归并排序。反方向时通过反向遍历
+ *   子关系实现;
+ * - 对每个子关系,用 get_cheapest_path_for_pathkeys() 找恰好满足该排序键的
+ *   路径;找不到就退化为 cheapest-total 路径并靠上层再排序(创建 MergeAppend
+ *   时每个子路径要单独 Sort,或让父级后续处理);
+ * - startup 与 total 若指向同一路径则不重复生成两条几乎相同的 MergeAppend
+ *   (用 startup_neq_total / fraction_neq_total 标记);
+ * - 这里不生成参数化有序路径:有序路径主要用于最外层或 merge join 的外侧,
+ *   放在 nestloop 内测价值不大,而且 add_path 对参数化路径的排序也不给加分。
+ *
+ * 【参数】
+ *   root               —— PlannerInfo;
+ *   rel                —— append 父关系;
+ *   live_childrels     —— 非 dummy 子关系列表;
+ *   all_child_pathkeys —— add_paths_to_append_rel 收集到的全部候选排序键列表
+ *                         (每个元素是一个 pathkey 列表)。
+ * 【返回值】无。
+ */
 static void
 generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 							 List *live_childrels,
@@ -2164,6 +2675,31 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
  *
  * Returns NULL if unable to create such a path.
  */
+/*
+ * get_cheapest_parameterized_child_path - (中文)取恰好具有指定参数化的最便宜子路径
+ *
+ * 【作用】在 append 子关系的 pathlist 中寻找"参数化集合恰好等于
+ * required_outer"的最便宜路径;找不到精确匹配时,尝试把已有的"参数化集合
+ * 是 required_outer 子集"的路径"重参数化"(reparameterize_path)提升到所需
+ * 参数化后再比较成本。用于 add_paths_to_append_rel() 组装参数化 Append 路径。
+ *
+ * 【设计思想】
+ * - 第一步直接查询:get_cheapest_path_for_pathkeys() 找"不超过所需参数化"
+ *   的最便宜路径;若其参数化恰好匹配则直接返回;
+ * - 否则逐个扫描 pathlist:跳过"所需参数化超集"(参数化只增不减,超集路径
+ *   无法满足;用 bms_is_subset 判断);
+ * - 重参数化只会增加成本,所以可以提前用当前 cheapest 剪枝;调用
+ *   reparameterize_path(root, path, required_outer, 1.0) 时 loop_count 传 1.0,
+ *   表示按 nestloop 内层循环一次来估新增 quals 的成本;失败(返回 NULL)则跳过;
+ * - 返回值可能为 NULL,调用方(add_paths_to_append_rel)据此判定该参数化
+ *   集合下无法凑齐所有子路径。
+ *
+ * 【参数】
+ *   root           —— PlannerInfo;
+ *   rel            —— append 子关系;
+ *   required_outer —— 期望的参数化集合(必含关系的 lateral_relids)。
+ * 【返回值】满足参数化的最便宜路径,或 NULL。
+ */
 static Path *
 get_cheapest_parameterized_child_path(PlannerInfo *root, RelOptInfo *rel,
 									  Relids required_outer)
@@ -2252,6 +2788,36 @@ get_cheapest_parameterized_child_path(PlannerInfo *root, RelOptInfo *rel,
  * NULL, we don't flatten the path at all (unless it contains only partial
  * paths).
  */
+/*
+ * accumulate_append_subpath - (中文)把一个子路径累加进 Append/MergeAppend 的子路径表
+ *
+ * 【作用】把 path 加入正在构造的 Append/MergeAppend 的子路径列表,同时维护
+ * child_append_relid_sets。若 path 本身是 Append/MergeAppend 且可以"展平",
+ * 则把它的子路径直接并入,而不是嵌套一层。被 add_paths_to_append_rel() 与
+ * generate_orderedappend_paths() 广泛调用。
+ *
+ * 【设计思想】
+ * - 展平的意义:省略中间层。若父是 MergeAppend,子合并 Append 的多余嵌套
+ *   排序无意义;若父是无序 Append,子 MergeAppend 的输出反正会被打乱。
+ *   不提前展平是因为两层变量替换(adjust_appendrel_attrs)要分别作用于
+ *   父子路径;
+ * - 非并行感知的 Append 或首部分路径下标为 0(全 partial)的并行 Append:
+ *   整个子路径列表并入 subpaths;带 partial 的并行 Append:把 partial 段
+ *   (subpaths[first_partial_path..])并入 subpaths,非 partial 段并入
+ *   special_subpaths(父并行 Append 的非 partial 段由 leader 执行);
+ * - MergeAppendPath 无条件并入其子路径;
+ * - 无论展平与否,都把 path 所属关系(parent->relids)登记进
+ *   child_append_relid_sets,以免该关系 id 从最终计划的 relid 集合中消失
+ *   (上层用它对 join/unique 判定)。
+ *
+ * 【参数】
+ *   path                     —— 待累加的子路径;
+ *   subpaths                 —— 输出/输入:partial(或普通)子路径累积列表;
+ *   special_subpaths         —— 输出/输入:并行 Append 的非 partial 段;NULL
+ *                              表示不展平并行 Append;
+ *   child_append_relid_sets  —— 输出/输入:子 append 关系的 relid 集合列表。
+ * 【返回值】无。
+ */
 static void
 accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths,
 						  List **child_append_relid_sets)
@@ -2318,6 +2884,23 @@ accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths,
  *
  * Note: 'path' must not be a parallel-aware path.
  */
+/*
+ * get_singleton_append_subpath - (中文)若 Append/MergeAppend 只有一个子路径则返回该子路径
+ *
+ * 【作用】用于有序 Append 的路径组装:如果传入的 path 是"只有一个子路径"的
+ * Append/MergeAppend(即它本身没在干实事),就把它"脱壳",返回那唯一的子路径;
+ * 否则原样返回 path。副作用:每当脱壳返回子路径时,把原路径所属关系的
+ * relid 集合记入 child_append_relid_sets,保证这些 relid 不会从最终计划消失。
+ *
+ * 【设计思想】子表本身可能是分区(子 append 关系),其路径又包了一层
+ * Append/MergeAppend;当该层只有一个子路径时纯属冗余,展开后父路径直接使用
+ * 这个子路径即可。要求 path 非并行感知(并行 Append 的语义不能这样简化)。
+ *
+ * 【参数】
+ *   path                     —— 待检查的路径;
+ *   child_append_relid_sets  —— 输出/输入:子 append 关系的 relid 集合列表。
+ * 【返回值】脱壳后的单子路径,或原 path。
+ */
 static Path *
 get_singleton_append_subpath(Path *path, List **child_append_relid_sets)
 {
@@ -2365,6 +2948,23 @@ get_singleton_append_subpath(Path *path, List **child_append_relid_sets)
  * (See also mark_dummy_rel, which does basically the same thing, but is
  * typically used to change a rel into dummy state after we already made
  * paths for it.)
+ */
+/*
+ * set_dummy_rel_pathlist - (中文)把被约束排除的关系标记为 dummy 并给出空路径
+ *
+ * 【作用】把关系的大小估算清零、丢弃已有路径,并添加一个"无任何子路径"的
+ * AppendPath 作为 dummy 路径。被 set_rel_size()/set_append_rel_size() 在约束
+ * 排除证明关系为空时调用;也是整个规划器标记"关系为空"的约定方式。
+ *
+ * 【设计思想】不发明专门的 dummy 路径类型,而是用空 AppendPath 表示
+ * (IS_DUMMY_APPEND/IS_DUMMY_REL 宏据此判断)。dummy 关系虽然零行,仍要保留
+ * lateral_relids 作为参数化,以免上层误判可无条件扫描。结尾调用 set_cheapest()
+ * 立即填充 cheapest-path 字段(与 mark_dummy_rel 行为一致),虽然当前调用点
+ * 稍后也会做,但这是廉价的安全措施。
+ *
+ * 【参数】
+ *   rel —— 待标记为 dummy 的关系。
+ * 【返回值】无。
  */
 static void
 set_dummy_rel_pathlist(RelOptInfo *rel)
@@ -2415,6 +3015,40 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
  * 'attno' to *run_cond_attrs offset by FirstLowInvalidHeapAttributeNumber.
  * If the 'opexpr' cannot be used then we set *keep_original to true and
  * return false.
+ */
+/*
+ * find_window_run_conditions - (中文)为窗口函数寻找可作 runCondition 的比较条件
+ *
+ * 【作用】判断子查询输出列上的比较表达式 opexpr 能否改造成窗口函数
+ * WindowAgg 的 runCondition,从而在执行时提前终止窗口计算(例如
+ * row_number() <= 10 时行号一到 11 就不再处理)。能用时把条件写入
+ * wfunc->runCondition、登记 run_cond_attrs,并按需设置 *keep_original。
+ * 被 check_and_push_window_quals() 调用。
+ *
+ * 【设计思想】
+ * - 前提:窗口函数的支持函数(prosupport)报告其单调性(monotonic),且被比较
+ *   的另一侧是伪常量(pseudo-constant,整个分区内不变);若含子查询则放弃;
+ * - 按比较类型转换 runCondition:单调递增函数配合 < / <= 过滤上界
+ *   (wfunc 在左)或 > / >= 过滤下界(常数在左);单调递减相反;= 时则改写为
+ *   <= / >= 形式过滤掉超过/低于目标值的行(此时原始相等条件必须保留,
+ *   keep_original = true);同时支持单调递增又递减(常量函数)时直接用原条件;
+ * - 改写用的运算符通过 get_opfamily_member_for_cmptype() 从原运算符所属
+ *   opfamily 推导;
+ * - 找到可用条件后把 runopexpr 复制进 WindowFuncRunCondition(拷贝的是对侧
+ *   表达式),登记"第 attno 列被 runCondition 使用"(偏移
+ *   FirstLowInvalidHeapAttributeNumber),供 remove_unused_subquery_outputs()
+ *   保留该列不被删除。
+ *
+ * 【参数】
+ *   subquery       —— 被分析的子查询;
+ *   attno          —— opexpr 引用的子查询输出列号;
+ *   wfunc          —— 对应的窗口函数(调用方已确认其来自该列);
+ *   opexpr         —— 候选比较表达式(<、<=、>、>=、=);
+ *   wfunc_left     —— wfunc 是否位于 opexpr 左操作数;
+ *   keep_original  —— 输出:调用方是否仍需保留原始 qual(置 false 表示
+ *                     runCondition 已完全接管过滤);
+ *   run_cond_attrs —— 输出:被 runCondition 用到的列号位图(累加)。
+ * 【返回值】true:成功把条件加入 wfunc->runCondition;false:不可用。
  */
 static bool
 find_window_run_conditions(Query *subquery, AttrNumber attno,
@@ -2606,6 +3240,30 @@ find_window_run_conditions(Query *subquery, AttrNumber attno,
  * the caller can safely ignore the original qual because the WindowAgg node
  * will use the runCondition to stop returning tuples.
  */
+/*
+ * check_and_push_window_quals - (中文)检查子查询外层 qual 能否推进为窗口 runCondition
+ *
+ * 【作用】给定子查询外层的一个限制条件 clause(取自 baserestrictinfo,由
+ * qual_is_pushdown_safe 判定为 PUSHDOWN_WINDOWCLAUSE_RUNCOND),检查它是否
+ * 是"窗口函数 <=/>= 常数"形式的二元比较;是则进一步调用
+ * find_window_run_conditions() 尝试把它改造成 WindowAgg 的 runCondition。
+ * 由 set_subquery_pathlist() 调用。
+ *
+ * 【设计思想】
+ * - 只接受二元 OpExpr,且要求操作符严格(strict):一旦 runCondition 变 false
+ *   执行器就停止计算 WindowFunc 并把剩余值置 NULL,只有严格函数才能保证
+ *   顶层 WindowAgg 正确过滤含 NULL 的行;
+ * - 分别在左、右操作数里找引用子查询输出列(targetlist 元素)的 Var,且该列
+ *   表达式是 WindowFunc 时才有戏;找到后询问 find_window_run_conditions(),
+ *   按其返回值决定调用方是否还需保留原始 qual。
+ *
+ * 【参数】
+ *   subquery       —— 被分析的子查询;
+ *   clause         —— 候选限制条件(通常来自上层 baserestrictinfo);
+ *   run_cond_attrs —— 输出:被 runCondition 用到的子查询输出列位图(累加)。
+ * 【返回值】true:调用方必须保留原始 qual;false:runCondition 已接管过滤,
+ *           调用方可丢弃原始 qual。
+ */
 static bool
 check_and_push_window_quals(Query *subquery, Node *clause,
 							Bitmapset **run_cond_attrs)
@@ -2678,6 +3336,40 @@ check_and_push_window_quals(Query *subquery, Node *clause,
  * So the paths made here will be parameterized if the subquery contains
  * LATERAL references, otherwise not.  As long as that's true, there's no need
  * for a separate set_subquery_size phase: just make the paths right away.
+ */
+/*
+ * set_subquery_pathlist - (中文)为子查询 RTE 生成 SubqueryScan 访问路径
+ *
+ * 【作用】处理 FROM 中的子查询:拷贝 Query 以免规划过程破坏原 RTE;尝试把
+ * 上层限制条件推入子查询(WHERE/HAVING 或窗口 runCondition);删除子查询不
+ * 需要的输出列;递归调用 subquery_planner() 为子查询生成子计划;然后把子
+ * 计划的每条路径包装成 SubqueryScanPath 加入本关系。由 set_rel_size() 对
+ * RTE_SUBQUERY 调用(在估算阶段就完成路径生成)。
+ *
+ * 【设计思想】
+ * - 推入条件的正确性分三层把关:subquery_is_pushdown_safe() 检查子查询整体
+ *   结构是否安全(LIMIT/EXCEPT/DISTINCT/窗口/集合函数/分组集等),
+ *   qual_is_pushdown_safe() 检查单条 qual(伪常量除外,留给上层做 gating),
+ *   推入时再用 setop 树递归 + ReplaceVarsFromTargetList 完成变量替换;
+ *   推入到 HAVING 而不是 WHERE 的判定依据是子查询是否分组/聚合;
+ * - 未能推入的条件留在 SubqueryScan 的 qpqual;推入窗口 runCondition 的条件
+ *   仍可能要在上层保留(见 check_and_push_window_quals 返回值);
+ * - tuple_fraction 只有在当前查询无连接/聚合/排序时才可下传,否则子查询要
+ *   按"取全部行"来规划,否则外层过滤会破坏语义;
+ * - 子查询规划结果(subroot、plan_params)保存在 rel->subroot /
+ *   rel->subplan_params,供执行期初始化 SubPlan 参数;若子查询被约束排除证明
+ *   为空则整个关系置 dummy;
+ * - reltarget 的 trivial 性(按序逐列取子计划输出)预先算出并传给
+ *   cost_subqueryscan(),避免它重复推导;
+ * - 子查询路径同样支持并行:若 rel->consider_parallel 且无参数化,把子计划
+ *   的 partial 路径逐个包装为 SubqueryScanPath 加入 partial_pathlist。
+ *
+ * 【参数】
+ *   root —— 外层查询的 PlannerInfo;
+ *   rel  —— 子查询关系(RELOPT_BASEREL);
+ *   rti  —— rel 在 rtable 中的索引;
+ *   rte  —— 对应 RangeTblEntry(RTE_SUBQUERY)。
+ * 【返回值】无。
  */
 static void
 set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -2948,6 +3640,26 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
  * set_function_pathlist
  *		Build the (single) access path for a function RTE
  */
+/*
+ * set_function_pathlist - (中文)为函数 RTE(FROM 中的函数)生成访问路径
+ *
+ * 【作用】为 RTE_FUNCTION 生成唯一的 FunctionScan 路径加入 rel->pathlist。
+ * 由 set_rel_pathlist() 调用。函数扫描不下推连接条件,但 LATERAL 引用造成的
+ * 参数化需要保留。
+ *
+ * 【设计思想】函数结果默认无序;若函数带 WITH ORDINALITY,则输出按序数列
+ * (最后一列)有序。此时若该列出现在关系 tlist 中,尝试用
+ * build_expression_pathkey() 构造排序键——注意传 allow_no_new_eclass = false,
+ * 表示如果该列尚不属于任何等价类(即没有人在意排序),就不要新建等价类,
+ * 路径保持无序。构造成功后 FunctionScan 路径带 pathkeys,上层可据此做
+ * 免排序合并等。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 函数关系;
+ *   rte  —— 对应 RangeTblEntry(RTE_FUNCTION)。
+ * 【返回值】无。
+ */
 static void
 set_function_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
@@ -3015,6 +3727,23 @@ set_function_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * set_values_pathlist
  *		Build the (single) access path for a VALUES RTE
  */
+/*
+ * set_values_pathlist - (中文)为 VALUES 列表 RTE 生成访问路径
+ *
+ * 【作用】为 RTE_VALUES 生成唯一的 ValuesScan 路径加入 rel->pathlist。
+ * 由 set_rel_pathlist() 调用。VALUES 扫描不下推连接条件,但 LATERAL 引用
+ * (出现在 values 表达式中)造成的参数化需要保留。
+ *
+ * 【设计思想】VALUES 列表本质上是一组常量行,执行器逐行返回,没有索引等
+ * 其它访问方式,所以只有一条路径。行数估算已在 set_values_size_estimates()
+ * 完成(见 set_rel_size)。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— VALUES 关系;
+ *   rte  —— 对应 RangeTblEntry(RTE_VALUES)。
+ * 【返回值】无。
+ */
 static void
 set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
@@ -3034,6 +3763,23 @@ set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 /*
  * set_tablefunc_pathlist
  *		Build the (single) access path for a table func RTE
+ */
+/*
+ * set_tablefunc_pathlist - (中文)为 XMLTABLE 等表函数 RTE 生成访问路径
+ *
+ * 【作用】为 RTE_TABLEFUNC 生成唯一的 TableFuncScan 路径加入 rel->pathlist。
+ * 由 set_rel_pathlist() 调用。表函数扫描不下推连接条件,但 LATERAL 引用造成
+ * 的参数化需要保留。
+ *
+ * 【设计思想】表函数(XMLTABLE 等)由执行器直接展开成行,没有其它访问方式,
+ * 所以只有一条路径。大小估算在 set_tablefunc_size_estimates() 完成(见
+ * set_rel_size)。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 表函数关系;
+ *   rte  —— 对应 RangeTblEntry(RTE_TABLEFUNC)。
+ * 【返回值】无。
  */
 static void
 set_tablefunc_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
@@ -3058,6 +3804,27 @@ set_tablefunc_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  *
  * There's no need for a separate set_cte_size phase, since we don't
  * support join-qual-parameterized paths for CTEs.
+ */
+/*
+ * set_cte_pathlist - (中文)为非递归 CTE 引用 RTE 生成访问路径
+ *
+ * 【作用】为 RTE_CTE(非 self-reference)生成唯一的 CteScan 路径:根据
+ * ctelevelsup 找到规划该 CTE 的那一层(cteroot),在其 cteList 中按名字定位
+ * CTE 并取得已生成好的路径(glob->subpaths[plan_id-1])与计划,据此设置大小
+ * 估算、转换排序键,最后创建 CteScan 路径。由 set_rel_size() 对非递归 CTE
+ * 调用。
+ *
+ * 【设计思想】CTE 先于引用处整体规划好(见 planner.c 的 WITH 处理),本函数
+ * 只负责"引用"它,因此同样不存在参数化选择问题,大小与路径在同一阶段完成。
+ * cte_plan_ids 可能比 cteList 短(规划过程中某个 CTE 引用另一个正在规划的
+ * CTE),所以要按名字线性查找并校验 plan_id 合法。路径排序键用
+ * convert_subquery_pathkeys() 从 CTE 内部表示转换为外层表示。
+ *
+ * 【参数】
+ *   root —— 引用 CTE 那一层的 PlannerInfo;
+ *   rel  —— CTE 引用关系;
+ *   rte  —— 对应 RangeTblEntry(RTE_CTE)。
+ * 【返回值】无。
  */
 static void
 set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
@@ -3138,6 +3905,22 @@ set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * There's no need for a separate set_namedtuplestore_size phase, since we
  * don't support join-qual-parameterized paths for tuplestores.
  */
+/*
+ * set_namedtuplestore_pathlist - (中文)为具名 tuplestore RTE 生成访问路径
+ *
+ * 【作用】为 RTE_NAMEDTUPLESTORE(spi 之类机制传入的具名 tuplestore)设置
+ * 大小估算并生成唯一的 NamedTuplestoreScan 路径。由 set_rel_size() 调用。
+ *
+ * 【设计思想】tuplestore 内容已在进入查询前物化,没有其它访问方式,也不支持
+ * 参数化路径选择,所以大小与路径在同一阶段完成。LATERAL 引用造成的参数化
+ * 仍需保留。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— tuplestore 引用关系;
+ *   rte  —— 对应 RangeTblEntry(RTE_NAMEDTUPLESTORE)。
+ * 【返回值】无。
+ */
 static void
 set_namedtuplestore_pathlist(PlannerInfo *root, RelOptInfo *rel,
 							 RangeTblEntry *rte)
@@ -3165,6 +3948,21 @@ set_namedtuplestore_pathlist(PlannerInfo *root, RelOptInfo *rel,
  * There's no need for a separate set_result_size phase, since we
  * don't support join-qual-parameterized paths for these RTEs.
  */
+/*
+ * set_result_pathlist - (中文)为 RTE_RESULT 关系生成访问路径
+ *
+ * 【作用】为 RTE_RESULT(表示"无实际数据源"的 Result 关系,例如仅含常量列的
+ * SELECT)设置大小估算并生成唯一的 ResultScan 路径。由 set_rel_size() 调用。
+ *
+ * 【设计思想】RTE_RESULT 只产生一行(或不产生),没有扫描语义,也没有其它访问
+ * 方式;大小与路径在同一阶段完成。LATERAL 引用造成的参数化仍需保留。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— Result 关系;
+ *   rte  —— 对应 RangeTblEntry(RTE_RESULT)。
+ * 【返回值】无。
+ */
 static void
 set_result_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					RangeTblEntry *rte)
@@ -3191,6 +3989,25 @@ set_result_pathlist(PlannerInfo *root, RelOptInfo *rel,
  *
  * There's no need for a separate set_worktable_size phase, since we don't
  * support join-qual-parameterized paths for CTEs.
+ */
+/*
+ * set_worktable_pathlist - (中文)为递归 CTE 的工作表引用 RTE 生成访问路径
+ *
+ * 【作用】为递归 CTE 中"引用工作表(worktable)"的 RTE 生成唯一的
+ * WorkTableScan 路径:沿 ctelevelsup 向上找到递归 UNION 所在层,取其
+ * non_recursive_path(非递归项的路径,代表工作表的初始内容)来估算大小。
+ * 由 set_rel_size() 对 self-reference 的 CTE 引用调用。
+ *
+ * 【设计思想】递归 CTE 的工作表在每次迭代后更新,其扫描由执行器的
+ * WorkTableScan 节点完成。这里需要注意 ctelevelsup 指向的层"下面"才是处理
+ * 递归 UNION 的层(levelsup 要减 1),因为工作表由递归查询本身维护。
+ * non_recursive_path 决定初始内容的大小,递归扩展的增量没有单独估计。
+ *
+ * 【参数】
+ *   root —— 引用工作表的查询层 PlannerInfo;
+ *   rel  —— 工作表引用关系;
+ *   rte  —— 对应 RangeTblEntry(RTE_CTE,self_reference 为真)。
+ * 【返回值】无。
  */
 static void
 set_worktable_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
@@ -3250,6 +4067,30 @@ set_worktable_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * need to override the rowcount estimate.  (It's not clear that the
  * particular value we're using here is actually best, but the underlying rel
  * has no estimate so we must do something.)
+ */
+/*
+ * generate_gather_paths - (中文)在 partial 路径之上生成 Gather / Gather Merge 路径
+ *
+ * 【作用】把关系的 partial 路径集合转化为完整的并行路径:对最便宜的(无序)
+ * partial 路径包一层 Gather;对每条带排序键的 partial 路径包一层保序的
+ * Gather Merge。生成结果加入 rel->pathlist。被 generate_useful_gather_paths()、
+ * planner.c 以及扫描/连接关系路径生成完毕时调用。
+ *
+ * 【设计思想】
+ * - 前提:调用时该关系的所有 partial 路径都已创建完毕,否则 add_partial_path
+ *   可能删除已被本函数引用的路径;
+ * - Gather 输出无序,因此只需考虑最便宜的 partial 路径(partial_pathlist 头部,
+ *   add_partial_path 保证最便宜的在前);
+ * - Gather Merge 保序:对每个带 pathkeys 的 partial 路径生成一条,输出行数
+ *   用 compute_gather_rows() 折算(考虑 worker 间的重复计数);
+ * - override_rows 为 true 时(用于部分聚合/部分 distinct 的上层关系)覆盖关系
+ *   自带的行数估计,因为这类关系没有合理估计。
+ *
+ * 【参数】
+ *   root          —— PlannerInfo;
+ *   rel           —— 拥有 partial_pathlist 的关系;
+ *   override_rows —— true 时用 compute_gather_rows 覆盖 rel->rows 用于成本计算。
+ * 【返回值】无。
  */
 void
 generate_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
@@ -3320,6 +4161,30 @@ generate_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
  * in the future. For example, we might want to consider pathkeys useful for
  * merge joins.
  */
+/*
+ * get_useful_pathkeys_for_relation - (中文)判断关系哪些排序键值得考虑
+ *
+ * 【作用】返回对指定关系"有用"的排序键列表,供 generate_useful_gather_paths()
+ * 在 Gather Merge 之下考虑加增量排序/全排序。目前只考察根查询的
+ * query_pathkeys:只要该关系能提前(在 gather 之前)按其中某前缀排序,这段
+ * 前缀就是有用的。
+ *
+ * 【设计思想】数据有序可能因为两点:匹配最终输出排序(省去顶层全排序),或
+ * 支持 merge join。这里的启发式是扫描 query_pathkeys 的前缀,逐键调用
+ * relation_can_be_sorted_early() 确认关系的 reltarget 里有安全(且可并行安全)
+ * 的等价类成员可提前计算;一旦某个键不满足就停止,但已满足的前缀仍返回
+ * (因为可以做增量排序)。require_parallel_safe 为 true 时额外要求排序表达式
+ * 并行安全,这样排序可被推入 Gather Merge 之下的并行部分。
+ * 若能匹配整个 query_pathkeys 则直接返回原列表指针(便于后续用指针比较),
+ * 否则拷贝前缀。
+ *
+ * 【参数】
+ *   root                  —— PlannerInfo;
+ *   rel                   —— 待生成 gather 路径的关系;
+ *   require_parallel_safe —— true 时要求排序表达式并行安全。
+ * 【返回值】有用排序键的列表(每个元素是一个 pathkey 列表);当前实现最多
+ *           一个元素。
+ */
 static List *
 get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel,
 								 bool require_parallel_safe)
@@ -3387,6 +4252,34 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel,
  * paths (aiming to preserve the ordering), but also considers ordering that
  * might be useful for nodes above the gather merge node, and tries to add
  * a sort (regular or incremental) to provide that.
+ */
+/*
+ * generate_useful_gather_paths - (中文)生成带"有用排序"的 Gather / Gather Merge 路径
+ *
+ * 【作用】generate_gather_paths() 的增强版:除了为带排序键的 partial 路径直接
+ * 生成保序 Gather Merge 外,还会根据 get_useful_pathkeys_for_relation() 找出的
+ * "有用排序",为部分已排序的 partial 路径加增量排序、为最便宜的 partial 路径
+ * 加全排序,再包上 Gather Merge,从而把顶层排序尽量下推进并行部分。被
+ * set_rel_pathlist()/standard_join_search() 等在处理完一个关系的 partial 路径
+ * 之后调用。
+ *
+ * 【设计思想】
+ * - 先调用 generate_gather_paths() 处理"已完全有序"的 subpath(它对每个带
+ *   pathkeys 的 subpath 都会建 Gather Merge),所以这里只需考虑"尚未达到所需
+ *   顺序"的路径;
+ * - 对每个有用排序:遍历 partial_pathlist,用 pathkeys_count_contained_in()
+ *   计算已有排序前缀长度 presorted_keys;完全有序则跳过;为了控制规划时间,
+ *   只对"最便宜的 partial 路径"做全排序,对"已有部分有序前缀"的路径做增量
+ *   排序(增量排序被禁用时则只排序最便宜的路径);
+ * - 排序后 subpath 的排序键成为 Gather Merge 的排序键,最后行数用
+ *   compute_gather_rows() 折算;
+ * - override_rows 语义同 generate_gather_paths()。
+ *
+ * 【参数】
+ *   root          —— PlannerInfo;
+ *   rel           —— 拥有 partial_pathlist 的关系;
+ *   override_rows —— true 时用 compute_gather_rows 覆盖 rel->rows。
+ * 【返回值】无。
  */
 void
 generate_useful_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
@@ -3504,6 +4397,39 @@ generate_useful_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_r
  *
  * The information needed is provided by the RelAggInfo structure stored in
  * "grouped_rel".
+ */
+/*
+ * generate_grouped_paths - (中文)为 grouped rel 生成排序/哈希的部分聚合路径
+ *
+ * 【作用】在"未分组关系"的路径之上,为对应的 grouped rel 生成各种"部分聚合"
+ * 路径:AGG_SORTED(排序分组)与 AGG_HASHED(哈希分组)、非并行与并行
+ * (partial)四种组合。被 set_grouped_rel_pathlist()(基础关系)与
+ * standard_join_search() / generate_partitionwise_join_paths()(连接关系)调用。
+ * 这些部分聚合路径随后由上层 FinalizeAggregate 路径再聚合成完整聚合。
+ *
+ * 【设计思想】
+ * - 急切聚合的适用位置与收益已由 RelAggInfo 记录(agg_info->apply_agg_at
+ *   表明聚合应推到的连接层,agg_useful 表明是否值得),不符合则直接返回;
+ *   rel 为空则标记 grouped_rel 为 dummy;
+ * - AGGSPLIT_INITIAL_SERIAL 表示"先做部分聚合,序列化中间结果"的拆分方式,
+ *   聚合开销由 get_agg_clause_costs() 统计;
+ * - can_sort 由 grouping_is_sortable() 判定,并构造 group_pathkeys(分组子句的
+ *   排序键);can_hash 由 grouping_is_hashable() 判定,要求有分组子句且可哈希
+ *   分组(有序聚合时禁止哈希——断言 numOrderedAggs == 0);
+ * - 排序路径生成:遍历 rel 的完整/partial 路径,优先用已部分有序的路径(增量
+ *   排序),否则对最便宜路径做全排序;非最便宜的参数化路径被忽略以省规划时间;
+ * - 哈希路径生成:直接基于 cheapest_total / cheapest_partial 路径;
+ * - 所有路径之上都先加 Projection(把未分组关系的输出投影成聚合所需输入
+ *   agg_info->agg_input),因为未分组关系不懂急切聚合;
+ * - 分组数估计用 estimate_num_groups()(按完整路径行数与 partial 路径行数
+ *   分别估计 dNumGroups / dNumPartialGroups),用于成本模型;
+ * - HAVING 条件不能下放(qual = NIL),因为最终聚合值未求出前无法评估。
+ *
+ * 【参数】
+ *   root        —— PlannerInfo;
+ *   grouped_rel —— 目标 grouped rel(IS_GROUPED_REL),其 agg_info 是 RelAggInfo;
+ *   rel         —— 提供输入路径的未分组关系(与 grouped_rel 同 relids)。
+ * 【返回值】无。
  */
 void
 generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
@@ -3843,6 +4769,25 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
  * See comments for deconstruct_jointree() for definition of the joinlist
  * data structure.
  */
+/*
+ * make_rel_from_joinlist - (中文)按 joinlist 引导连接路径搜索
+ *
+ * 【作用】根据 deconstruct_jointree() 生成的 joinlist(连接树的一种扁平化
+ * 嵌套列表表示)构建最终的连接关系:对列表里每个节点递归——RangeTblRef 直接
+ * 取对应基础关系,List 则递归本函数先求出该子问题的连接关系;然后按层数选择
+ * 搜索策略:单节点直接返回;多节点则交给插件钩子(join_search_hook)、GEQO
+ * (enable_geqo 且层数达标)或 standard_join_search()。由 make_one_rel() 调用。
+ *
+ * 【设计思想】joinlist 的深度就是动态规划需要的"层数"(levels_needed,即独立
+ * 连接树项的数量)。把 initial_rels 暂存到 root->initial_rels 是因为
+ * has_legal_joinclause() 需要读取它。这样设计让 join 顺序搜索算法可以替换:
+ * 插件/GEQO 与标准算法共享同一份输入与输出契约。
+ *
+ * 【参数】
+ *   root     —— PlannerInfo;
+ *   joinlist —— 嵌套列表:RangeTblRef 或子 List。
+ * 【返回值】代表全部基础关系连接结果的 RelOptInfo(level 为 0 时返回 NULL)。
+ */
 static RelOptInfo *
 make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 {
@@ -3947,6 +4892,35 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
  * modify root->join_rel_list and root->join_rel_hash.  If you want to do more
  * than one join-order search, you'll probably need to save and restore the
  * original states of those data structures.  See geqo_eval() for an example.
+ */
+/*
+ * standard_join_search - (中文)标准动态规划连接顺序搜索
+ *
+ * 【作用】用自底向上的动态规划找出全部连接顺序:第 lev 层生成所有"连接
+ * lev 个 joinlist 项"的连接关系(joinrel),每个 joinrel 由任意一对低层
+ * (合计 lev 项)关系通过 join_search_one_level() 构造。逐层推进直到顶层,
+ * 返回最终的全体连接关系。由 make_rel_from_joinlist() 在未启用 GEQO 时调用;
+ * 也可由插件替换。
+ *
+ * 【设计思想】
+ * - root->join_rel_level[lev] 存放第 lev 层的全部 joinrel 列表;
+ *   join_rel_level[1] 就是 initial_rels。每层生成后立刻做三件事:
+ *   generate_partitionwise_join_paths()(分区连接关系先各自处理子分区连接)、
+ *   generate_useful_gather_paths()(非顶层关系汇聚 partial 路径)、
+ *   set_cheapest()(挑最便宜路径);有 grouped rel 的连接关系还要生成部分聚合
+ *   路径。必须等 join_search_one_level 对该层全部 joinrel 处理完再做,因为
+ *   一个 joinrel 的路径可能在过程中多次追加;
+ * - 最顶层(relids == all_query_rels)的 Gather 推迟到拿到最终 targetlist
+ *   之后(见 grouping_planner 的 apply_scanjoin_target_to_paths),所以这里
+ *   用 is_top_rel 跳过;
+ * - 结束时要求第 levels_needed 层恰好一个关系;join_rel_level 被置回 NULL
+ *   以释放临时数组(元素本身属于 join_rel_list,仍保留)。
+ *
+ * 【参数】
+ *   root          —— PlannerInfo;
+ *   levels_needed —— 独立 jointree 项个数(> 1),即动态规划层数;
+ *   initial_rels  —— 各独立 jointree 项的 RelOptInfo 列表(长度 == levels_needed)。
+ * 【返回值】最终层(全部关系连接结果)的 RelOptInfo。
  */
 RelOptInfo *
 standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
@@ -4143,6 +5117,31 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
  * large, and we've seen no field complaints about the longstanding comparable
  * behavior with DISTINCT.
  */
+/*
+ * subquery_is_pushdown_safe - (中文)判定子查询整体是否允许下推条件
+ *
+ * 【作用】检查一个子查询(或 setop 树的某个组件查询)是否具备把上层限制条件
+ * 推入其内部的安全性。同时扫描子查询的输出列,把"哪些列不适合被下推条件
+ * 引用"的原因逐列记入 safetyInfo->unsafeFlags[]。由 set_subquery_pathlist()
+ * 调用。
+ *
+ * 【设计思想】整体层面拒绝的情况:
+ * 1) 子查询含 LIMIT(改变返回行集);6) 含非空 grouping sets(常量折叠隐患);
+ * 2) EXCEPT / EXCEPT ALL(setop 递归检查);3) DISTINCT 时拒绝易变(volatile)
+ * 条件;4) 窗口函数时拒绝易变条件;5) targetlist 含 SRF 时拒绝易变条件。
+ * 列层面:叶子查询(无 setop)调用 check_output_expressions() 逐列标记不安全
+ * 原因(集合函数、易变函数、DISTINCT ON 之外的列、未全部分区列等);
+ * setop 组件则调用 compare_tlist_datatypes() 标记类型不一致的列。
+ * 关键点:列的不安全只"记录"不"整体拒绝",因为具体的 qual 可能根本不用这些
+ * 列——真正的逐条件判断在 qual_is_pushdown_safe() 里做。
+ *
+ * 【参数】
+ *   subquery   —— 当前检查的组件查询;
+ *   topquery   —— setop 树的最顶层查询(无 setop 时即 subquery 本身);
+ *   safetyInfo —— 共享的推入安全性工作区,unsafeFlags[] 按列号记录原因。
+ * 【返回值】true 表示可以继续考虑下推(还需逐条 qual 检查);false 表示整体
+ *           禁止下推。
+ */
 static bool
 subquery_is_pushdown_safe(Query *subquery, Query *topquery,
 						  pushdown_safety_info *safetyInfo)
@@ -4198,6 +5197,22 @@ subquery_is_pushdown_safe(Query *subquery, Query *topquery,
 
 /*
  * Helper routine to recurse through setOperations tree
+ */
+/*
+ * recurse_pushdown_safe - (中文)递归检查 setop 树的下推安全性
+ *
+ * 【作用】沿 SetOperationStmt 树递归,逐个组件查询调用
+ * subquery_is_pushdown_safe() 做安全检查;遇到 EXCEPT/EXCEPT ALL 立即返回
+ * false(下推会改变结果语义)。被 subquery_is_pushdown_safe() 在顶层调用。
+ *
+ * 【设计思想】UNION / INTERSECT 对组内行做去重或合并,只要 qual 不区分
+ * "分组认为相等"的行,下推就安全;EXCEPT 的下推语义难以保证,故直接拒绝。
+ *
+ * 【参数】
+ *   setOp      —— setop 树的当前节点(RangeTblRef 或 SetOperationStmt);
+ *   topquery   —— 顶层查询(供 rt_fetch 定位组件 RTE);
+ *   safetyInfo —— 共享的安全性工作区。
+ * 【返回值】true 表示该子树可安全下推;false 表示发现 EXCEPT 或不安全。
  */
 static bool
 recurse_pushdown_safe(Node *setOp, Query *topquery,
@@ -4267,6 +5282,30 @@ recurse_pushdown_safe(Node *setOp, Query *topquery,
  * subquery_is_pushdown_safe handles that.).  Subquery columns marked as
  * unsafe for this reason can still have WindowClause run conditions pushed
  * down.
+ */
+/*
+ * check_output_expressions - (中文)检查子查询输出表达式,逐列标记下推不安全的列
+ *
+ * 【作用】对叶子子查询的每个非 resjunk 输出列,检查四种不安全情形并在
+ * safetyInfo->unsafeFlags[resno] 里置对应位:含集合返回函数(SRF)、含易变
+ * (volatile)函数、DISTINCT ON 中未出现的列、未出现在所有窗口 PARTITION BY
+ * 中的列。被 subquery_is_pushdown_safe() 对无 setop 的查询调用。
+ *
+ * 【设计思想】
+ * - SRF 列:下推会把"函数返回集合"塞进 WHERE,改变求值次数/结果;
+ * - 易变函数列:多重求值会产生不一致结果;
+ * - DISTINCT ON 未选中的列:被下推 qual 过滤会改变返回行的集合(普通 DISTINCT
+ *   时所有列都出现在 distinctClause,该检查自然为空);
+ * - 窗口列:只有全部出现在每个窗口的 PARTITION BY 里,qual 才会对同一分区内
+ *   所有行一致地通过/失败,不改变窗口函数结果;这种列仍可作为 WindowClause
+ *   的 runCondition 被下推,故只是"不能当普通 qual 引用";
+ * - 对 GROUP RTE 的查询,先把 targetlist 展开(group 变量展开成底层分组表达式)
+ *   再检查,因为分组表达式本身可能易变/返回集合;join alias 变量无需展开。
+ *
+ * 【参数】
+ *   subquery   —— 叶子子查询;
+ *   safetyInfo —— 安全性工作区(unsafeFlags 已按列数分配)。
+ * 【返回值】无。
  */
 static void
 check_output_expressions(Query *subquery, pushdown_safety_info *safetyInfo)
@@ -4369,6 +5408,25 @@ check_output_expressions(Query *subquery, pushdown_safety_info *safetyInfo)
  * colTypes is an OID list of the top-level setop's output column types.
  * safetyInfo is the pushdown_safety_info to set unsafeFlags[] for.
  */
+/*
+ * compare_tlist_datatypes - (中文)比对 setop 组件输出与顶层输出的类型
+ *
+ * 【作用】把某个 setop 组件查询的 targetlist 与顶层 setop 的输出类型列表逐列
+ * 比较,若某列类型不一致,在 safetyInfo->unsafeFlags[resno] 置
+ * UNSAFE_TYPE_MISMATCH。由 subquery_is_pushdown_safe() 对 setop 组件调用。
+ *
+ * 【设计思想】UNION/INTERSECT 系列允许把 qual 推入各组件,但被引用列必须在
+ * setop 过程中"未经历类型强制转换",否则语义有坑;因此只要任一组件该列类型
+ * 与顶层不同就标记为不安全。typmod 的差异无需关心:setop 允许的唯一 typmod
+ * 差异是"输入为具体 typmod、输出为 -1",而这不产生强制转换。resjunk 列跳过,
+ * 列数不匹配时报错(内部一致性错误)。
+ *
+ * 【参数】
+ *   tlist      —— 组件查询的 targetlist;
+ *   colTypes   —— 顶层 setop 输出列类型的 OID 列表;
+ *   safetyInfo —— 安全性工作区。
+ * 【返回值】无。
+ */
 static void
 compare_tlist_datatypes(List *tlist, List *colTypes,
 						pushdown_safety_info *safetyInfo)
@@ -4401,6 +5459,22 @@ compare_tlist_datatypes(List *tlist, List *colTypes,
  * function, but it's not easy to get that info at this stage; and it's
  * unlikely to be useful to spend any extra cycles getting it, since
  * unreferenced window definitions are probably infrequent in practice.
+ */
+/*
+ * targetIsInAllPartitionLists - (中文)判断目标列是否出现在所有窗口的 PARTITION BY 中
+ *
+ * 【作用】返回 true 当且仅当 targetlist 项 tle 出现在查询定义的所有窗口的
+ * PARTITION BY 子句里。被 check_output_expressions() 用于标记窗口列是否可被
+ * 下推 qual 引用。
+ *
+ * 【设计思想】只要任一窗口未把该列作为分区列,该列就不满足"同一分区内全部
+ * 行一致"的保证,标记为不安全。此处不试图排除"没有被任何窗口函数实际使用"
+ * 的窗口定义,因为此阶段获取该信息成本高而收益低。
+ *
+ * 【参数】
+ *   tle   —— 待检查的 targetlist 项;
+ *   query —— 子查询。
+ * 【返回值】true:出现在所有窗口的 PARTITION BY;false:至少一个窗口没有。
  */
 static bool
 targetIsInAllPartitionLists(TargetEntry *tle, Query *query)
@@ -4454,6 +5528,38 @@ targetIsInAllPartitionLists(TargetEntry *tle, Query *query)
  * (or, for window functions, change per-partition values such as ranks and
  * counts).  See expression_has_grouping_conflict for the kinds of conflict
  * detected.
+ */
+/*
+ * qual_is_pushdown_safe - (中文)判定单条限制条件是否可下推进子查询
+ *
+ * 【作用】在子查询整体可下推(见 subquery_is_pushdown_safe)的前提下,逐条
+ * 检查上层限制条件 rinfo,返回 PUSHDOWN_SAFE(可推入 WHERE/HAVING)、
+ * PUSHDOWN_UNSAFE(不可推)或 PUSHDOWN_WINDOWCLAUSE_RUNCOND(不能当普通条件,
+ * 但可作为窗口 runCondition 下推)。由 set_subquery_pathlist() 对每个
+ * baserestrictinfo 项调用。
+ *
+ * 【设计思想】六类检查:
+ * 1) 含子计划(SubPlan)拒绝——子查询里对应的 SubLink 尚未转换,推入会不一致
+ *    (initplan 转换成的 Param 是安全的);
+ * 2) 子查询有 DISTINCT/窗口/SRF 且条件易变时拒绝(语义变化);
+ * 3) 子查询是安全屏障(security_barrier)且条件含"泄密"函数(带 Var 参数、
+ *    可能通过副作用泄露数据)时拒绝;
+ * 4) 条件引用子查询整行(varattno == 0)拒绝(子查询内部无法命名该输出);
+ * 5) 条件引用的列被标记为不安全:视具体原因——易变/SRF/DISTINCT ON/类型不
+ *    匹配则拒绝;仅"未全部分区列"(UNSAFE_NOTIN_PARTITIONBY_CLAUSE)时可降级
+ *    为 PUSHDOWN_WINDOWCLAUSE_RUNCOND(注意即使已降级仍继续扫描其它 Var,
+ *    可能进一步退化为不安全);
+ * 6) 分组冲突检查:子查询有窗口/DISTINCT/setop 分组时,若条件对"分组视为
+ *    相等"的行应用了不同等价关系(expression_has_grouping_conflict),推入
+ *    会改变组的代表行,拒绝。
+ * 另外 LATERAL 引用与 PlaceHolderVar 也被拒绝(基础设施不支持)。
+ *
+ * 【参数】
+ *   subquery   —— 子查询;
+ *   rti        —— 子查询在父查询 rtable 中的索引;
+ *   rinfo      —— 待检查的上层限制条件;
+ *   safetyInfo —— 安全性工作区(含 unsafeFlags 与 volatile/leaky 开关)。
+ * 【返回值】PUSHDOWN_SAFE / PUSHDOWN_UNSAFE / PUSHDOWN_WINDOWCLAUSE_RUNCOND。
  */
 static pushdown_safe_type
 qual_is_pushdown_safe(Query *subquery, Index rti, RestrictInfo *rinfo,
@@ -4575,6 +5681,23 @@ qual_is_pushdown_safe(Query *subquery, Index rti, RestrictInfo *rinfo,
  *
  * 'context' is the subquery Query whose pushdown safety we're checking.
  */
+/*
+ * pushdown_var_grouping_eqop - (中文)分组冲突检查回调:取变量的分组等号运算符
+ *
+ * 【作用】作为 expression_has_grouping_conflict() 的 grouping_eqop_callback
+ * 回调:对 qual 中引用的 Var,返回子查询在其上做行分组所用的等号运算符
+ * (eqop);若 Var 不参与任何分组机制则返回 InvalidOid。由 qual_is_pushdown_safe()
+ * 传入使用。
+ *
+ * 【设计思想】qual_is_pushdown_safe() 已保证到达这里的 level-0 Var 必然引用
+ * 子查询的某个分组列(否则走不到点 6),因此断言 eqop 必然有效。上层 Var
+ * (varlevelsup != 0)一律返回 InvalidOid(不在本层分组)。
+ *
+ * 【参数】
+ *   var     —— qual 中引用的 Var;
+ *   context —— 子查询 Query。
+ * 【返回值】子查询对该列使用的分组等号运算符 OID,无则 InvalidOid。
+ */
 static Oid
 pushdown_var_grouping_eqop(Var *var, void *context)
 {
@@ -4607,6 +5730,27 @@ pushdown_var_grouping_eqop(Var *var, void *context)
  * tree.  In all of these cases the parser builds the SortGroupClause with the
  * column's type-default equality operator via get_sort_group_operators, so any
  * matching SortGroupClause carries the correct eqop.
+ */
+/*
+ * subquery_column_grouping_eqop - (中文)取子查询某输出列的分组等号运算符
+ *
+ * 【作用】给定子查询与输出列号,返回子查询对该列做行分组所用的等号运算符;
+ * 若该列不参与任何分组机制(DISTINCT/DISTINCT ON、窗口 PARTITION BY、
+ * setop 分组)则返回 InvalidOid。被 pushdown_var_grouping_eqop() 调用。
+ *
+ * 【设计思想】分组机制分三种按序检查:
+ * 1) distinctClause(DISTINCT 与 DISTINCT ON 共用):找到 tleSortGroupRef 匹配
+ *    的 SortGroupClause 即返回其 eqop;
+ * 2) 窗口 PARTITION BY:必须出现在每个窗口的 partitionClause 里才返回等号
+ *    运算符(取最后一个匹配窗口的 eqop,解析器用 get_sort_group_operators
+ *    生成的都是类型默认等号,所以一致);
+ * 3) setop:递归 setop_column_grouping_eqop() 检查是否被某个节点按等号分组。
+ * 全部未命中返回 InvalidOid。attno 越界直接返回 InvalidOid。
+ *
+ * 【参数】
+ *   subquery —— 子查询;
+ *   attno    —— 输出列号(1 起)。
+ * 【返回值】该列的分组等号运算符 OID;不参与分组则 InvalidOid。
  */
 static Oid
 subquery_column_grouping_eqop(Query *subquery, AttrNumber attno)
@@ -4671,6 +5815,23 @@ subquery_column_grouping_eqop(Query *subquery, AttrNumber attno)
  * list of SortGroupClauses, with element N-1 corresponding to output column N
  * (see makeSortGroupClauseForSetOp).
  */
+/*
+ * setop_column_grouping_eqop - (中文)递归查找 setop 树中某列的分组等号运算符
+ *
+ * 【作用】沿 SetOperationStmt 树递归,查找第一个按等号分组行并且覆盖指定输出
+ * 列的节点,返回其分组等号运算符;整棵树都不分组(纯 UNION ALL)时返回
+ * InvalidOid。被 subquery_column_grouping_eqop() 调用。
+ *
+ * 【设计思想】对任何非 UNION ALL 的 setop 节点,groupClauses 是按位置排列的
+ * SortGroupClause 列表(第 N 个元素对应输出列 N),直接按 attno-1 取即可;若
+ * 当前节点不分组(UNION ALL)则向左右子树递归。注意递归只找"第一个"命中的
+ * 等号运算符即可,因为解析器构造的各类节点运算符一致。
+ *
+ * 【参数】
+ *   setop —— setop 树节点(NULL 或非 SetOperationStmt 返回 InvalidOid);
+ *   attno —— 输出列号(1 起)。
+ * 【返回值】该列的分组等号运算符 OID;无则 InvalidOid。
+ */
 static Oid
 setop_column_grouping_eqop(Node *setop, AttrNumber attno)
 {
@@ -4703,6 +5864,20 @@ setop_column_grouping_eqop(Node *setop, AttrNumber attno)
  *		Return true if any node in the SetOperationStmt tree groups rows by
  *		equality (i.e., has non-NIL groupClauses).
  */
+/*
+ * setop_has_grouping - (中文)判断 setop 树中是否存在按等号分组的节点
+ *
+ * 【作用】返回 true 当且仅当 SetOperationStmt 树的某个节点带非空 groupClauses
+ * (即非 UNION ALL,按等号分组)。被 qual_is_pushdown_safe() 用于判定是否要做
+ * 分组冲突检查。
+ *
+ * 【设计思想】简单的递归:当前节点有 groupClauses 即为 true,否则递归左右
+ * 子树取或。
+ *
+ * 【参数】
+ *   setop —— setop 树节点(可为 NULL)。
+ * 【返回值】true:存在分组节点;false:纯 UNION ALL 树或空节点。
+ */
 static bool
 setop_has_grouping(Node *setop)
 {
@@ -4720,6 +5895,28 @@ setop_has_grouping(Node *setop)
 
 /*
  * subquery_push_qual - push down a qual that we have determined is safe
+ */
+/*
+ * subquery_push_qual - (中文)把已确认安全的 qual 推入子查询
+ *
+ * 【作用】把一条上层限制条件真正下推进子查询:若子查询是 setop 树则按组件
+ * 递归(每个组件得到自己的副本);否则把 qual 中引用子查询输出列的 Var 替换
+ * 为子查询 targetlist 的对应表达式,再挂到子查询的 WHERE(无分组时)或 HAVING
+ * (有聚合/分组时)。由 set_subquery_pathlist() 调用。
+ *
+ * 【设计思想】
+ * - 用 ReplaceVarsFromTargetList() 完成变量替换:qual 里的 Var 在父查询中
+ *   以 (rti, attno) 标识子查询输出,替换后变成子查询内部实际表达式;上层
+ *   变量此时已被改成 Param,无需处理;
+ * - 归属地选择:若子查询有聚合/分组,条件语义针对"组结果行",必须进 HAVING;
+ * - 不改 hasAggs/hasSubLinks 标志:推入的不会有新聚合,也不下推子查询。
+ *
+ * 【参数】
+ *   subquery —— 目标子查询;
+ *   rte      —— 子查询在父查询中的 RTE;
+ *   rti      —— 子查询 RTE 的索引;
+ *   qual     —— 待推入的条件。
+ * 【返回值】无。
  */
 static void
 subquery_push_qual(Query *subquery, RangeTblEntry *rte, Index rti, Node *qual)
@@ -4768,6 +5965,24 @@ subquery_push_qual(Query *subquery, RangeTblEntry *rte, Index rti, Node *qual)
 
 /*
  * Helper routine to recurse through setOperations tree
+ */
+/*
+ * recurse_push_qual - (中文)把 qual 递归推入 setop 树的每个组件查询
+ *
+ * 【作用】沿 SetOperationStmt 树递归,对每个叶子组件查询(RangeTblRef)调用
+ * subquery_push_qual() 把同一条 qual 推入。由 subquery_push_qual() 在子查询
+ * 含 setop 时调用。
+ *
+ * 【设计思想】同一 qual 会被推入所有组件(每个组件自行做变量替换),这是
+ * UNION/INTERSECT 语义要求的"每臂都过滤"。EXCEPT 已在安全性检查阶段被排除。
+ *
+ * 【参数】
+ *   setOp    —— setop 树节点;
+ *   topquery —— 顶层查询(供 rt_fetch 定位组件 RTE);
+ *   rte      —— 子查询在父查询中的 RTE;
+ *   rti      —— 子查询 RTE 的索引;
+ *   qual     —— 待推入的条件。
+ * 【返回值】无。
  */
 static void
 recurse_push_qual(Node *setOp, Query *topquery,
@@ -4820,6 +6035,32 @@ recurse_push_qual(Node *setOp, Query *topquery,
  * To avoid affecting column numbering in the targetlist, we don't physically
  * remove unused tlist entries, but rather replace their expressions with NULL
  * constants.  This is implemented by modifying subquery->targetList.
+ */
+/*
+ * remove_unused_subquery_outputs - (中文)删除子查询中未被使用的输出列
+ *
+ * 【作用】把子查询 targetlist 中"上层查询不需要、且子查询自身也不依赖"的
+ * 输出表达式替换成 NULL 常量,从而减少计算量并可能让子查询内部(如 join
+ * removal)受益。由 set_subquery_pathlist() 在推入 quals 之后调用。
+ *
+ * 【设计思想】
+ * - 收集"被使用"的输出列号位图:关系 reltarget(注意不能看 attr_needed,
+ *   继承子关系没有它)、未推下的限制条件,以及调用方传入的
+ *   extra_used_attrs(窗口 runCondition 用到的列);
+ * - 存在整行引用时不可删除任何列;
+ * - 逐列跳过:有 sortgroupref(参与某 sort/group 子句)、resjunk、被上层使用、
+ *   含 SRF(删了改变行数)、含易变函数(可能产生用户期待的副作用)的列都保留;
+ * - 删除的实现是"把表达式替换为保持类型/typmod/排序规则的 NULL 常量",而
+ *   非物理删除,以保证列编号稳定;
+ * - 有 setop 或普通 DISTINCT 时不处理(前者改全部子 SELECT 麻烦,后者所有
+ *   输出列本来就在 distinctClause 中)。
+ *
+ * 【参数】
+ *   subquery         —— 子查询(其 targetList 被就地修改);
+ *   rel              —— 子查询关系(供收集使用列);
+ *   extra_used_attrs —— 额外的必须保留列位图(偏移
+ *                       FirstLowInvalidHeapAttributeNumber),会被就地修改。
+ * 【返回值】无。
  */
 static void
 remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel,
@@ -4933,6 +6174,24 @@ remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel,
  * create_partial_bitmap_paths
  *	  Build partial bitmap heap path for the relation
  */
+/*
+ * create_partial_bitmap_paths - (中文)为位图堆扫描生成 partial 路径
+ *
+ * 【作用】在给定位图路径(bitmapqual)之上,为关系生成一个并行感知的
+ * BitmapHeapScan partial 路径:先用 compute_bitmap_pages() 估算需要读取的堆
+ * 页数,据此计算并行 worker 数,然后创建路径加入 rel->partial_pathlist。
+ * 被 indxpath.c 在生成位图路径时调用。
+ *
+ * 【设计思想】位图扫描的并行度按"位图访问到的堆页数"而非全表页数估算
+ * (compute_bitmap_pages 应用了位图选择性与随机访问比例)。worker 数不够
+ * (<=0,例如表太小)则放弃生成。
+ *
+ * 【参数】
+ *   root       —— PlannerInfo;
+ *   rel        —— 被扫描的关系;
+ *   bitmapqual —— 位图路径(任意叶子为 BitmapIndexScan 的树)。
+ * 【返回值】无。
+ */
 void
 create_partial_bitmap_paths(PlannerInfo *root, RelOptInfo *rel,
 							Path *bitmapqual)
@@ -4968,6 +6227,29 @@ create_partial_bitmap_paths(PlannerInfo *root, RelOptInfo *rel,
  *
  * "max_workers" is caller's limit on the number of workers.  This typically
  * comes from a GUC.
+ */
+/*
+ * compute_parallel_worker - (中文)计算扫描关系应使用的并行 worker 数
+ *
+ * 【作用】根据将被扫描的堆页数与索引页数估算并行 worker 数,返回给调用方
+ * 用于创建 parallel 路径。被 create_plain_partial_paths()、create_partial_bitmap_paths()
+ * 等调用。
+ *
+ * 【设计思想】
+ * - 优先使用表的 parallel_workers reloption(用户显式指定);
+ * - 否则按"页数每增长 3 倍就多一个 worker"的对数公式估算(以
+ *   min_parallel_table_scan_size / min_parallel_index_scan_size 为基数,即
+ *   小于该阈值时表太小不值得并行,返回 0;但继承子关系例外——单独可能不值,
+ *   合起来却值,所以子关系不因大小被拒);堆、索引两个估算取小者;
+ * - 最终结果受调用方 max_workers(通常来自 max_parallel_workers_per_gather
+ *   等 GUC)封顶;循环里有溢出保护(阈值超过 INT_MAX/3 即停)。
+ *
+ * 【参数】
+ *   rel         —— 被扫描的关系;
+ *   heap_pages  —— 预计扫描的堆页数,-1 表示不扫堆(如纯索引场景);
+ *   index_pages —— 预计扫描的索引页数,-1 表示不扫索引;
+ *   max_workers —— 调用方允许的最大 worker 数。
+ * 【返回值】并行 worker 数(0 表示不值得/不允许并行)。
  */
 int
 compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
@@ -5056,6 +6338,32 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
  * This must not be called until after we are done adding paths for all
  * child-joins. Otherwise, add_path might delete a path to which some path
  * generated here has a reference.
+ */
+/*
+ * generate_partitionwise_join_paths - (中文)为分区连接关系生成分区连接路径
+ *
+ * 【作用】对分区连接关系(joinrel),递归地为其每个子分区连接(part_rels)
+ * 生成路径,然后把所有非 dummy 子连接的路径聚合成父连接的 Append 路径。
+ * 被 standard_join_search() 在每层连接关系路径生成完毕后调用;也递归调用
+ * 自身处理更深的分区层级。
+ *
+ * 【设计思想】
+ * - 前提:rel 是 joinrel 且带分区(IS_PARTITIONED_REL),且
+ *   consider_partitionwise_join 已置位(由 set_append_rel_size 或更上层保证);
+ * - 每个子分区连接递归处理:若某个子分区因约束排除而无法生成任何路径,
+ *   则父连接"放弃分区连接"——把 rel->nparts 清零、直接返回(让普通连接路径
+ *   继续存在);
+ * - 子连接路径生成后立即 set_cheapest() 挑最便宜路径,并同样处理其 grouped
+ *   rel(急切聚合);dummy 子连接跳过;
+ * - 全部子连接都为 dummy 时父连接也标记 dummy;否则用 add_paths_to_append_rel()
+ *   把子连接路径合成父连接的 Append/并行 Append 路径;
+ * - 注意调用时机:必须在所有子连接路径都添加完之后,否则 add_path 可能删除
+ *   本函数引用的路径。
+ *
+ * 【参数】
+ *   root —— PlannerInfo;
+ *   rel  —— 分区连接关系(若非 joinrel 或非分区则立即返回)。
+ * 【返回值】无。
  */
 void
 generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)

@@ -8,6 +8,37 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * 【模块总览(中文)】
+ * 本文件实现谓词之间的逻辑蕴含 / 互斥判定:给定一组"子句"(clause)与一组
+ * "谓词"(predicate),判断能否从子句为真的前提出发,证明谓词必为真(蕴含),
+ * 或证明两者必不能同时为真(互斥)。这是优化器实现"冗余条件删除"、"连接
+ * 约减"与"分区裁剪"等优化时最常复用的逻辑推理工具。
+ *
+ * 【核心接口】
+ * - predicate_implied_by:clause 成立 => predicate 成立?若能证明,上层可放心
+ *   丢弃 predicate(它被已有条件覆盖);
+ * - predicate_refuted_by:clause 成立 => predicate 必不成立?若能证明,上层可
+ *   判断某分支永远无输出(如 partition 排除、外连接化简)。
+ * 两者都有 strong / weak 两种强度:weak 版额外容忍"clause 本身求值为 NULL"
+ *   的情况(NULL => 谓词 的蕴含在三值逻辑下仍成立),用于必须保证无漏报、
+ *   宁可不优化的场景。
+ *
+ * 【推理策略】
+ * - 抽象 AND/OR:把 BoolExpr(AND/OR)、ScalarArrayOpExpr(ANY/ALL)统一抽象为
+ *   "AND 结构 / OR 结构",通过 predicate_classify + 一组 *_startup_fn /
+ *   *_next_fn / *_cleanup_fn 迭代器统一遍历,避免为每种节点重复编码
+ *   (递归规则的完备性依赖"蕴含需对谓词递归、对子句并取交集"的组合枚举);
+ * - 原子子句证明:predicate_implied_by_simple_clause 处理"同一表达式两种比较
+ *   关系"的推理;operator_predicate_proof 利用操作符的交换子、否定子与
+ *   btree 操作符族内的语义排序关系做证明,必要时在执行器中真实执行一次
+ *   常量比较来验证;
+ * - 常量比较缓存:lookup_proof_cache 以 (pred_op, clause_op) 为键缓存 btree
+ *   证明所需测试操作符,pg_amop 变化时由 InvalidateOprProofCacheCallBack
+ *   统一失效。
+ *
+ * 注意:所有证明都要求相关操作符/表达式为 IMMUTABLE,否则结果在运行时可能
+ * 变化、证明不可靠;判定失败一律返回 false(宁可不优化,不可误优化)。
+ *
  * IDENTIFICATION
  *	  src/backend/optimizer/util/predtest.c
  *
@@ -151,6 +182,27 @@ static void InvalidateOprProofCacheCallBack(Datum arg, SysCacheIdentifier cachei
  * Immutability of functions in the clause_list is checked here, if necessary.
  */
 bool
+/*
+ * predicate_implied_by - (中文)判断子句列表是否蕴含谓词(入口)
+ *
+ * 【作用】递归判定 clause_list 成立是否蕴含 predicate_list 成立。空谓词列表
+ * 视为真(蕴含平凡成立),空子句列表无法蕴含任何东西返回 false;单元素列表
+ * 直接取出其唯一成员,避免一层无意义的 AND 递归,然后交给
+ * predicate_implied_by_recurse 完成实际推理。
+ *
+ * 【设计思想】两个 List 都按隐式 AND 语义处理(顶层每个元素都是必须为真的
+ * 条件)。提供 strong / weak 两种蕴含定义:
+ * - strong:clause 为真 => predicate 为真(用于 WHERE 条件蕴含索引谓词);
+ * - weak:clause 非假(真或 NULL)=> predicate 非假(用于 CHECK 约束蕴含)。
+ * 前提是谓词已被调用方确认只含 IMMUTABLE 函数与操作符,否则推导在计划与
+ * 执行之间可能失效;子句的可变性在本文件内按需检查。
+ *
+ * 【参数】
+ *   predicate_list —— 谓词列表(隐式 AND);
+ *   clause_list    —— 前提子句列表(隐式 AND);
+ *   weak           —— 是否使用弱蕴含定义。
+ * 【返回值】true:可证明蕴含;false:无法证明。
+ */
 predicate_implied_by(List *predicate_list, List *clause_list,
 					 bool weak)
 {
@@ -221,6 +273,27 @@ predicate_implied_by(List *predicate_list, List *clause_list,
  * Immutability of functions in the clause_list is checked here, if necessary.
  */
 bool
+/*
+ * predicate_refuted_by - (中文)判断子句列表是否推翻谓词(入口)
+ *
+ * 【作用】递归判定 clause_list 成立能否证明 predicate_list 为假。空谓词或无
+ * 子句都无法推翻,返回 false;单元素列表取出唯一成员后交给
+ * predicate_refuted_by_recurse。注意这与"无法蕴含"不是一回事:互斥性要求
+ * 更强的条件。
+ *
+ * 【设计思想】同样分 strong / weak 两种互斥定义:
+ * - strong:clause 为真 => predicate 必为假(用于 WHERE 推翻 CHECK,证明某行
+ *   满足 WHERE 必然违反 CHECK);
+ * - weak:clause 为真 => predicate 非真(假或 NULL),用于检测互相矛盾的
+ *   WHERE 条件。弱互斥在部分强互斥不成立的场景仍然可证,因此更常用。
+ * 当前不支持 CHECK 对 CHECK、CHECK 对 WHERE 的互斥(缺乏实际使用场景)。
+ *
+ * 【参数】
+ *   predicate_list —— 谓词列表(隐式 AND);
+ *   clause_list    —— 前提子句列表(隐式 AND);
+ *   weak           —— 是否使用弱互斥定义。
+ * 【返回值】true:可证明互斥(推翻);false:无法证明。
+ */
 predicate_refuted_by(List *predicate_list, List *clause_list,
 					 bool weak)
 {
@@ -287,6 +360,28 @@ predicate_refuted_by(List *predicate_list, List *clause_list,
  * We have to be prepared to handle RestrictInfo nodes in the restrictinfo
  * tree, though not in the predicate tree.
  *----------
+ */
+/*
+ * predicate_implied_by_recurse - (中文)蕴含测试的核心递归
+ *
+ * 【作用】对单个 clause 与单个 predicate(均为非空、非 RestrictInfo 包装的)
+ * 做蕴含判定,按两者的 AND/OR/原子类别组合应用推理规则;原子对原子的情况
+ * 落入 predicate_implied_by_simple_clause 这个基例。
+ *
+ * 【设计思想】规则矩阵(以 "=>" 表示蕴含):
+ * - A=>AND(B):A 须蕴含 B 的每一项;
+ * - A=>OR(B):A 蕴含 B 的任一项即可;
+ * - AND(A)=>B:任一项能蕴含 B 即可;OR(A)=>B:每一项都必须蕴含 B。
+ * 为避免漏掉 (x AND y) => (x OR y) 这类"两边都要展开"的例子,不能先整体
+ * 展开任一侧,必须按上述矩阵交叉递归(iterate_begin/end 宏遍历组件)。所有
+ * 规则对 strong/weak 都适用;NOT 节点应已被常量折叠消除。Clause 侧可能被
+ * RestrictInfo 包装,先剥掉再分类。
+ *
+ * 【参数】
+ *   clause    —— 前提子句;
+ *   predicate —— 待证谓词;
+ *   weak      —— 是否使用弱蕴含定义。
+ * 【返回值】true:蕴含成立;false:未证出。
  */
 static bool
 predicate_implied_by_recurse(Node *clause, Node *predicate,
@@ -528,6 +623,26 @@ predicate_implied_by_recurse(Node *clause, Node *predicate,
  *
  * Other comments are as for predicate_implied_by_recurse().
  *----------
+ */
+/*
+ * predicate_refuted_by_recurse - (中文)互斥测试的核心递归
+ *
+ * 【作用】对单个 clause 与单个 predicate 做互斥判定,按 AND/OR/原子类别
+ * 组合应用规则;原子对原子落入 predicate_refuted_by_simple_clause 基例。
+ *
+ * 【设计思想】互斥规则与蕴含是"对偶"的(以 "R=>" 表示"推翻"):
+ * - A R=> AND(B):推翻 B 的任一项即可;
+ * - A R=> OR(B):须推翻 B 的每一项;
+ * - AND(A) R=> B:A 任一项能推翻 B 即可;OR(A) R=> B:每一项都必须。
+ * 附加的取反规则:若 B 是 NOT 型子句,则 A R=> B 等价于 strong 蕴含
+ * A=>arg(B)(前提 A 为真,足够证明其参数为真);若 A 是强 NOT(IS FALSE /
+ * NOT),A R=> B 等价于 B => arg(A),且需按互斥强度反选蕴含强度。
+ *
+ * 【参数】
+ *   clause    —— 前提子句;
+ *   predicate —— 待推翻的谓词;
+ *   weak      —— 是否使用弱互斥定义。
+ * 【返回值】true:互斥成立;false:未证出。
  */
 static bool
 predicate_refuted_by_recurse(Node *clause, Node *predicate,
@@ -824,6 +939,24 @@ predicate_refuted_by_recurse(Node *clause, Node *predicate,
  * cannot just stop after considering MAX_SAOP_ARRAY_SIZE elements; in general
  * that would result in wrong proofs, rather than failing to prove anything.
  */
+/*
+ * predicate_classify - (中文)把表达式分类为 AND / OR / 原子
+ *
+ * 【作用】判定 clause 的逻辑结构:List(隐式 AND)、BoolExpr AND/OR、
+ * ScalarArrayOpExpr(把数组展开成 AND/OR 结构)归为相应类别;其余视为原子。
+ * 若归为 AND/OR,则把 *info 填上用于遍历其组件的 startup/next/cleanup 函数。
+ *
+ * 【设计思想】把多种"逻辑上是 AND 或 OR"的节点统一抽象为一种可迭代结构,
+ * 避免在两个递归函数里为每种节点重复编码。对 ScalarArrayOpExpr 强制
+ * MAX_SAOP_ARRAY_SIZE:数组过大时直接当作原子处理——因为不能只截取前 N 个
+ * 元素(会得出错误证明),宁可不证。数组操作数须为非空 Const 或一维
+ * ArrayExpr 才可解构。
+ *
+ * 【参数】
+ *   clause —— 待分类表达式(非空,且不应是 RestrictInfo);
+ *   info   —— 输出:AND/OR 时的遍历函数集(原子时未定义)。
+ * 【返回值】CLASS_AND / CLASS_OR / CLASS_ATOM。
+ */
 static PredClass
 predicate_classify(Node *clause, PredIterInfo info)
 {
@@ -906,6 +1039,18 @@ predicate_classify(Node *clause, PredIterInfo info)
  * PredIterInfo routines for iterating over regular Lists.  The iteration
  * state variable is the next ListCell to visit.
  */
+/*
+ * list_startup_fn - (中文)List 迭代器的初始化函数
+ *
+ * 【作用】把 List 保存进 info->state_list,并让迭代游标 state 指向表头。
+ *
+ * 【设计思想】普通 List 被当作隐式 AND;迭代状态仅需记住"下一个 ListCell"。
+ *
+ * 【参数】
+ *   clause —— 作为 List 处理的节点;
+ *   info   —— 迭代器上下文,写入 state_list / state。
+ * 【返回值】无。
+ */
 static void
 list_startup_fn(Node *clause, PredIterInfo info)
 {
@@ -913,6 +1058,19 @@ list_startup_fn(Node *clause, PredIterInfo info)
 	info->state = list_head(info->state_list);
 }
 
+/*
+ * list_next_fn - (中文)List 迭代器取下一个组件
+ *
+ * 【作用】返回当前 ListCell 指向的节点,并把游标推进到下一个 ListCell;游标
+ * 为 NULL(已到尾)时返回 NULL 表示迭代结束。
+ *
+ * 【设计思想】纯粹的状态机推进,next 函数签名统一为 Node *(*)(PredIterInfo),
+ * 供 iterate_begin/end 宏调用。
+ *
+ * 【参数】
+ *   info —— 迭代器上下文,内含 state(当前 ListCell)与 state_list。
+ * 【返回值】下一个组件节点;迭代结束返回 NULL。
+ */
 static Node *
 list_next_fn(PredIterInfo info)
 {
@@ -926,6 +1084,18 @@ list_next_fn(PredIterInfo info)
 	return n;
 }
 
+/*
+ * list_cleanup_fn - (中文)List 迭代器的清理函数
+ *
+ * 【作用】List 迭代不占用额外资源,清理为空操作,仅为满足统一的函数指针
+ * 接口。
+ *
+ * 【设计思想】List 属于调用方的表达式树,迭代过程只读取不改动,无需释放。
+ *
+ * 【参数】
+ *   info —— 迭代器上下文(不使用)。
+ * 【返回值】无。
+ */
 static void
 list_cleanup_fn(PredIterInfo info)
 {
@@ -935,6 +1105,20 @@ list_cleanup_fn(PredIterInfo info)
 /*
  * BoolExpr needs its own startup function, but can use list_next_fn and
  * list_cleanup_fn.
+ */
+/*
+ * boolexpr_startup_fn - (中文)BoolExpr 迭代器的初始化函数
+ *
+ * 【作用】把 BoolExpr 的 args 列表设为待迭代对象:存入 state_list 并让游标
+ * 指向其表头;next 与 cleanup 复用 List 版本的函数。
+ *
+ * 【设计思想】BoolExpr(AND/OR)的组件就是它的 args 列表,因此初始化后即可
+ * 当作普通 List 遍历。
+ *
+ * 【参数】
+ *   clause —— 作为 BoolExpr 处理的节点;
+ *   info   —— 迭代器上下文,写入 state_list / state。
+ * 【返回值】无。
  */
 static void
 boolexpr_startup_fn(Node *clause, PredIterInfo info)
@@ -957,6 +1141,23 @@ typedef struct
 	bool	   *elem_nulls;
 } ArrayConstIterState;
 
+/*
+ * arrayconst_startup_fn - (中文)常量数组 SAOP 迭代器的初始化函数
+ *
+ * 【作用】为 ScalarArrayOpExpr(数组操作数为非空 Const)建立迭代状态
+ * ArrayConstIterState:拆解数组常量得到元素值与空值数组,构造一个"占位"
+ * OpExpr 与"占位" Const 作为每次迭代返回的组件节点,并把右操作数替换成该
+ * 占位 Const,使每个数组元素都被表示成一次单元素比较。
+ *
+ * 【设计思想】把 "x op ANY(ARRAY[...])" 逻辑上展开为 OR(x op e1, x op e2,
+ * ...),每次迭代把占位 Const 的值改成下一个元素,复用同一个 OpExpr 节点;
+ * 常量数组不可变,元素直接拆出即可。数组元素个数字段 next_elem 从 0 开始。
+ *
+ * 【参数】
+ *   clause —— ScalarArrayOpExpr 节点;
+ *   info   —— 迭代器上下文,state 指向新建的 ArrayConstIterState。
+ * 【返回值】无。
+ */
 static void
 arrayconst_startup_fn(Node *clause, PredIterInfo info)
 {
@@ -1006,6 +1207,20 @@ arrayconst_startup_fn(Node *clause, PredIterInfo info)
 	state->next_elem = 0;
 }
 
+/*
+ * arrayconst_next_fn - (中文)常量数组 SAOP 迭代器取下一个元素
+ *
+ * 【作用】若 next_elem 已遍历完所有元素返回 NULL;否则把占位 Const 的值与
+ * 空值标志更新为当前数组元素,递增游标,返回占位 OpExpr 作为"该元素对应
+ * 的原子子句"。
+ *
+ * 【设计思想】占位节点在迭代间原地修改,避免反复构造表达式;返回的是组件
+ * 形式(x op elem),供上层递归证明直接消费。
+ *
+ * 【参数】
+ *   info —— 迭代器上下文,state 为 ArrayConstIterState。
+ * 【返回值】代表当前数组元素比较的 OpExpr;迭代结束返回 NULL。
+ */
 static Node *
 arrayconst_next_fn(PredIterInfo info)
 {
@@ -1019,6 +1234,19 @@ arrayconst_next_fn(PredIterInfo info)
 	return (Node *) &(state->opexpr);
 }
 
+/*
+ * arrayconst_cleanup_fn - (中文)常量数组 SAOP 迭代器的清理函数
+ *
+ * 【作用】释放迭代期间占用的资源:拆出的元素值/空值数组、占位 OpExpr 的
+ * args 拷贝以及状态结构本身。
+ *
+ * 【设计思想】元素数组由 deconstruct_array 分配,占位 OpExpr.args 是入参
+ * 参数的拷贝,均属迭代器私有,须在此释放以免泄漏。
+ *
+ * 【参数】
+ *   info —— 迭代器上下文,state 为 ArrayConstIterState。
+ * 【返回值】无。
+ */
 static void
 arrayconst_cleanup_fn(PredIterInfo info)
 {
@@ -1040,6 +1268,21 @@ typedef struct
 	ListCell   *next;
 } ArrayExprIterState;
 
+/*
+ * arrayexpr_startup_fn - (中文)ArrayExpr 数组 SAOP 迭代器的初始化函数
+ *
+ * 【作用】为 ScalarArrayOpExpr(数组操作数为一维 ArrayExpr)建立迭代状态
+ * ArrayExprIterState:构造占位 OpExpr,把待迭代列表设为 ArrayExpr 的 elements
+ * 并让游标指向其表头。
+ *
+ * 【设计思想】与常量数组版本同理把 SAOP 展开为逐元素比较,但数组元素此时
+ * 是运行时表达式,直接逐个换入占位 OpExpr 的右操作数即可,无需拆解常量。
+ *
+ * 【参数】
+ *   clause —— ScalarArrayOpExpr 节点;
+ *   info   —— 迭代器上下文,state 指向新建的 ArrayExprIterState。
+ * 【返回值】无。
+ */
 static void
 arrayexpr_startup_fn(Node *clause, PredIterInfo info)
 {
@@ -1067,6 +1310,19 @@ arrayexpr_startup_fn(Node *clause, PredIterInfo info)
 	state->next = list_head(arrayexpr->elements);
 }
 
+/*
+ * arrayexpr_next_fn - (中文)ArrayExpr 数组 SAOP 迭代器取下一个元素
+ *
+ * 【作用】游标为 NULL 时返回 NULL;否则把占位 OpExpr 的右操作数换成当前
+ * ArrayExpr 元素表达式,推进游标,返回占位 OpExpr。
+ *
+ * 【设计思想】元素表达式直接来自 ArrayExpr 的 elements,迭代器只读引用、
+ * 不做拷贝,故 cleanup 也无需释放元素本身。
+ *
+ * 【参数】
+ *   info —— 迭代器上下文,state 为 ArrayExprIterState。
+ * 【返回值】代表当前元素比较的 OpExpr;迭代结束返回 NULL。
+ */
 static Node *
 arrayexpr_next_fn(PredIterInfo info)
 {
@@ -1079,6 +1335,18 @@ arrayexpr_next_fn(PredIterInfo info)
 	return (Node *) &(state->opexpr);
 }
 
+/*
+ * arrayexpr_cleanup_fn - (中文)ArrayExpr 数组 SAOP 迭代器的清理函数
+ *
+ * 【作用】释放占位 OpExpr 的 args 拷贝与状态结构本身。
+ *
+ * 【设计思想】数组元素表达式归属调用方表达式树,迭代器只负责自己的占位
+ * 节点,清理范围仅限私有资源。
+ *
+ * 【参数】
+ *   info —— 迭代器上下文,state 为 ArrayExprIterState。
+ * 【返回值】无。
+ */
 static void
 arrayexpr_cleanup_fn(PredIterInfo info)
 {
@@ -1095,6 +1363,26 @@ arrayexpr_cleanup_fn(PredIterInfo info)
  *	  and a "simple clause" restriction.
  *
  * We return true if able to prove the implication, false if not.
+ */
+/*
+ * predicate_implied_by_simple_clause - (中文)原子子句之间的蕴含证明
+ *
+ * 【作用】对"原子"形式的 clause 与 predicate 尝试证明蕴含,按以下策略依次
+ * 尝试:表达式相等(equal)则自蕴含成立;clause 是布尔等值操作(x = TRUE/FALSE
+ * 折算成 x / NOT x);predicate 是 IS NOT NULL 且 clause 对其实参严格
+ * (clause_is_strict_for)则非空成立(仅 strong);最后两者都是二元操作符时
+ * 交给 operator_predicate_proof 用操作符语义证明。
+ *
+ * 【设计思想】相等检查是通用基例,对任意表达式与两种蕴含定义都成立;严格性
+ * 规则利用了"strict 函数在 NULL 输入下必出 NULL/假"的语义:clause 为真时其
+ * 严格参数必然非空。每次尝试前 CHECK_FOR_INTERRUPTS 允许中断过长的证明。
+ * 全部失败返回 false(宁可不优化)。
+ *
+ * 【参数】
+ *   predicate —— 待证谓词(原子表达式);
+ *   clause    —— 前提子句(原子表达式);
+ *   weak      —— 是否使用弱蕴含定义。
+ * 【返回值】true:可证蕴含;false:未证出。
  */
 static bool
 predicate_implied_by_simple_clause(Expr *predicate, Node *clause,
@@ -1222,6 +1510,26 @@ predicate_implied_by_simple_clause(Expr *predicate, Node *clause,
  *
  * The main motivation for covering IS [NOT] NULL cases is to support using
  * IS NULL/IS NOT NULL as partition-defining constraints.
+ */
+/*
+ * predicate_refuted_by_simple_clause - (中文)原子子句之间的互斥证明
+ *
+ * 【作用】对"原子"形式的 clause 与 predicate 尝试证明互斥:指针相等直接
+ * 失败(简单子句不能推翻自身);再处理 IS [NOT] NULL 类的规则,例如
+ * "foo IS NULL" 与 "foo IS NOT NULL" 相互互斥、严格于 foo 的子句能推翻
+ * "foo IS NULL" 等;最后两者都是二元操作符时交给 operator_predicate_proof
+ * 用操作符语义证明(refute_it=true)。
+ *
+ * 【设计思想】覆盖 IS [NOT] NULL 主要是为了支持把 IS NULL/IS NOT NULL 用作
+ * 分区定义约束时的排除判断。row 形式的 IS NULL 语义复杂、按简单规则处理
+ * 不安全,一律先排除。弱互斥还允许"foo IS NULL"推翻任何严格于 foo 的谓词
+ * (此时谓词必出假或 NULL)。
+ *
+ * 【参数】
+ *   predicate —— 待推翻的谓词(原子表达式);
+ *   clause    —— 前提子句(原子表达式);
+ *   weak      —— 是否使用弱互斥定义。
+ * 【返回值】true:可证互斥;false:未证出。
  */
 static bool
 predicate_refuted_by_simple_clause(Expr *predicate, Node *clause,
