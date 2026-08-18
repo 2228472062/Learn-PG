@@ -28,6 +28,48 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * ============================================================================
+ * 【中文注释】execExpr.c —— 表达式求值基础设施：把表达式树"编译"成可执行的步骤序列
+ * ----------------------------------------------------------------------------
+ * 文件定位：
+ *   本文件是 PostgreSQL 执行器"表达式求值"的编译核心：执行器启动时（ExecInitExpr
+ *   及其同族函数）把一棵表达式树（Expr 节点树，已经过 parser/planner 的规范化
+ *   处理）编译成一个 ExprState；执行时（见 execExprInterp.c 的 ExecInterpExpr）
+ *   逐条解释执行 ExprState->steps 数组中的步骤，直到遇见 EEOP_DONE_RETURN 或
+ *   EEOP_DONE_NO_RETURN。本文件只负责"编译"，与具体执行技术（switch 语句、
+ *   computed goto、JIT 生成机器码）完全解耦；执行技术由 ExecReadyExpr 选择。
+ *
+ * 核心数据结构：
+ *   - ExprState：一个已编译表达式的运行时状态容器，内含 steps（ExprEvalStep
+ *     数组）、resvalue/resnull（最终结果存放处）、resultslot、各种 flags，以及
+ *     innermost_caseval/innermost_domainval 等编译期上下文。
+ *   - ExprEvalStep：一条"指令"（如 EEOP_SCAN_VAR、EEOP_FUNCEXPR、EEOP_JUMP 等），
+ *     由 opcode 与联合体 d 描述；步骤数组等价于一个简单的虚拟机程序，步骤之间
+ *     通过 jumpdone 等字段实现跳转（短路求值、CASE/COALESCE 等）。
+ *   - ExprSetupInfo：预扫描阶段收集的"setup 需求"——各 TupleTableSlot 需要变形
+ *     （deform）到多少列，以及 MULTIEXPR 子计划列表。
+ *
+ * 三步构建流程：
+ *   1. ExecCreateExprSetupSteps：用 expr_setup_walker 预扫描表达式，统计所有
+ *      Var 引用的各槽位最大属性号并收集 MULTIEXPR SubPlan；随后
+ *      ExecPushExprSetupSteps 生成 EEOP_*_FETCHSOME（元组变形）与子计划执行步骤。
+ *   2. ExecInitExprRec：深度优先递归遍历表达式树，按节点类型（一个巨大的
+ *      switch）把每个子表达式的求值压成相应的 ExprEvalStep 并回填跳转目标。
+ *   3. ExecReadyExpr 定稿：先尝试 jit_compile_expr() 让 JIT 引擎把步骤序列编译
+ *      成原生代码（成功则直接返回，状态挂 JIT 生成的执行函数），失败或未启用
+ *      JIT 时回退 ExecReadyInterpretedExpr() 做解释执行准备。
+ *
+ * 设计思想：
+ *   - "编译一次、执行多次"：编译期把可预先查到的 catalog 信息（函数 OID、类型
+ *     信息、域约束集合等）直接烘焙进步骤结构，参数求值结果也下沉到 fcinfo 槽，
+ *     运行时对每一元组只剩顺序执行步骤的开销（case 分发只在编译期发生一次）。
+ *   - Var 读取被编译成 EEOP_*_VAR（及 SYSVAR/WHOLEROW/FETCHSOME 等）专用步骤，
+ *     varno/varreturningtype 等属性在编译期就决定了读哪个槽、置哪个 flag。
+ *   - 没有 ExecEndExpr：ExprState 依赖的资源统一随所属内存上下文释放，需要额外
+ *     清理的函数通过 ExprContext 的 shutdown 回调完成。
+ * ============================================================================
+ */
 #include "postgres.h"
 
 #include "access/nbtree.h"
@@ -106,38 +148,40 @@ static void ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
 
 
 /*
- * ExecInitExpr: prepare an expression tree for execution
+ * ============================================================================
+ * 【中文注释】ExecInitExpr —— 编译一棵表达式树为可执行状态（对外主入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   将一棵（已由 parser/planner 预处理过的）Expr 节点树编译为 ExprState：内部
+ *   依次完成 setup 步骤生成、表达式主体步骤生成（ExecInitExprRec 递归）以及
+ *   DONE 步骤追加，最后交给 ExecReadyExpr 定稿。返回的 ExprState 可交给
+ *   ExecEvalExpr（见 execExprInterp.c）反复执行。
  *
- * This function builds and returns an ExprState implementing the given
- * Expr node tree.  The return ExprState can then be handed to ExecEvalExpr
- * for execution.  Because the Expr tree itself is read-only as far as
- * ExecInitExpr and ExecEvalExpr are concerned, several different executions
- * of the same plan tree can occur concurrently.  (But note that an ExprState
- * does mutate at runtime, so it can't be re-used concurrently.)
+ * 参数：
+ *   node   - 表达式树根；可为 NULL（此时返回 NULL，方便调用方统一处理
+ *            "可能没有表达式"的场景）。
+ *   parent - 拥有该表达式的 PlanState；聚合/窗口函数/子计划等节点必须登记在
+ *            它的子结构上，故这些表达式的编译必须带 parent。独立表达式（无
+ *            计划树）场景传 NULL，此时不允许出现聚合等，且应走 ExecPrepareExpr。
  *
- * This must be called in a memory context that will last as long as repeated
- * executions of the expression are needed.  Typically the context will be
- * the same as the per-query context of the associated ExprContext.
+ * 返回值：
+ *   ExprState* - 编译结果；node 为 NULL 时返回 NULL。注意 NULL 状态不能交给
+ *                ExecEvalExpr，但 ExecQual/ExecCheck 接受（当作恒真）。
  *
- * Any Aggref, WindowFunc, or SubPlan nodes found in the tree are added to
- * the lists of such nodes held by the parent PlanState.
- *
- * Note: there is no ExecEndExpr function; we assume that any resource
- * cleanup needed will be handled by just releasing the memory context
- * in which the state tree is built.  Functions that require additional
- * cleanup work can register a shutdown callback in the ExprContext.
- *
- *	'node' is the root of the expression tree to compile.
- *	'parent' is the PlanState node that owns the expression.
- *
- * 'parent' may be NULL if we are preparing an expression that is not
- * associated with a plan tree.  (If so, it can't have aggs or subplans.)
- * Such cases should usually come through ExecPrepareExpr, not directly here.
- *
- * Also, if 'node' is NULL, we just return NULL.  This is convenient for some
- * callers that may or may not have an expression that needs to be compiled.
- * Note that a NULL ExprState pointer *cannot* be handed to ExecEvalExpr,
- * although ExecQual and ExecCheck will accept one (and treat it as "true").
+ * 设计思想：
+ *   1. NULL 特例：翻译成 NULL 指针而非空 ExprState——条件为空是极常见场景
+ *      （无过滤的扫描），让热路径直接跳过求值。
+ *   2. 调用链：ExecCreateExprSetupSteps（预扫描+变形/子计划步骤）→
+ *      ExecInitExprRec（按节点类型生成主体步骤）→ EEOP_DONE_RETURN 收尾 →
+ *      ExecReadyExpr（JIT 或解释执行定稿）。
+ *   3. 树只读、状态可复用：编译过程不修改 Expr 树，同一计划树可被多个执行器
+ *      并发使用；但 ExprState 运行时是可变的（执行状态、缓存、jump 修正），
+ *      不能并发复用。
+ *   4. 内存上下文：调用方须保证当前上下文生命周期覆盖"反复执行"（典型是每查询
+ *      上下文）；无 ExecEndExpr 即因资源回收依赖整个上下文的整体释放。
+ *   5. 被调用方：ExecInitExprList、ExecInitCheck、ExecBuildUpdateProjection、
+ *      各节点执行器（如 ExecInitAgg、ExecInitWindowAgg、ExecInitSubPlan 等）。
+ * ============================================================================
  */
 ExprState *
 ExecInitExpr(Expr *node, PlanState *parent)
@@ -171,10 +215,30 @@ ExecInitExpr(Expr *node, PlanState *parent)
 }
 
 /*
- * ExecInitExprWithParams: prepare a standalone expression tree for execution
+ * ============================================================================
+ * 【中文注释】ExecInitExprWithParams —— 带外部参数列表的独立表达式编译
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 ExecInitExpr 相同，但没有 parent PlanState；外部参数（PARAM_EXTERN）由
+ *   调用方通过 ext_params（ParamListInfo）直接提供，供编译期记录并在运行时由
+ *   EEOP_PARAM_EXTERN 步骤读取。
  *
- * This is the same as ExecInitExpr, except that there is no parent PlanState,
- * and instead we may have a ParamListInfo describing PARAM_EXTERN Params.
+ * 参数：
+ *   node       - 表达式树根（可为 NULL，返回 NULL）。
+ *   ext_params - 描述 PARAM_EXTERN 参数的 ParamListInfo；可为 NULL（此时运行时
+ *                按父节点 EState 的参数列表或"未提供的 NULL 参数"处理）。
+ *
+ * 返回值：
+ *   ExprState* - 编译结果。
+ *
+ * 设计思想：
+ *   与 ExecInitExpr 的差异只有两处：state->parent = NULL、state->ext_params 被
+ *   设置。execExprInterp.c 的 ExecEvalParamExtern 正是优先读 state->ext_params，
+ *   因此本入口是"脱离计划树执行带外部参数的表达式"的标准通道，被说明语言执行器
+ *   （如 plpgsql 内部表达式）与扩展模块使用；有父节点的场景优先取父节点 EState
+ *   的参数列表而非这里传入的 ext_params。ext_params 中的 paramCompile hook 允许
+ *   参数类型自定义编译行为（如参数类型强制转换）。
+ * ============================================================================
  */
 ExprState *
 ExecInitExprWithParams(Expr *node, ParamListInfo ext_params)
@@ -208,22 +272,37 @@ ExecInitExprWithParams(Expr *node, ParamListInfo ext_params)
 }
 
 /*
- * ExecInitQual: prepare a qual for execution by ExecQual
+ * ============================================================================
+ * 【中文注释】ExecInitQual —— 编译隐式 AND 连接词表达式（WHERE 子句专用入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把"隐式 AND"语义的 qual 列表（如 WHERE 子句的条件列表、JOIN 条件）编译成
+ *   供 ExecQual 使用的 ExprState。空列表返回 NULL（恒真）；若任一子表达式为假
+ *   或为 NULL，则整体为假——这正好是 SQL 对 WHERE 的语义（NULL 条件不选行）。
  *
- * Prepares for the evaluation of a conjunctive boolean expression (qual list
- * with implicit AND semantics) that returns true if none of the
- * subexpressions are false.
+ * 参数：
+ *   qual   - 条件表达式列表（List of Expr，元素间是隐式 AND）。
+ *   parent - 所属 PlanState。
  *
- * We must return true if the list is empty.  Since that's a very common case,
- * we optimize it a bit further by translating to a NULL ExprState pointer
- * rather than setting up an ExprState that computes constant TRUE.  (Some
- * especially hot-spot callers of ExecQual detect this and avoid calling
- * ExecQual at all.)
+ * 返回值：
+ *   ExprState* - NULL 表示恒真（空条件）；非 NULL 时必须用 ExecQual 执行
+ *                （flags 已置 EEO_FLAG_IS_QUAL，禁止直接 ExecEvalExpr）。
  *
- * If any of the subexpressions yield NULL, then the result of the conjunction
- * is false.  This makes ExecQual primarily useful for evaluating WHERE
- * clauses, since SQL specifies that tuples with null WHERE results do not
- * get selected.
+ * 设计思想：
+ *   1. 空列表优化：翻译为 NULL 指针而非"计算恒 TRUE 的 ExprState"——无过滤的
+ *      表扫描是最常见的场景，热路径调用方检测到 NULL 可干脆不调 ExecQual。
+ *   2. 短路求值：每个子表达式求值后紧跟一条 EEOP_QUAL 步骤，一旦结果为假（或
+ *      NULL）立即跳到整个 qual 之后，不再求值其余条件——WHERE 条件不求值是
+ *      重要的性能手段，为此专门设计了比 BOOL_AND 更简单的 EEOP_QUAL opcode
+ *      （它的 NULL 处理只有"返回 false"一种，无需三值逻辑）。
+ *   3. 两遍填充跳转：先以 -1 占位记录步骤下标，全部子表达式编译完后统一回填
+ *      jumpdone——这是本文件所有"跳转类"编译的通用模式（步骤数组可能在构建期
+ *      扩容移动，不能提前取指针）。
+ *   4. 结果的存放：每个子表达式的值直接落到 state->resvalue/resnull，最后一次
+ *      求值结果即 qual 的最终结果，故无需额外的收尾步骤。
+ *   5. 与 ExecInitCheck 的对比：CHECK 约束把 NULL 视为"通过"，走普通 AND；
+ *      WHERE 把 NULL 视为"不通过"，走 EEOP_QUAL——本函数刻意为之。
+ * ============================================================================
  */
 ExprState *
 ExecInitQual(List *qual, PlanState *parent)
@@ -300,16 +379,29 @@ ExecInitQual(List *qual, PlanState *parent)
 }
 
 /*
- * ExecInitCheck: prepare a check constraint for execution by ExecCheck
+ * ============================================================================
+ * 【中文注释】ExecInitCheck —— 编译 CHECK 约束表达式（供 ExecCheck 执行）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 CHECK 约束（隐式 AND 列表）编译为 ExprState。与 ExecInitQual 的关键差异：
+ *   当整个合取式结果为 NULL 时视为 TRUE（约束通过）——SQL 规定 NULL 约束条件
+ *   不算违反，例如 CHECK (x > 0) 在 x 为 NULL 时通过。
  *
- * This is much like ExecInitQual/ExecQual, except that a null result from
- * the conjunction is treated as TRUE.  This behavior is appropriate for
- * evaluating CHECK constraints, since SQL specifies that NULL constraint
- * conditions are not failures.
+ * 参数：
+ *   qual   - 隐式 AND 列表。
+ *   parent - 所属 PlanState。
  *
- * Note that like ExecInitQual, this expects input in implicit-AND format.
- * Users of ExecCheck that have expressions in normal explicit-AND format
- * can just apply ExecInitExpr to produce suitable input for ExecCheck.
+ * 返回值：
+ *   ExprState* - NULL 表示恒真；非 NULL 时用 ExecCheck 求值。
+ *
+ * 设计思想：
+ *   实现上不自行编译，而是把隐式 AND 列表用 make_ands_explicit 展开成显式 AND
+ *   的 BoolExpr（多于一项时），再交给 ExecInitExpr 走通用编译——因为 NULL 不能
+ *   被短路为"失败"，必须用标准 AND 的三值逻辑（NULL AND x 的结果是 NULL）。
+ *   调用方若已持有显式 AND 表达式，也可直接 ExecInitExpr 后交给 ExecCheck。
+ *   主要在 ALTER TABLE ... ADD CONSTRAINT 校验、INSERT/UPDATE 时元组约束检查
+ *   （heap 层经 ExecCheck 驱动）以及域类型检查之外的表级 CHECK 中使用。
+ * ============================================================================
  */
 ExprState *
 ExecInitCheck(List *qual, PlanState *parent)
@@ -329,7 +421,18 @@ ExecInitCheck(List *qual, PlanState *parent)
 }
 
 /*
- * Call ExecInitExpr() on a list of expressions, return a list of ExprStates.
+ * ============================================================================
+ * 【中文注释】ExecInitExprList —— 批量编译表达式列表
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对表达式列表中的每个元素调用 ExecInitExpr，返回与输入一一对应的
+ *   ExprState 列表。
+ *
+ * 设计思想：
+ *   纯模板化遍历（foreach + lappend），保持列表顺序；供"一组并列表达式"的场景
+ *   复用，如窗口函数的参数列表（ExecInitExprRec 的 T_WindowFunc 分支）等。
+ *   每个元素编译成独立状态，互不影响。
+ * ============================================================================
  */
 List *
 ExecInitExprList(List *nodes, PlanState *parent)
@@ -348,23 +451,41 @@ ExecInitExprList(List *nodes, PlanState *parent)
 }
 
 /*
- *		ExecBuildProjectionInfo
+ * ============================================================================
+ * 【中文注释】ExecBuildProjectionInfo —— 构建"投影"执行器（tlist 求值并写入结果槽）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把一个目标列表（targetList）整体编译成一个"一步完成"的 ExprState，并用
+ *   ProjectionInfo 包装：执行后结果直接写入给定 TupleTableSlot（resultslot）。
+ *   调用方须保证 slot 的描述符与 tlist 一致（由调用方在建立 plan 时保证）。
  *
- * Build a ProjectionInfo node for evaluating the given tlist in the given
- * econtext, and storing the result into the tuple slot.  (Caller must have
- * ensured that tuple slot has a descriptor matching the tlist!)
+ * 参数：
+ *   targetList - 规划器生成的 TargetEntry 列表（v10 之前此处传 ExprState 列表，
+ *                现在统一在本函数内完成编译）。
+ *   econtext   - 投影求值所用的表达式上下文。
+ *   slot       - 结果写入的元组槽。
+ *   parent     - 所属 PlanState。
+ *   inputDesc  - 可为 NULL；非 NULL 时把 tlist 中的"简单 Var"与源关系描述符做
+ *                相容性检查（防止计划生成后表被 ALTER 造成列错位），关系扫描类
+ *                节点建议提供；上层节点无需重复检查。
  *
- * inputDesc can be NULL, but if it is not, we check to see whether simple
- * Vars in the tlist match the descriptor.  It is important to provide
- * inputDesc for relation-scan plan nodes, as a cross check that the relation
- * hasn't been changed since the plan was made.  At higher levels of a plan,
- * there is no need to recheck.
+ * 返回值：
+ *   ProjectionInfo* - 其 pi_state 内嵌 ExprState（省一次 palloc），pi_exprContext
+ *                     记录执行上下文。
  *
- * This is implemented by internally building an ExprState that performs the
- * whole projection in one go.
- *
- * Caution: before PG v10, the targetList was a list of ExprStates; now it
- * should be the planner-created targetlist, since we do the compilation here.
+ * 设计思想：
+ *   1. 快路径：Safe Var（非系统列；有 inputDesc 时还要求列未 drop、类型匹配，
+ *      无 inputDesc 时"无从校验则直接信任"）生成一条 EEOP_ASSIGN_*_VAR 步骤，
+ *      一步完成取列与落位；按 varno 分派 INNER/OUTER/SCAN 槽，按
+ *      varreturningtype 分派 OLD/NEW 槽（RETURNING 语义）并置相应 flag。
+ *   2. 慢路径：普通表达式编译成步骤求值到 state->resvalue/resnull，再用
+ *      EEOP_ASSIGN_TMP 搬到结果槽；varlena（变长，可能是可写展开对象）类型
+ *      额外加 EEOP_ASSIGN_TMP_MAKE_RO 强制只读——投影结果可能被上层节点多处
+ *      引用，可写对象被某处修改会破坏值语义。
+ *   3. 结尾用 EEOP_DONE_NO_RETURN：结果已写进槽，无需再返回 datum。
+ *   4. 运行时由 ExecProject 驱动（execUtils.c），执行器上层（各节点的
+ *      ps_ProjInfo）几乎全靠它；ExecBuildUpdateProjection 是其 UPDATE 特化版。
+ * ============================================================================
  */
 ProjectionInfo *
 ExecBuildProjectionInfo(List *targetList,
@@ -512,36 +633,40 @@ ExecBuildProjectionInfo(List *targetList,
 }
 
 /*
- *		ExecBuildUpdateProjection
+ * ============================================================================
+ * 【中文注释】ExecBuildUpdateProjection —— 构建 UPDATE 专用投影（写新值+拷回旧列）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为 UPDATE 构造"新元组"构建投影：把 targetList 的赋值表达式结果写入目标列
+ *   （targetColnos 指定的列），未被赋值的旧列从"scan 槽"（UPDATE 的旧元组）拷回，
+ *   被 drop 的列置 NULL，最终完整元组写入结果槽。同时执行与 ExecCheckPlanOutput
+ *   等价的健全性检查——因为这里没有与"待赋整行"等价的普通 tlist，无法直接复用
+ *   ExecCheckPlanOutput，只能在此手工校验。
  *
- * Build a ProjectionInfo node for constructing a new tuple during UPDATE.
- * The projection will be executed in the given econtext and the result will
- * be stored into the given tuple slot.  (Caller must have ensured that tuple
- * slot has a descriptor matching the target rel!)
+ * 参数：
+ *   targetList     - UPDATE ... SET 表达式列表。
+ *   evalTargetList - true：tlist 需要真正求值（表达式可引用 outer/inner/scan 槽）；
+ *                    false：tlist 的值已由子计划节点算好，直接从"outer 槽"按序取。
+ *   targetColnos   - 与每个非 resjunk 项一一对应的目标列号列表。
+ *   relDesc        - 被更新关系的描述符。
+ *   econtext / slot / parent - 同 ExecBuildProjectionInfo。
  *
- * When evalTargetList is false, targetList contains the UPDATE ... SET
- * expressions that have already been computed by a subplan node; the values
- * from this tlist are assumed to be available in the "outer" tuple slot.
- * When evalTargetList is true, targetList contains the UPDATE ... SET
- * expressions that must be computed (which could contain references to
- * the outer, inner, or scan tuple slots).
- *
- * In either case, targetColnos contains a list of the target column numbers
- * corresponding to the non-resjunk entries of targetList.  The tlist values
- * are assigned into these columns of the result tuple slot.  Target columns
- * not listed in targetColnos are filled from the UPDATE's old tuple, which
- * is assumed to be available in the "scan" tuple slot.
- *
- * targetList can also contain resjunk columns.  These must be evaluated
- * if evalTargetList is true, but their values are discarded.
- *
- * relDesc must describe the relation we intend to update.
- *
- * This is basically a specialized variant of ExecBuildProjectionInfo.
- * However, it also performs sanity checks equivalent to ExecCheckPlanOutput.
- * Since we never make a normal tlist equivalent to the whole
- * tuple-to-be-assigned, there is no convenient way to apply
- * ExecCheckPlanOutput, so we must do our safety checks here.
+ * 设计思想：
+ *   1. 先校验后生成：验证 tlist 中非 resjunk 列必须连续排在 resjunk 列之前
+ *      （子计划目标列表顺序约定）、targetColnos 数量与列号范围/类型/是否 drop
+ *      列；用 Bitmapset 记录已赋值列以避免 list_member 的 O(N^2)。
+ *   2. 赋值列求值方式与 ExecBuildProjectionInfo 不同：不搞"Safe Var"快路径
+ *      （UPDATE 路径相对低频，不值得扩展开销），统一"编译 + EEOP_ASSIGN_TMP"；
+ *      也不强制只读（赋值后不再被共享）。
+ *   3. 变形深度：scan 槽至少要变形到"最后一个未被赋值的非 drop 旧列"；
+ *      evalTargetList=false 时只需 outer 槽前 nAssignableCols 列（子计划输出
+ *      恰好按此顺序排列），evalTargetList=true 时把 tlist 的 Var 需求也并入。
+ *   4. 兜底列：未赋值且未 drop 的旧列按列号正序生成 EEOP_ASSIGN_SCAN_VAR 拷回
+ *      （类型天然一致，无需检查）；drop 列先 EEOP_CONST(NULL) 再 ASSIGN_TMP，
+ *      保证新元组的物理完整性。
+ *   5. 被调用方：nodeModifyTable.c 的 ExecUpdate/ExecMerge 与 execPartition.c
+ *      （分区 UPDATE/MERGE 的每条路由路径）。
+ * ============================================================================
  */
 ProjectionInfo *
 ExecBuildUpdateProjection(List *targetList,
@@ -751,15 +876,31 @@ ExecBuildUpdateProjection(List *targetList,
 }
 
 /*
- * ExecPrepareExpr --- initialize for expression execution outside a normal
- * Plan tree context.
+ * ============================================================================
+ * 【中文注释】ExecPrepareExpr —— 独立表达式（脱离计划树）的执行准备入口
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在 EState 的查询上下文（es_query_cxt）中，先把表达式树经 expression_planner
+ *   做执行前转换（常量折叠、子查询展开、规范化等），再以 parent=NULL 编译成
+ *   ExprState 并返回。
  *
- * This differs from ExecInitExpr in that we don't assume the caller is
- * already running in the EState's per-query context.  Also, we run the
- * passed expression tree through expression_planner() to prepare it for
- * execution.  (In ordinary Plan trees the regular planning process will have
- * made the appropriate transformations on expressions, but for standalone
- * expressions this won't have happened.)
+ * 参数：
+ *   node   - 表达式树（可为 NULL，返回 NULL）。
+ *   estate - 提供 es_query_cxt（编译产物所在上下文）的 EState。
+ *
+ * 返回值：
+ *   ExprState* - 编译结果；node 为 NULL 时返回 NULL。
+ *
+ * 设计思想：
+ *   与 ExecInitExpr 的两点差异：
+ *   1. 调用方很可能不在查询上下文中执行本函数，这里显式切进 es_query_cxt，
+ *      保证编译产物与查询同生命周期（依赖"无 ExecEndExpr、上下文整体释放"的
+ *      资源管理约定）。
+ *   2. 普通计划树中的表达式已由规划流程完成转换；但独立表达式（如触发器
+ *      WHEN 条件、规则动作片段、RI 约束表达式、说明语言调用的 SQL 表达式）
+ *      没有经过规划器，必须补一步 expression_planner。
+ *   典型调用方：plpgsql/SPI 的表达式执行路径、ExecPrepareExprList 批量场景。
+ * ============================================================================
  */
 ExprState *
 ExecPrepareExpr(Expr *node, EState *estate)
@@ -779,15 +920,27 @@ ExecPrepareExpr(Expr *node, EState *estate)
 }
 
 /*
- * ExecPrepareQual --- initialize for qual execution outside a normal
- * Plan tree context.
+ * ============================================================================
+ * 【中文注释】ExecPrepareQual —— 独立场景的 WHERE 条件编译入口
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在 es_query_cxt 中先对 qual 列表做 expression_planner，再调用 ExecInitQual
+ *   编译为可交给 ExecQual 的 ExprState。与 ExecPrepareExpr 的关系对应
+ *   ExecInitQual 与 ExecInitExpr 的关系（NULL 视为不通过、短路求值、空列表
+ *   返回 NULL 恒真）。
  *
- * This differs from ExecInitQual in that we don't assume the caller is
- * already running in the EState's per-query context.  Also, we run the
- * passed expression tree through expression_planner() to prepare it for
- * execution.  (In ordinary Plan trees the regular planning process will have
- * made the appropriate transformations on expressions, but for standalone
- * expressions this won't have happened.)
+ * 参数：
+ *   qual   - 隐式 AND 列表。
+ *   estate - 提供 es_query_cxt 的 EState。
+ *
+ * 返回值：
+ *   ExprState* - 编译结果（空列表为 NULL）。
+ *
+ * 设计思想：
+ *   供脱离计划树的场景（触发器、扩展模块等）编译 WHERE 式条件；结果以
+ *   EEO_FLAG_IS_QUAL 标记，运行时只能走 ExecQual。与 ExecPrepareExpr 一样
+ *   负责"规划器缺失"的补课（expression_planner）与上下文切换。
+ * ============================================================================
  */
 ExprState *
 ExecPrepareQual(List *qual, EState *estate)
@@ -807,10 +960,27 @@ ExecPrepareQual(List *qual, EState *estate)
 }
 
 /*
- * ExecPrepareCheck -- initialize check constraint for execution outside a
- * normal Plan tree context.
+ * ============================================================================
+ * 【中文注释】ExecPrepareCheck —— 独立场景的 CHECK 约束编译入口
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在 es_query_cxt 中先对约束表达式做 expression_planner，再调用 ExecInitCheck
+ *   编译 CHECK 约束表达式。细节同 ExecPrepareExpr（规划器补课 + 上下文切换）与
+ *   ExecInitCheck（NULL 视为通过）。
  *
- * See ExecPrepareExpr() and ExecInitCheck() for details.
+ * 参数：
+ *   qual   - 隐式 AND 列表。
+ *   estate - 提供 es_query_cxt 的 EState。
+ *
+ * 返回值：
+ *   ExprState* - 编译结果（空列表为 NULL）。
+ *
+ * 设计思想：
+ *   CHECK 约束（CREATE TABLE/ALTER TABLE 的表级与列级约束校验、域类型约束
+ *   之外的程序化约束检查）在未嵌入计划树时由本入口准备，结果交给 ExecCheck
+ *   执行——NULL 结果按"约束通过"处理。典型调用方是 RI 触发器与
+ *   ExecConstraints（heaptuple.c / execUtils.c 中的约束检查路径）。
+ * ============================================================================
  */
 ExprState *
 ExecPrepareCheck(List *qual, EState *estate)
@@ -830,10 +1000,25 @@ ExecPrepareCheck(List *qual, EState *estate)
 }
 
 /*
- * Call ExecPrepareExpr() on each member of a list of Exprs, and return
- * a list of ExprStates.
+ * ============================================================================
+ * 【中文注释】ExecPrepareExprList —— 批量准备独立表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对列表内每个表达式调用 ExecPrepareExpr，生成与输入一一对应的 ExprState
+ *   列表；同时保证列表的 List 节点本身也分配在 es_query_cxt 中。
  *
- * See ExecPrepareExpr() for details.
+ * 参数：
+ *   nodes  - 表达式列表。
+ *   estate - 提供 es_query_cxt 的 EState。
+ *
+ * 返回值：
+ *   List* - ExprState 列表（顺序保持）。
+ *
+ * 设计思想：
+ *   除了逐项编译，还特意把 List 及其 cell 切进查询上下文——若调用方在更短生命
+ *   周期的上下文里构造列表，返回值将失去意义；这是"编译产物与其容器同上下文"
+ *   原则的体现，也是 SPI/触发器等批处理场景的标准批量入口。
+ * ============================================================================
  */
 List *
 ExecPrepareExprList(List *nodes, EState *estate)
@@ -858,15 +1043,34 @@ ExecPrepareExprList(List *nodes, EState *estate)
 }
 
 /*
- * ExecCheck - evaluate a check constraint
+ * ============================================================================
+ * 【中文注释】ExecCheck —— 执行 CHECK 约束求值（NULL 视为通过）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对 ExprState 求值并返回布尔结果。结果（或任一中间条件）为 NULL 时一律视为
+ *   true——SQL 规定 CHECK 约束的 NULL 条件不算违反，例如 CHECK (x > 0) 在
+ *   x 为 NULL 时通过。
  *
- * For check constraints, a null result is taken as TRUE, ie the constraint
- * passes.
+ * 参数：
+ *   state    - ExecInitCheck（或 ExecPrepareCheck）编译的结果；也可接收普通
+ *              ExecInitExpr/ExecPrepareExpr 编译的显式 AND 布尔表达式；NULL
+ *              视为恒真。不得是 ExecInitQual 编译的结果（其求值与 NULL 语义是
+ *              WHERE 专用的）。
+ *   econtext - 执行上下文（提供槽位绑定、参数等）。
  *
- * The check constraint may have been prepared with ExecInitCheck
- * (possibly via ExecPrepareCheck) if the caller had it in implicit-AND
- * format, but a regular boolean expression prepared with ExecInitExpr or
- * ExecPrepareExpr works too.
+ * 返回值：
+ *   bool - 约束是否通过。
+ *
+ * 设计思想：
+ *   1. 先断言 state 未带 EEO_FLAG_IS_QUAL 标记，从机制上防止把 WHERE 语义
+ *      （NULL 即不通过）误用于 CHECK 约束。
+ *   2. 求值走 ExecEvalExprSwitchContext：先切到 econtext 的表达式内存上下文再
+ *      执行，保证求值期间的临时分配落在正确上下文、随执行结束整体释放。
+ *   3. NULL 与 false 的唯一区别在返回侧（NULL→true），故在调用侧区分即可，
+ *      执行器内部无需专门的三值返回。
+ *   4. 被调用方：heap 元组约束检查（ExecConstraints）、ALTER TABLE 校验、
+ *      域类型检查等。
+ * ============================================================================
  */
 bool
 ExecCheck(ExprState *state, ExprContext *econtext)
@@ -890,13 +1094,24 @@ ExecCheck(ExprState *state, ExprContext *econtext)
 }
 
 /*
- * Prepare a compiled expression for execution.  This has to be called for
- * every ExprState before it can be executed.
+ * ============================================================================
+ * 【中文注释】ExecReadyExpr —— ExprState 定稿：选择执行技术（JIT 优先）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在步骤序列构建完成后做"定稿"：先调用 jit_compile_expr(state) 尝试用 JIT
+ *   把步骤序列编译为原生代码；成功则直接返回（state->evalfunc 指向 JIT 生成的
+ *   函数），失败或未启用 JIT 时回退 ExecReadyInterpretedExpr()（解释执行准备：
+ *   步骤重排、预计算跳转偏移等，见 execExprInterp.c）。
  *
- * NB: While this currently only calls ExecReadyInterpretedExpr(),
- * this will likely get extended to further expression evaluation methods.
- * Therefore this should be used instead of directly calling
- * ExecReadyInterpretedExpr().
+ * 参数：
+ *   state - 已完成步骤填充、即将交付执行的 ExprState。
+ *
+ * 设计思想：
+ *   这是"执行技术选择"的唯一切面：所有编译入口（ExecInitExpr、
+ *   ExecInitExprWithParams、ExecBuildProjectionInfo、ExecBuildAggTrans、
+ *   ExecBuildHash32* 等）在返回前都调用它，保证任何 ExprState 在执行前必经
+ *   定稿。将来新增求值技术只需扩展此函数，各调用方零改动。
+ * ============================================================================
  */
 static void
 ExecReadyExpr(ExprState *state)
@@ -908,12 +1123,103 @@ ExecReadyExpr(ExprState *state)
 }
 
 /*
- * Append the steps necessary for the evaluation of node to ExprState->steps,
- * possibly recursing into sub-expressions of node.
+ * ============================================================================
+ * 【中文注释】ExecInitExprRec —— 表达式编译核心递归：按节点类型生成步骤（主分发器）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   深度优先递归遍历表达式树：把 node 求值所需的步骤追加到 state->steps，并使
+ *   最终结果写入调用方给定的 resv/resnull（Datum 与"是否为 NULL"的存放地址）。
+ *   这是本文件的"主分发器"：除少数复杂节点转交给专门的 static 函数外，所有
+ *   Expr 节点类型（Var/Const/Param/Aggref/WindowFunc/FuncExpr/OpExpr/Case/
+ *   ArrayRef/RowExpr/CoerceToDomain 等三十余种）的编译逻辑都内联在本函数的
+ *   switch 中。
  *
- * node - expression to evaluate
- * state - ExprState to whose ->steps to append the necessary operations
- * resv / resnull - where to store the result of the node into
+ * 参数：
+ *   node    - 当前要编译的子表达式（根为整棵树时由 ExecInitExpr 传入）。
+ *   state   - 正在构建的 ExprState（步骤数组、flags、innermost_caseval/
+ *             innermost_domainval 等编译期上下文都挂在它上面）。
+ *   resv/resnull - 本子表达式结果的存放位置；由调用方决定（可能是
+ *             state->resvalue/resnull，也可能是 fcinfo 参数槽、数组元素槽、
+ *             CASE 工作区等），这是"结果下沉、避免搬运"的关键设计。
+ *
+ * 设计思想（按节点类型分组）：
+ *   1. Var 三态：varattno==0 是整行 Var（转 ExecInitWholeRowVar）；
+ *      varattno<0 是系统列（xmin/ctid 等，EEOP_*_SYSVAR）；>0 是普通用户列
+ *      （EEOP_*_VAR）。varno 决定从 inner/outer/scan 哪个槽取，而
+ *      varreturningtype（DEFAULT/OLD/NEW）决定从 default/OLD/NEW 槽取并置
+ *      EEO_FLAG_HAS_OLD/NEW（RETURNING 语义）。
+ *   2. Const：常量值与是否 NULL 编译期直接烘焙成 EEOP_CONST，运行时零开销；
+ *      Param：PARAM_EXEC 用 EEOP_PARAM_EXEC（按 paramid 运行时查
+ *      es_param_exec_vals）；PARAM_EXTERN 优先调用 ParamListInfo 的 paramCompile
+ *      hook（允许参数类型自定义编译，如扩展实现"参数化表达式"），否则用
+ *      EEOP_PARAM_EXTERN 读外部参数。
+ *   3. Aggref/GroupingFunc/WindowFunc：把节点登记进父 AggState 的 aggs 列表
+ *      /WindowAggState 的 funcs 列表（含 WindowFuncExprState 参数预编译、嵌套
+ *      窗口函数防御），生成 EEOP_AGGREF / EEOP_GROUPING_FUNC / EEOP_WINDOW_FUNC
+ *      步骤；父节点不对（非 Agg/WindowAgg）直接报错——planner 出错。
+ *   4. MergeSupportFunc：MERGE 专用辅助函数步骤，父节点必须是 CMD_MERGE 的
+ *      ModifyTableState。
+ *   5. FuncExpr/OpExpr/DistinctExpr/NullIfExpr：统一走 ExecInitFunc（权限检查、
+ *      fmgr 初始化、参数下沉），再由本分支覆盖 opcode 为 EEOP_DISTINCT /
+ *      EEOP_NULLIF（"函数调用+特化语义"的组合，NULLIF 对 varlena 参数还要
+ *      强制只读）。
+ *   6. ScalarArrayOpExpr：IN/NOT IN。hashfuncid 有效时（可哈希的 IN/NOT IN，
+ *      含 hashed NOT IN 用等值函数探测哈希表）生成 EEOP_HASHED_SCALARARRAYOP，
+ *      比线性扫描快得多；否则 EEOP_SCALARARRAYOP。编译期完成两枚函数的
+ *      ACL 检查与 fmgr 查找；标量参数直接下沉到 fcinfo->args[0]。
+ *   7. BoolExpr：AND/OR 的每个参数拆成 STEP_FIRST（1 个）/ STEP（0 或多个）/
+ *      STEP_LAST（1 个）三种步骤以支持短路与 NULL 传播（共享 anynull 记录）；
+ *      跳转目标最后统一回填。NOT 是单步 EEOP_BOOL_NOT_STEP。
+ *   8. SubPlan：MULTIEXPR 子计划已在 setup 阶段整体执行过，这里只生成"返回
+ *      NULL 记录"的占位步骤（它的输出以参数形式被引用）；普通子计划转
+ *      ExecInitSubPlanExpr。
+ *   9. FieldSelect/FieldStore：复合字段读取与赋值。FieldStore 先把输入元组拆到
+ *      values/nulls 工作区（EEOP_FIELDSTORE_DEFORM），用 CaseTestExpr 机制把
+ *      "被替换字段的旧值"传给嵌套赋值表达式（FieldStore/数组赋值的 arg 直接
+ *      读该旧值），最后 EEOP_FIELDSTORE_FORM 合成新复合值。
+ *   10. RelabelType：运行时无操作（类型重标注是编译期语义），只递归子表达式。
+ *       CoerceViaIO：源类型 output + 目标类型 input 合并进单个 EEOP_IOCOERCE
+ *       步骤（高频路径），input 的 typioparam/typmod 常量参数预填；带 escontext
+ *       时用 *_SAFE 变体支持软错误。
+ *   11. ArrayCoerceExpr：数组逐元素强转——元素表达式单独编译成一个"子
+ *       ExprState"（运行时对每个元素调用）；若元素表达式退化为"直接读
+ *       CaseTestExpr"（恒等转换）则子状态置 NULL，彻底免除运行时开销。
+ *       ConvertRowtypeExpr：行类型转换，带输入/输出两个类型缓存槽避免重复
+ *       catalog 查找。
+ *   12. CaseExpr/CaseTestExpr：先求测试表达式到 caseval 工作区（varlena 强制
+ *       只读——值可能被多次读取），每个 WHEN 条件里可放 CaseTestExpr 占位符
+ *       （innermost_caseval 机制，支持嵌套 CASE 的保存/恢复）；步骤模式为
+ *       "条件假则跳到下一个 WHEN → 命中则求 THEN 并跳到 CASE 尾 → ELSE"。
+ *   13. ArrayExpr/RowExpr/RowCompareExpr/CoalesceExpr/MinMaxExpr：
+ *       各元素求到工作区数组后一次性合成（EEOP_ARRAYEXPR/EEOP_ROW/
+ *       EEOP_ROWCOMPARE_STEP、EEOP_ROWCOMPARE_FINAL、EEOP_JUMP_IF_NOT_NULL、
+ *       EEOP_MINMAX）。RowExpr 处理
+ *       named 类型缺列补 NULL、drop 列替换为 int4 NULL 与类型错位检查；
+ *       RowCompareExpr 逐字段比较并按"结果为 NULL / 非零"回填跳转。
+ *   14. XML/JSON 系列：SQLValueFunction（CURRENT_TIMESTAMP 类）、XmlExpr、
+ *       JsonValueExpr、JsonConstructorExpr（常量参数免求值）、JsonIsPredicate；
+ *       JsonExpr 除 JSON_TABLE_OP（上游 tfuncFetchRows 只需要 formatted_expr）
+ *       外转 ExecInitJsonExpr。
+ *   15. NullTest/BooleanTest：生成 EEOP_NULLTEST_* / EEOP_BOOLTEST_IS_* 步骤；
+ *       IS UNKNOWN 等价于标量 IS NULL，直接复用 NULLTEST 步骤；行式参数用
+ *       行级变体（ROWISNULL 等，带 rowtype 缓存）。
+ *   16. CoerceToDomain/CoerceToDomainValue：转 ExecInitCoerceToDomain；
+ *       CoerceToDomainValue 读 innermost_domainval（独立域检查场景读
+ *       econtext->domainValue_datum，即 EEOP_DOMAIN_TESTVAL_EXT）。
+ *   17. CurrentOfExpr/NextValueExpr/ReturningExpr：游标 CURRENT OF、序列
+ *       nextval、以及 MERGE/UPDATE RETURNING 的"OLD/NEW 行不存在时跳过求值"
+ *       （EEOP_RETURNINGEXPR 按空行 flag 跳转）。
+ *
+ * 通用机制：
+ *   - scratch 复用：单个 ExprEvalStep scratch 贯穿全程，每次 push 前按需覆盖；
+ *     push 是按值拷贝，入栈后修改 scratch 不影响已生成的步骤。
+ *   - 跳转目标两遍回填：所有短路口先以 -1 占位并把步骤下标记入 adjust_jumps，
+ *     子表达式全部编译完后统一修正为 state->steps_len——步骤数组构建期可能
+ *     扩容移动，不能提前持有指针。
+ *   - check_stack_depth 防御：表达式树可被构造得很深，防止递归栈溢出。
+ *   - 被调用方：ExecInitExpr、ExecInitQual、ExecBuildProjectionInfo、
+ *     ExecBuildAggTrans 等所有编译入口。
+ * ============================================================================
  */
 static void
 ExecInitExprRec(Expr *node, ExprState *state,
@@ -2662,10 +2968,24 @@ ExecInitExprRec(Expr *node, ExprState *state,
 }
 
 /*
- * Add another expression evaluation step to ExprState->steps.
+ * ============================================================================
+ * 【中文注释】ExprEvalPushStep —— 向步骤数组追加一条求值步骤（动态扩容）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 s 按值拷贝到 es->steps 尾部（steps_len 自增）。首次 push 分配 16 个槽，
+ *   满员时翻倍（repalloc）。本文件所有"生成步骤"的地方都经由此函数。
  *
- * Note that this potentially re-allocates es->steps, therefore no pointer
- * into that array may be used while the expression is still being built.
+ * 参数：
+ *   es - 目标 ExprState。
+ *   s  - 待追加的步骤（结构体按值拷贝，之后调用方对 scratch 的修改不影响
+ *        已入栈项）。
+ *
+ * 设计思想：
+ *   注意 es->steps 可能因 repalloc 而整体移动，因此"正在构建表达式"期间任何人
+ *   不得持有指向 steps 数组的指针并跨过 push 调用——全文件的回填模式都是
+ *   "先记下标、最后再取 &state->steps[i]"（见 ExecInitExprRec 的 adjust_jumps
+ *   两遍回填）。
+ * ============================================================================
  */
 void
 ExprEvalPushStep(ExprState *es, const ExprEvalStep *s)
@@ -2686,12 +3006,43 @@ ExprEvalPushStep(ExprState *es, const ExprEvalStep *s)
 }
 
 /*
- * Perform setup necessary for the evaluation of a function-like expression,
- * appending argument evaluation steps to the steps list in *state, and
- * setting up *scratch so it is ready to be pushed.
+ * ============================================================================
+ * 【中文注释】ExecInitFunc —— 编译"函数式"表达式（函数调用/运算符的共同基础）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为一次函数调用做全部准备工作：①编译期 ACL 权限检查；②FmgrInfo 与
+ *   FunctionCallInfo 的初始化；③生成参数求值步骤（结果直接下沉到 fcinfo 参数
+ *   槽）；④按函数严格性与 pgstat 统计等级选择最合适的 opcode。本函数不 push
+ *   步骤——调用方（ExecInitExprRec 的 FuncExpr/OpExpr 分支等）需自行覆盖 opcode
+ *   （如 EEOP_DISTINCT/EEOP_NULLIF）后再 push。
  *
- * *scratch is not pushed here, so that callers may override the opcode,
- * which is useful for function-like cases like DISTINCT.
+ * 参数：
+ *   scratch     - 待填充的步骤结构（含执行时所需的 finfo/fcinfo 工作区指针）。
+ *   node        - 原始表达式节点（供 fmgr_info_set_expr 记录调用来源与错误定位）。
+ *   args        - 函数参数表达式列表。
+ *   funcid      - 被调函数 OID。
+ *   inputcollid - 输入排序规则（已合并）。
+ *   state       - 所属 ExprState。
+ *
+ * 设计思想：
+ *   1. 编译期权限检查：object_aclcheck 验证调用者对被调函数有 EXECUTE 权限并
+ *      触发对象访问 hook，失败立即抛错——把"每次调用都检查"降为"编译一次检查"，
+ *      是执行期零开销的重要来源。
+ *   2. 参数直接下沉进 fcinfo->args：子表达式结果直接写到函数参数槽，省去中间
+ *      搬运；Const 参数编译期直接填入（"不要每轮循环重复求常量"，比较运算中
+ *      尤其常见），是热路径优化。
+ *   3. opcode 选择矩阵（两维：是否跟踪统计 x 是否严格）：
+ *      - 关闭统计（pgstat_track_functions <= fn_stats）且 strict 时按参数个数选
+ *        EEOP_FUNCEXPR_STRICT_1 / STRICT_2 / STRICT 通用——strict 语义是"任一
+ *        参数为 NULL 直接返回 NULL、不调用函数"，参数越少检查越轻（1/2 参数
+ *        特化展开）。
+ *      - 开启统计则用 *_FUSAGE 变体，运行时把"函数被调用次数"记入 pgstat。
+ *   4. 防御性检查：nargs 超过 FUNC_MAX_ARGS 报错（正常情况下解析器已保证）；
+ *      fn_retset（集合返回函数）直接报错——本上下文不支持集合（应由 SRF 节点
+ *      处理）。
+ *   5. 被调用方：FuncExpr、OpExpr、DistinctExpr、NullIfExpr 分支；执行器为
+ *      execExprInterp.c 的 EEOP_FUNCEXPR* 系列步骤。
+ * ============================================================================
  */
 static void
 ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
@@ -2803,12 +3154,31 @@ ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
 }
 
 /*
- * Append the steps necessary for the evaluation of a SubPlan node to
- * ExprState->steps.
+ * ============================================================================
+ * 【中文注释】ExecInitSubPlanExpr —— 编译普通子计划表达式（含参数传递步骤）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为 SubPlan 节点生成三类步骤：①对每个 parParam 参数，"求参数表达式 →
+ *   EEOP_PARAM_SET 写入参数槽"；②调用 ExecInitSubPlan 初始化真正的子计划状态
+ *   （SubPlanState，登记进父节点 PlanState 的 subPlan 列表）；③EEOP_SUBPLAN
+ *   步骤（运行时执行子计划并把结果写到 resv/resnull）。
  *
- * subplan - SubPlan expression to evaluate
- * state - ExprState to whose ->steps to append the necessary operations
- * resv / resnull - where to store the result of the node into
+ * 参数：
+ *   subplan   - 子计划表达式（规划器已设定参数对应关系 parParam/args）。
+ *   state     - 所属 ExprState（其 parent 必须非空——子计划必须有宿主计划）。
+ *   resv/resnull - 子计划结果的存放位置。
+ *
+ * 设计思想：
+ *   1. 参数约定：先求参数表达式，再立刻用 EEOP_PARAM_SET 把值存进
+ *      es_param_exec_vals[paramid]。特意"先求到 resv/resnull 再赋值"而不是直接
+ *      求进参数槽——避免生成代码对参数槽指针稳定性的依赖；多个参数共享
+ *      resv/resnull 是安全的，因为每个求值后紧跟一次 PARAM_SET 落盘。
+ *   2. 参数值的生命周期：参数只需活到子计划执行完毕，放在父 econtext 即可；
+ *      真正进入子查询的值在 ExecutorRun 时由 es_param_exec_vals 传递。
+ *   3. MULTIEXPR 子计划不走本函数（由 setup 阶段提前整体执行，见
+ *      ExecPushExprSetupSteps），且其运行结果不同于普通子计划——见
+ *      ExecInitExprRec 的 T_SubPlan 分支。
+ * ============================================================================
  */
 static void
 ExecInitSubPlanExpr(SubPlan *subplan,
@@ -2869,8 +3239,33 @@ ExecInitSubPlanExpr(SubPlan *subplan,
 }
 
 /*
- * Add expression steps performing setup that's needed before any of the
- * main execution of the expression.
+ * ============================================================================
+ * 【中文注释】ExecCreateExprSetupSteps / ExecPushExprSetupSteps —— 生成表达式 setup 步骤
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   ExecCreateExprSetupSteps：对整棵表达式做一次预扫描（expr_setup_walker）得到
+ *   ExprSetupInfo，再调用 ExecPushExprSetupSteps 生成步骤。
+ *   ExecPushExprSetupSteps：按 Info 生成两类"前置"步骤——
+ *   ①当表达式引用 inner/outer/scan/old/new 槽的 Var 时，按"所需最大属性号"生成
+ *     对应的 EEOP_*_FETCHSOME 变形步骤（让元组在求值前被 deform 到足够深度，
+ *     一次变形、多列共用）；
+ *   ②对每个 MULTIEXPR SubPlan 生成执行步骤（必须在引用其输出参数的 Param 被
+ *     求值之前完成）。
+ *
+ * 参数：
+ *   state - 目标 ExprState；
+ *   node  -（Create 版）表达式树根；info -（Push 版）预扫描统计结果。
+ *
+ * 设计思想：
+ *   1. "先 setup 后主体"的顺序保证不变式：FETCHSOME 步骤恒位于所有求值步骤
+ *      之前；deform 是元组级一次性开销，只做到所需列数，窄列场景收益显著。
+ *   2. FETCHSOME 是否真正需要经过 ExecComputeSlotInfo 判定（固定且虚拟的槽
+ *      已变形完成，可免步骤），返回 false 时不入栈。
+ *   3. MULTIEXPR 子计划之间不存在相互引用，按收集顺序执行即可；其输出以
+ *      PARAM_EXEC 形式被主体表达式引用。
+ *   4. ExecPushExprSetupSteps 还被 ExecBuildUpdateProjection 与
+ *      ExecBuildAggTrans 复用，以支持"一个 ExprState 覆盖多个表达式"的场景。
+ * ============================================================================
  */
 static void
 ExecCreateExprSetupSteps(ExprState *state, Node *node)
@@ -2884,10 +3279,6 @@ ExecCreateExprSetupSteps(ExprState *state, Node *node)
 	ExecPushExprSetupSteps(state, &info);
 }
 
-/*
- * Add steps performing expression setup as indicated by "info".
- * This is useful when building an ExprState covering more than one expression.
- */
 static void
 ExecPushExprSetupSteps(ExprState *state, ExprSetupInfo *info)
 {
@@ -2972,7 +3363,31 @@ ExecPushExprSetupSteps(ExprState *state, ExprSetupInfo *info)
 }
 
 /*
- * expr_setup_walker: expression walker for ExecCreateExprSetupSteps
+ * ============================================================================
+ * 【中文注释】expr_setup_walker —— 表达式预扫描：统计槽位需求与 MULTIEXPR 子计划
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   递归遍历表达式树并维护 ExprSetupInfo：按 varno 把引用的 Var 的最大属性号
+ *   记入 last_inner/last_outer/last_scan/last_old/last_new（OLD/NEW 按
+ *   varreturningtype 区分），把遇到的 MULTIEXPR SubPlan 收集到
+ *   multiexpr_subplans。
+ *
+ * 参数：
+ *   node - 当前节点；info - 累计统计结果（多处复用同一结构以合并需求）。
+ *
+ * 返回值：
+ *   bool - expression_tree_walker 约定（true 提前终止）；本函数总是遍历完整棵树，
+ *          返回 false。
+ *
+ * 设计思想：
+ *   1. 属性号取 Max 即可：FETCHSOME 按最大列变形后，更小的列号自然可用；
+ *      负属性号（系统列）不影响 last_* > 0 的判定。
+ *   2. Aggref/WindowFunc/GroupingFunc 的参数不求值在当前 econtext（聚合参数
+ *      的求值归聚合执行器管，窗口函数同），故不深入其内部；GroupingFunc 参数
+ *      根本不求值。
+ *   3. 这是"两遍编译"里的第一遍（轻量只读统计），真正的步骤生成由
+ *      ExecInitExprRec 在第二遍完成。
+ * ============================================================================
  */
 static bool
 expr_setup_walker(Node *node, ExprSetupInfo *info)
@@ -3040,18 +3455,32 @@ expr_setup_walker(Node *node, ExprSetupInfo *info)
 }
 
 /*
- * Compute additional information for EEOP_*_FETCHSOME ops.
+ * ============================================================================
+ * 【中文注释】ExecComputeSlotInfo —— 判定 FETCHSOME 步骤的"固定性"（固定槽优化）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为一条 EEOP_*_FETCHSOME 步骤确定是否"固定"：若每次求值都会遇到相同类型的
+ *   槽、相同描述符，则把 tts_ops 与描述符直接烘焙进步骤（固定路径，运行时免去
+ *   动态判定），否则以"运行时检查"模式执行；并返回该步骤是否真的需要入栈。
  *
- * The goal is to determine whether a slot is 'fixed', that is, every
- * evaluation of the expression will have the same type of slot, with an
- * equivalent descriptor.
+ * 参数：
+ *   state - 所属 ExprState（其 parent 提供 innerops/outerops/scanops 等信息）。
+ *   op    - 待分析的 FETCHSOME 步骤（opcode 决定查询哪个槽）。
  *
- * EEOP_OLD_FETCHSOME and EEOP_NEW_FETCHSOME are used to process RETURNING, if
- * OLD/NEW columns are referred to explicitly.  In both cases, the tuple
- * descriptor comes from the parent scan node, so we treat them the same as
- * EEOP_SCAN_FETCHSOME.
+ * 返回值：
+ *   bool - true 需要生成该步骤；false 无需（如固定且恒为虚拟槽——虚拟槽的
+ *          数据天然已变形，再变形是浪费）。
  *
- * Returns true if the deforming step is required, false otherwise.
+ * 设计思想：
+ *   1. 信息出处：inner/outer 槽看 parent->innerops/outerops 与相应子计划结果
+ *      类型；scan/old/new 槽统一看 parent->scandesc 与 scanops（OLD/NEW 的
+ *      描述符同样来自父扫描节点，仅槽位不同）。注意 inneropsset 但
+ *      !inneropsfixed 的情况（中继算子可换槽型），此时不能烘焙。
+ *   2. 未固定时以通用模式运行：每次按实际槽类型决定变形方式，正确性优先。
+ *   3. 特例豁免：固定且为 TTSOpsVirtual 时直接返回 false——虚拟槽的 datums
+ *      数组就是"变形后"形态，FETCHSOME 无意义；这正是把"deform 决策"前移到
+ *      编译期的收益。
+ * ============================================================================
  */
 static bool
 ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
@@ -3152,8 +3581,26 @@ ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Prepare step for the evaluation of a whole-row variable.
- * The caller still has to push the step.
+ * ============================================================================
+ * 【中文注释】ExecInitWholeRowVar —— 编译整行 Var（表.* / row.*）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   生成 EEOP_WHOLEROW 步骤的固定字段：记录 Var、首次标志、tupdesc（运行时
+ *   填写）与可选的 JunkFilter——用于剔除子查询结果里的 resjunk 列（GROUP BY/
+ *   ORDER BY 列），保证整行值只含用户可见列。调用方仍需 push 该步骤。
+ *
+ * 参数：
+ *   scratch  - 待填充步骤；variable - 整行 Var（varattno == 0）；
+ *   state    - 所属 ExprState（parent 用于判断是否可能带 junk 列）。
+ *
+ * 设计思想：
+ *   1. 只有父节点是 SubqueryScanState / CteScanState 时输入才可能含 resjunk
+ *      列（子查询投影），因此仅在这两种父节点下检查子计划 tlist 并按需构建
+ *      JunkFilter（用父 EState 的额外虚拟槽承接清洗结果）；独立表达式（无
+ *      parent）假定引用的是普通表行，无需过滤。
+ *   2. OLD/NEW 整行引用同样置 EEO_FLAG_HAS_OLD/NEW，使执行器准备对应槽位。
+ *   3. tupdesc 延迟到运行时由槽描述符填充，避免编译期与运行时描述符漂移。
+ * ============================================================================
  */
 static void
 ExecInitWholeRowVar(ExprEvalStep *scratch, Var *variable, ExprState *state)
@@ -3232,7 +3679,36 @@ ExecInitWholeRowVar(ExprEvalStep *scratch, Var *variable, ExprState *state)
 }
 
 /*
- * Prepare evaluation of a SubscriptingRef expression.
+ * ============================================================================
+ * 【中文注释】ExecInitSubscriptingRef —— 编译下标访问/赋值（数组 arr[i]、切片等）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 SubscriptingRef（读：arr[i]；写：arr[i] := v，含切片与嵌套赋值）编译成
+ *   一组步骤：求容器表达式 → 可选 NULL 短路 → 求上/下界下标 → 下标检查（可选）
+ *   → 取旧值（仅嵌套赋值需要）→ 求替换值 → EEOP_SBSREF_FETCH/ASSIGN 收尾。
+ *   下标计算、旧值提取、赋值等"容器类型相关"操作全部经由 SubscriptRoutines
+ *   的回调（exec_setup 填好的 methods）委托给类型特定实现（数组、可下标化
+ *   复合类型等）。
+ *
+ * 参数：
+ *   scratch - 步骤工作区（sbsref 相关字段）；sbsref - 下标引用节点；
+ *   state   - 所属 ExprState（innermost_caseval 等上下文）；
+ *   resv/resnull - 结果存放地址。
+ *
+ * 设计思想：
+ *   1. SubscriptingRefState 一次性 palloc 出 上/下界 Datum、是否提供、是否 NULL
+ *      六组数组（连续内存，避免多次小分配）；切片时某边界表达式为 NULL 表示
+ *      省略，记 provided=false 由类型代码解释。
+ *   2. 容器表达式可以安全地直接求进 resv/resnull（最后的 FETCH/ASSIGN 步骤
+ *      一定覆盖它）。严格取值的类型（fetch_strict，如数组"元素为 NULL"语义）
+ *      在容器为 NULL 时直接跳到结尾返回 NULL——EEOP_JUMP_IF_NULL 天然实现
+ *      NULL 传播。
+ *   3. 嵌套赋值（a[i].f := v）的旧值传递复用 CaseTestExpr 机制：仅当替换表达式
+ *      是"赋值间接表达式"（isAssignmentIndirectionExpr）且类型支持取旧值时，
+ *      才生成 EEOP_SBSREF_OLD 把旧元素取到 prevvalue/prevnull 并设为
+ *      innermost_caseval；普通单层赋值不产生该开销。
+ *   4. 跳转目标（NULL 短路与下标检查失败）统一在最后回填，模式与其他分支一致。
+ * ============================================================================
  */
 static void
 ExecInitSubscriptingRef(ExprEvalStep *scratch, SubscriptingRef *sbsref,
@@ -3460,21 +3936,28 @@ ExecInitSubscriptingRef(ExprEvalStep *scratch, SubscriptingRef *sbsref,
 }
 
 /*
- * Helper for preparing SubscriptingRef expressions for evaluation: is expr
- * a nested FieldStore or SubscriptingRef that needs the old element value
- * passed down?
+ * ============================================================================
+ * 【中文注释】isAssignmentIndirectionExpr —— 判定赋值目标是否为"嵌套赋值"表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判断替换表达式（SubscriptingRef 的 refassgnexpr）是否直接或间接（透过
+ *   CoerceToDomain/RelabelType）需要"旧值"输入——即其 arg/refexpr 是
+ *   CaseTestExpr 的 FieldStore/SubscriptingRef。用于决定是否需要生成取旧元素
+ *   步骤（EEOP_SBSREF_OLD）。
  *
- * (We could use this in FieldStore too, but in that case passing the old
- * value is so cheap there's no need.)
+ * 参数：
+ *   expr - 赋值目标表达式（可为 NULL）。
  *
- * Note: it might seem that this needs to recurse, but in most cases it does
- * not; the CaseTestExpr, if any, will be directly the arg or refexpr of the
- * top-level node.  Nested-assignment situations give rise to expression
- * trees in which each level of assignment has its own CaseTestExpr, and the
- * recursive structure appears within the newvals or refassgnexpr field.
- * There is an exception, though: if the array is an array-of-domain, we will
- * have a CoerceToDomain or RelabelType as the refassgnexpr, and we need to
- * be able to look through that.
+ * 返回值：
+ *   bool - true 表示需要旧值。
+ *
+ * 设计思想：
+ *   1. 不需要递归深挖：嵌套赋值结构里每层都有各自的 CaseTestExpr，且顶层节点的
+ *      arg/refexpr 就是该 CaseTestExpr 的直接位置；唯一例外是"数组元素为域类型"
+ *      时外层有 CoerceToDomain/RelabelType 包着，因此只对这两种节点递归一层。
+ *   2. FieldStore 不采用本判定：FieldStore 里传旧值几乎零成本，无条件传输即可；
+ *      只有数组/切片的取旧值可能有明显开销，才按需生成。
+ * ============================================================================
  */
 static bool
 isAssignmentIndirectionExpr(Expr *expr)
@@ -3511,7 +3994,31 @@ isAssignmentIndirectionExpr(Expr *expr)
 }
 
 /*
- * Prepare evaluation of a CoerceToDomain expression.
+ * ============================================================================
+ * 【中文注释】ExecInitCoerceToDomain —— 编译域类型强转（含全体约束检查）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为 CoerceToDomain 生成步骤序列：先求值参数（直接写 resv/resnull——约束失败
+ *   会抛错，成功即最终结果），再把域上定义的全部约束编译成步骤：
+ *   NOT NULL 约束 → EEOP_DOMAIN_NOTNULL；CHECK 约束 → 以 CoerceToDomainValue
+ *   机制把待检值传给检查表达式，再用 EEOP_DOMAIN_CHECK 判定结果。
+ *
+ * 参数：
+ *   scratch - 步骤工作区（domaincheck 字段）；ctest - 域强转节点；
+ *   state   - 所属 ExprState；resv/resnull - 结果地址。
+ *
+ * 设计思想：
+ *   1. 约束在编译期"烘焙"进 ExprState（v10 起不再每次求值重查约束集），用
+ *      DomainConstraintRef 锁定约束集合（内含检查表达式）。
+ *   2. 检查值通道：域检查表达式经 CoerceToDomainValue 节点读
+ *      innermost_domainval（编译为 EEOP_DOMAIN_TESTVAL）；嵌套域检查时保存/
+ *      恢复 innermost_domainval，保证任意嵌套深度正确。
+ *   3. varlena（可能是可写展开对象）且确有 CHECK 时插入 EEOP_MAKE_READONLY：
+ *      检查函数可能改写共享值，必须只读形态参与检查，但最终结果仍返回原来的
+ *      可写指针；非 varlena 直接以 resv/resnull 作检查源，零拷贝。
+ *   4. 被调用方：ExecInitExprRec 的 T_CoerceToDomain 分支；运行时步骤为
+ *      execExprInterp.c 的 EEOP_DOMAIN_* 系列。
+ * ============================================================================
  */
 static void
 ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
@@ -3654,18 +4161,42 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 }
 
 /*
- * Build transition/combine function invocations for all aggregate transition
- * / combination function invocations in a grouping sets phase. This has to
- * invoke all sort based transitions in a phase (if doSort is true), all hash
- * based transitions (if doHash is true), or both (both true).
+ * ============================================================================
+ * 【中文注释】ExecBuildAggTrans —— 构建聚合过渡函数求值表达式（含 grouping sets 批量）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为聚合执行器（AggState）构建一个 ExprState：对"一个阶段（phase）内"所有
+ *   过渡函数调用，生成"过滤 → 求参数 → strict NULL 检查 → 调用过渡/合并函数"
+ *   的步骤序列；排序型（doSort）与哈希型（doHash）可分别或同时覆盖，并按
+ *   grouping sets 的数量展开（每个 set 一份 pergroup 状态）。
  *
- * The resulting expression will, for each set of transition values, first
- * check for filters, evaluate aggregate input, check that that input is not
- * NULL for a strict transition function, and then finally invoke the
- * transition for each of the concurrently computed grouping sets.
+ * 参数：
+ *   aggstate - 聚合执行状态（pertrans/numtrans/aggcontexts/hashcontext 等）。
+ *   phase    - 当前阶段（numsets 决定排序型展开份数）。
+ *   doSort/doHash - 是否覆盖排序型/哈希型过渡调用。
+ *   nullcheck- 是否生成"pergroup 状态为 NULL 指针即跳过"的检查（用于单趟
+ *              交换式扫描中"新 group 尚无 pergroup 状态"的情形）。
  *
- * If nullcheck is true, the generated code will check for a NULL pointer to
- * the array of AggStatePerGroup, and skip evaluation if so.
+ * 返回值：
+ *   ExprState* - 以 EEOP_DONE_NO_RETURN 收尾（结果写进 pergroup 状态而非返回）。
+ *
+ * 设计思想：
+ *   1. 前置 setup：把所有过渡的 aggref 参数/排序/过滤表达式一次性统计并生成
+ *      FETCHSOME 步骤——聚合输入往往同源（同一元组），合并变形优于逐表达式
+ *      重复变形。
+ *   2. 每个过渡的步骤顺序固定：aggfilter 最先求（避免无谓计算与副作用；合并
+ *      模式 isCombine 已过滤完，不再求）→ 参数求值（合并模式下参数是经
+ *      deserialfn 反序列化来的过渡值，见 EEOP_AGG_DESERIALIZE）→ strict 输入
+ *      检查（存在 NULL 则跳过本次过渡，保留旧 transValue）→ 预排序 DISTINCT
+ *      检查（EEOP_AGG_PRESORTED_DISTINCT_*）→ 为每个 grouping set 各生成一次
+ *      ExecBuildAggTransCall（排序段 & 哈希段）。
+ *   3. 所有"提前跳出"的跳转目标（adjust_bailout 列表）在整表达式编译完后统一
+ *      回填。
+ *   4. 该方法把"聚合每行的过渡函数调用"也变成步骤序列，使 JIT/解释器统一受益；
+ *      参数结果下沉到 trans_fcinfo->args（0 号永远留给过渡值本身）。
+ *   5. 被调用方：nodeAgg.c 的 ExecAgg 初始化（evaltrans/evaltrans_cache），
+ *      phase 内每次切换分组集时使用缓存版本的 ExprState。
+ * ============================================================================
  */
 ExprState *
 ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
@@ -4005,9 +4536,39 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 }
 
 /*
- * Build transition/combine function invocation for a single transition
- * value. This is separated from ExecBuildAggTrans() because there are
- * multiple callsites (hash and sort in some grouping set cases).
+ * ============================================================================
+ * 【中文注释】ExecBuildAggTransCall —— 单个过渡值的过渡函数调用步骤
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为"一个聚合过渡函数在某个 grouping set（或哈希组）上的一次调用"生成步骤：
+ *   可选 pergroup 空指针检查 → 按过渡值类型（byval/byref）与函数严格性选择最
+ *   合适的 EEOP_AGG_*_TRANS 变体 → push 并回填跳转目标。从 ExecBuildAggTrans
+ *   中拆出是因为排序型与哈希型两条路径（多个 grouping set、多哈希表）共用。
+ *
+ * 参数：
+ *   state/scratch - 目标状态与步骤工作区；aggstate - 提供运行上下文选择
+ *            （排序型取 aggcontexts[setno]，哈希型取 hashcontext）；
+ *   fcinfo - 过渡函数调用信息；pertrans - 过渡描述（transtypeByVal、
+ *            initValueIsNull、aggsortrequired、numInputs 等）；
+ *   transno/setno/setoff - 过渡编号/分组集编号/偏移（setoff 用于 pergroup
+ *            数组定位）；ishash - 哈希型还是排序型；nullcheck - 是否生成
+ *            pergroup 空指针跳过检查。
+ *
+ * 设计思想：
+ *   1. 变体矩阵（聚合是热点，多一步分支都有代价）：
+ *      - 非排序聚合：严格且无初始值 → EEOP_AGG_PLAIN_TRANS_INIT_STRICT_*
+ *        （首个非 NULL 输入直接采纳为初始态）；严格且有初始值 →
+ *        EEOP_AGG_PLAIN_TRANS_STRICT_*（过渡态已 NULL 则跳过调用）；否则
+ *        EEOP_AGG_PLAIN_TRANS_*。每种再按过渡类型 byval/byref 分两种（byval
+ *        无需内存管理，可内联）。
+ *      - 排序聚合（ORDER BY/DISTINCT 需先排序）：单列 → ORDERED_TRANS_DATUM，
+ *        多列 → ORDERED_TRANS_TUPLE（列进 sortslot）；严格性判定推迟到
+ *        finalize 阶段（process_ordered_aggregate_*），此处不做。
+ *   2. 各变体责任重叠并不优雅，但聚合性能敏感，值得以"专用步骤"换取一次分支
+ *      的节省——原注释明确承认这一权衡。
+ *   3. jumpnull 在 push 之后回填到"本过渡调用之后"的位置，保证 pergroup 为
+ *      NULL（nullcheck 模式）时跳过整段过渡逻辑。
+ * ============================================================================
  */
 static void
 ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
@@ -4116,20 +4677,33 @@ ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 }
 
 /*
- * Build an ExprState that calls the given hash function(s) on the attnums
- * given by 'keyColIdx' .  When numCols > 1, the hash values returned by each
- * hash function are combined to produce a single hash value.
+ * ============================================================================
+ * 【中文注释】ExecBuildHash32FromAttrs —— 构建"按属性列计算 32 位哈希"的表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   构建把 inner 槽元组的指定列用给定哈希函数（每列一个）散列并混合成单个
+ *   uint32 的 ExprState：先按最高列号生成一条 FETCHSOME，再逐列"取列 →
+ *   EEOP_HASHDATUM_FIRST/NEXT32 哈希"，多列时后列哈希与前列中间结果混合，
+ *   最终结果存 state->resvalue。
  *
- * desc: tuple descriptor for the to-be-hashed columns
- * ops: TupleTableSlotOps to use for the give TupleDesc
- * hashfunctions: FmgrInfos for each hash function to call, one per numCols.
- * These are used directly in the returned ExprState so must remain allocated.
- * collations: collation to use when calling the hash function.
- * numCols: array length of hashfunctions, collations and keyColIdx.
- * parent: PlanState node that the resulting ExprState will be evaluated at
- * init_value: Normally 0, but can be set to other values to seed the hash
- * with.  Non-zero is marginally slower, so best to only use if it's provably
- * worthwhile.
+ * 参数：
+ *   desc - 待哈希列的元组描述符；ops - 槽类型（供固定性分析）；
+ *   hashfunctions - 每列一个 FmgrInfo（被直接引用进 ExprState，调用方须保证
+ *            其生命周期不短于结果状态）；collations - 每列排序规则；
+ *   numCols/keyColIdx - 列数与列号数组；parent - 宿主 PlanState；
+ *   init_value - 哈希种子（默认 0；非零略慢但可注入固定偏移/参与混合）。
+ *
+ * 设计思想：
+ *   1. 单列且无种子时用 EEOP_HASHDATUM_FIRST 直接产出结果（不做混合）；其余
+ *      情形先 SET_INITVAL 放种子再逐列 NEXT32——FIRST 会覆盖已存种子故不可用。
+ *   2. 列值与哈希调用之间 resv 指向 fcinfo->args[0]（参数下沉），哈希结果写
+ *      中间 NullableDatum（多列时）或 state->resvalue（最后一列），避免冗余
+ *      拷贝。
+ *   3. 哈希函数总是按严格处理：输入为 NULL 时不调用函数，结果置 NULL（由执行
+ *      器语义决定，通常意味着"无法哈希"）。
+ *   4. 被调用方：execGrouping.c 的哈希表键哈希（hash join/分组）、nodeSubplan.c
+ *      （子计划左边参数哈希，配合 ExecBuildGroupingEqual 判等）。
+ * ============================================================================
  */
 ExprState *
 ExecBuildHash32FromAttrs(TupleDesc desc, const TupleTableSlotOps *ops,
@@ -4272,25 +4846,30 @@ ExecBuildHash32FromAttrs(TupleDesc desc, const TupleTableSlotOps *ops,
 }
 
 /*
- * Build an ExprState that calls the given hash function(s) on the given
- * 'hash_exprs'.  When multiple expressions are present, the hash values
- * returned by each hash function are combined to produce a single hash value.
+ * ============================================================================
+ * 【中文注释】ExecBuildHash32Expr —— 构建"按任意表达式计算 32 位哈希"的表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 ExecBuildHash32FromAttrs 同构，但哈希对象从"属性列"泛化为"任意表达式
+ *   列表"（hash_exprs）：逐表达式求值后哈希并混合；当某表达式为 NULL 且其
+ *   对应运算（opstrict[i] 为 true）严格时，结果直接为 NULL；非严格运算符按
+ *   "NULL 的哈希值为零"处理——通过选择 *_STRICT / 非 STRICT 步骤变体区分。
  *
- * If any hash_expr yields NULL and the corresponding hash operator is strict,
- * the created ExprState will return NULL.  (If the operator is not strict,
- * we treat NULL values as having a hash value of zero.  The hash functions
- * themselves are always treated as strict.)
+ * 参数：
+ *   desc/ops - 槽描述与类型（供 FETCHSOME 及 Var 编译分析）；hashfunc_oids -
+ *              每表达式哈希函数 OID；collations - 每表达式排序规则；
+ *   hash_exprs - 待哈希表达式列表；opstrict - 与表达式一一对应的运算符严格性；
+ *   parent/init_value - 同 ExecBuildHash32FromAttrs。
  *
- * desc: tuple descriptor for the to-be-hashed expressions
- * ops: TupleTableSlotOps for the TupleDesc
- * hashfunc_oids: Oid for each hash function to call, one for each 'hash_expr'
- * collations: collation to use when calling the hash function
- * hash_exprs: list of expressions to hash the value of
- * opstrict: strictness flag for each hash function's comparison operator
- * parent: PlanState node that the 'hash_exprs' will be evaluated at
- * init_value: Normally 0, but can be set to other values to seed the hash
- * with some other value.  Using non-zero is slightly less efficient but can
- * be useful.
+ * 设计思想：
+ *   1. 步骤序列：setup（FETCHSOME）→ 可选 SET_INITVAL → 对每个表达式：求值进
+ *      fcinfo->args[0] → 按 opstrict 与位置选 FIRST（含 STRICT 变体）或
+ *      NEXT32（含 STRICT 变体）→ 结果写中间或最终位置。严格变体遇 NULL 时
+ *      跳到结尾返回 NULL，跳转目标最后统一回填。
+ *   2. 与 FromAttrs 版的分工：连接键/分组键若是"表达式"（如 a+b、函数调用）
+ *      而非裸列，则用本入口；HashJoin 的表达式化连接键（nodeHashjoin.c）是
+ *      典型调用方。
+ * ============================================================================
  */
 ExprState *
 ExecBuildHash32Expr(TupleDesc desc, const TupleTableSlotOps *ops,
@@ -4447,15 +5026,32 @@ ExecBuildHash32Expr(TupleDesc desc, const TupleTableSlotOps *ops,
 }
 
 /*
- * Build equality expression that can be evaluated using ExecQual(), returning
- * true if the expression context's inner/outer tuple are NOT DISTINCT. I.e
- * two nulls match, a null and a not-null don't match.
+ * ============================================================================
+ * 【中文注释】ExecBuildGroupingEqual —— 构建"组内相等"判定表达式（NOT DISTINCT）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   构建可用 ExecQual 求值的 ExprState：逐列比较 inner/outer 槽的 numCols 个
+ *   键，对每列用给定等值函数求"NOT DISTINCT FROM"（两个 NULL 相等、NULL 与
+ *   非 NULL 不等），返回 true 表示"同一组/同一条记录"。HashAgg 输入的前后行
+ *   判定、子计划左右两边记录配对等直接复用。
  *
- * desc: tuple descriptor of the to-be-compared tuples
- * numCols: the number of attributes to be examined
- * keyColIdx: array of attribute column numbers
- * eqFunctions: array of function oids of the equality functions to use
- * parent: parent executor node
+ * 参数：
+ *   ldesc/rdesc（lops/rops）- 两侧槽描述与槽类型；numCols/keyColIdx - 键列数
+ *            与列号数组（label:按 keyColIdx 指向两侧各自同号列）；
+ *   eqfunctions - 每列的等值函数 OID；collations - 每列排序规则；
+ *   parent - 宿主计划节点（也可为 NULL，此时跳过固定性分析）。
+ *
+ * 设计思想：
+ *   1. 空键（numCols==0）返回 NULL ExprState——ExecQual 对 NULL 状态恒真，
+ *      正好表达"空 GROUP BY 全部相等"。
+ *   2. 两遍 FETCHSOME：两侧各自按最大键列变形，一次到位。
+ *   3. 从最后一列（最不重要的排序键）倒序比较：若输入来自排序源，低位键最
+ *      可能出现差异，先比它们可以在更早的 EEOP_QUAL 跳出，减少平均比较次数。
+ *   4. NULL 语义由 EEOP_NOT_DISTINCT 步骤实现（等值函数 + NULL 处理逻辑），
+ *      而非简单调用等值函数；每列比较后都紧跟 EEOP_QUAL（false/NULL 即跳出）。
+ *   5. 被调用方：execGrouping.c 的 ExecuteEqualityFuncs（排序分组）、
+ *      nodeSubplan.c（左右表连接键判等，配合 ExecBuildHash32FromAttrs）。
+ * ============================================================================
  */
 ExprState *
 ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
@@ -4602,19 +5198,29 @@ ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 }
 
 /*
- * Build equality expression that can be evaluated using ExecQual(), returning
- * true if the expression context's inner/outer tuples are equal.  Datums in
- * the inner/outer slots are assumed to be in the same order and quantity as
- * the 'eqfunctions' parameter.  NULLs are treated as equal.
+ * ============================================================================
+ * 【中文注释】ExecBuildParamSetEqual —— 构建"参数集与元组相等"判定表达式
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   构建可交给 ExecQual 的 ExprState：把 inner 槽的前 N 列与 outer 槽对应列
+ *   逐个按"NOT DISTINCT"比较（两个 NULL 相等、NULL 与非 NULL 不等）。与
+ *   ExecBuildGroupingEqual 的差异：两侧键列号固定为连续的 0..N-1，类型取自
+ *   同一个 desc——专门用于把"已算好的一组键"与输入元组前若干列配对。
  *
- * desc: tuple descriptor of the to-be-compared tuples
- * lops: the slot ops for the inner tuple slots
- * rops: the slot ops for the outer tuple slots
- * eqFunctions: array of function oids of the equality functions to use
- * this must be the same length as the 'param_exprs' list.
- * collations: collation Oids to use for equality comparison. Must be the
- * same length as the 'param_exprs' list.
- * parent: parent executor node
+ * 参数：
+ *   desc - 两侧共同使用的元组描述符；lops/rops - 两侧槽类型；
+ *   eqfunctions/collations - 每列等值函数与排序规则数组；
+ *   param_exprs - 表达式列表（其长度决定比较列数 N；语义上这些表达式的结果
+ *            已按序放进了 inner 槽的前 N 列）；parent - 宿主节点。
+ *
+ * 设计思想：
+ *   1. 比较按正序进行（与 GroupingEqual 的倒序相反）：本函数服务的是"键已备
+ *      好、逐列比对"的场景，没有"低位键先不同"的排序统计前提。
+ *   2. EEO_FLAG_IS_QUAL 标记 + EEOP_QUAL 收尾：ExecQual 遇任一列 NULL 直接
+ *      返回 false，保证"NULL 键不匹配"语义。
+ *   3. 被调用方：nodeMemoize.c 的 Memoize 节点——用哈希键的前缀列与缓存条目
+ *      做精确回访判定（哈希碰撞后的最终确认）。
+ * ============================================================================
  */
 ExprState *
 ExecBuildParamSetEqual(TupleDesc desc,
@@ -4738,7 +5344,39 @@ ExecBuildParamSetEqual(TupleDesc desc,
 }
 
 /*
- * Push steps to evaluate a JsonExpr and its various subsidiary expressions.
+ * ============================================================================
+ * 【中文注释】ExecInitJsonExpr —— 编译 JsonExpr（JSON_VALUE/JSON_QUERY/JSON_EXISTS）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   生成 JsonExpr 的完整求值步骤序列：求 formatted_expr（JSON 输入值）与
+ *   path_spec（jsonpath 路径）→ 两者任一为 NULL 则结果为 NULL → 求 PASSING
+ *   命名参数 → EEOP_JSONEXPR_PATH 执行 jsonpath 求值 → 按 RETURNING 类型强转
+ *   （json 强转或 IO 强转）→ 按 ON ERROR / ON EMPTY 行为处理错误与空结果。
+ *
+ * 参数：
+ *   jsexpr - JsonExpr 节点；state - 所属 ExprState；resv/resnull - 结果地址；
+ *   scratch - 步骤工作区（jsonexpr 字段）。
+ *
+ * 设计思想：
+ *   1. JsonExprState 承载全部运行时状态：formatted_expr/pathspec 的求值结果、
+ *      命名参数列表（JsonPathVariable）、错误与空标志（error/empty）、软错误
+ *      上下文（escontext）与强转函数信息。
+ *   2. 错误软化：on_error 不是 ERROR 行为时建立 ErrorSaveContext 传给 jsonpath
+ *      求值与强转步骤（错误先不抛），由 EEOP_JSONEXPR_COERCION_FINISH 统一
+ *      检查并把控制流转到 ON ERROR 表达式；行为是 ERROR 时 escontext 为 NULL，
+ *      错误正常抛出。
+ *   3. NULL/空/错误分支的"跳过优化"：ON ERROR / ON EMPTY 的默认表达式是
+ *      "NULL 常量"时，只要 RETURNING 不是域类型（域需要走约束检查），整个处理
+ *      分支都省略——jsonpath 求值器在出错/为空时本来就返回 NULL；
+ *      formatted_expr 或 path_spec 为 NULL 时也直接 JUMP 到尾部的 NULL 常量
+ *      步骤（此时 ON EMPTY/ON ERROR 不生效）。
+ *   4. ON ERROR/ON EMPTY 表达式自身的求值与强转同样以软错误方式编译（临时切换
+ *      state->escontext），并在其强转（若需要）后补 COERCION_FINISH 把潜在
+ *      错误重新抛出；两个分支最后都跳到 jump_end，跳转目标在全部步骤生成后
+ *      统一回填。
+ *   5. 被调用方：ExecInitExprRec 的 T_JsonExpr 分支（JSON_TABLE_OP 除外——
+ *      上游 tfuncFetchRows 只需要 formatted_expr 的值）。
+ * ============================================================================
  */
 static void
 ExecInitJsonExpr(JsonExpr *jsexpr, ExprState *state,
@@ -5039,8 +5677,27 @@ ExecInitJsonExpr(JsonExpr *jsexpr, ExprState *state,
 }
 
 /*
- * Initialize a EEOP_JSONEXPR_COERCION step to coerce the value given in resv
- * to the given RETURNING type.
+ * ============================================================================
+ * 【中文注释】ExecInitJsonCoercion —— 生成 JSON 结果强转步骤（EEOP_JSONEXPR_COERCION）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   生成一条把 resv 中的值为按 JsonReturning 指定的类型强转的步骤：运行时由
+ *   json_populate_type 依据 JSON 类别做目标类型转换（数值/字符串/布尔/复合等），
+ *   支持软错误（escontext）与 JSON_EXISTS 的特殊形态（结果强转为 int 表示
+ *   true/false、跳过域约束检查）。
+ *
+ * 参数：
+ *   state - 所属 ExprState；returning - RETURNING 类型规格（typid/typmod）；
+ *   escontext - 软错误上下文（可为 NULL）；omit_quotes - 强转时是否对文本值
+ *           去引号（JSON_QUERY 语义）；exists_coerce - 是否为 JSON_EXISTS 的
+ *           bool→目标类型强转；resv/resnull - 值所在地址。
+ *
+ * 设计思想：
+ *   EXISTS 强转特例：把 bool 结果强转为目标类型（目标是 int4 时用专用快速路径
+ *   exists_cast_to_int），并检测目标是否为域类型（DomainHasConstraints）以决定
+ *   是否需要保留域约束检查。被 ExecInitJsonExpr 的正常强转路径与 ON ERROR /
+ *   ON EMPTY 分支复用。
+ * ============================================================================
  */
 static void
 ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,

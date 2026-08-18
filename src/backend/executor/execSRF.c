@@ -16,6 +16,36 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * ============================================================================
+ * 【中文注释】execSRF.c —— 集合返回函数（SRF）执行 API
+ * ----------------------------------------------------------------------------
+ * 文件定位：
+ *   为 nodeFunctionscan.c（FROM ROWS FROM 表函数/ROWS FROM）与
+ *   nodeProjectSet.c（targetlist 中的 SRF 投影）提供公共支撑：
+ *   按 ReturnSetInfo 协议调用集合返回函数并消费其输出。
+ *
+ * 核心概念（ReturnSetInfo 协议，三个 returnMode）：
+ *   1. SFRM_ValuePerCall：每调用一次函数返回一行（isDone 区分
+ *      ExprSingleResult 一行即止 / ExprMultipleResult 还能再要 /
+ *      ExprEndResult 结束）。这是最常用模式（大部分 SRF 语言函数、
+ *      C 函数等）。
+ *   2. SFRM_Materialize：函数一次性把结果写进 tuplestore 并回填
+ *      setResult/setDesc；执行器随后从 tuplestore 逐行读出。
+ *      SFRM_Materialize_Preferred/Random 变体表示"更希望/允许物化"。
+ *   3. 协议违规（SRF 在上下文中乱换模式、非 SRF 返回多行等）报
+ *      ERRCODE_E_R_I_E_SRF_PROTOCOL_VIOLATED。
+ *
+ * 关键机制：
+ *   - SetExprState 缓存函数元数据（fmgr_info）、参数表达式列表、fcinfo
+ *     及"结果存储"（funcResultStore/ funcResultSlot）；首次调用时初始化
+ *     （init_sexpr：权限检查 + 元数据 + 结果行类型推导 funcResultDesc）；
+ *   - 参数粘性（setArgsValid）：ValuePerCall 多行模式下参数只需求值一次，
+ *     后续调用复用（值保存在 argContext，跨 per-tuple 上下文存活）；
+ *   - 清理回调（RegisterExprContextCallback → ShutdownSetExpr）：未跑完
+ *     就被丢弃时释放 tuplestore/槽。
+ * ============================================================================
+ */
 #include "postgres.h"
 
 #include "access/htup_details.h"
@@ -49,9 +79,18 @@ static void tupledesc_match(TupleDesc dst_tupdesc, TupleDesc src_tupdesc);
 
 
 /*
- * Prepare function call in FROM (ROWS FROM) for execution.
+ * ============================================================================
+ * 【中文注释】ExecInitTableFunctionResult —— 准备 FROM 子句表函数调用
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为表函数（FROM 位置的 ROWS FROM 项）构建 SetExprState。若表达式是
+ *   FuncExpr 则按其声明初始化（参数列表编译 + init_sexpr 完成权限/元数据）；
+ *   否则（规划器常量折叠/内联把函数调用替换成了别的表达式）退化为通用
+ *   表达式路径——elidedFuncState 走 ExecEvalExpr，代价是嵌套在表达式里
+ *   的 SRF 不再受支持。
  *
- * This is used by nodeFunctionscan.c.
+ * 上下文选择：per-query 内存（函数元数据跨整查询存活）。
+ * ============================================================================
  */
 SetExprState *
 ExecInitTableFunctionResult(Expr *expr,
@@ -91,12 +130,30 @@ ExecInitTableFunctionResult(Expr *expr,
 }
 
 /*
- *		ExecMakeTableFunctionResult
+ * ============================================================================
+ * 【中文注释】ExecMakeTableFunctionResult —— 求值表函数并物化为 tuplestore
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   调用表函数，把结果全部收集进 Tuplestore 返回（nodeFunctionscan 逐行
+ *   读取）。两种输入形态：
+ *   - 真正的 SRF：按 ReturnSetInfo 协议驱动（ValuePerCall 循环收集 /
+ *     Materialize 直接接住 tuplestore）；strict 且含 NULL 参数时跳过函数
+ *     视作空集；
+ *   - 被折叠成普通表达式的：每轮 ExecEvalExpr 求值一次（isDone 恒为
+ *     SingleResult，即函数式 SRF 已无从谈起）。
  *
- * Evaluate a table function, producing a materialized result in a Tuplestore
- * object.
+ * 内存层次（重要）：
+ *   - 参数/函数调用信息分配在调用方提供的 argContext（长生命周期，循环
+ *     内每轮 Reset 防膨胀）；ValuePerCall 多次调用间参数必须存活；
+ *   - 函数每轮调用切换进 per-tuple 上下文（ResetExprContext 清理函数
+ *     泄漏的中间内存）；
+ *   - tuplestore 与行类型描述符建立在 per-query 上下文。
  *
- * This is used by nodeFunctionscan.c.
+ * 结果行类型处理：返回复合类型时从行 Datum 里取类型信息查描述符
+ * （记录类型逐行校验 tdtypeid/tdtypmod 一致性，不一致报错）；标量类型
+ * 造单列 "column" 描述符；NULL 行展开为全 NULL 行（用 expectedDesc）。
+ * 结束后 tupledesc_match 与期望描述符交叉校验，动态描述符释放防泄漏。
+ * ============================================================================
  */
 Tuplestorestate *
 ExecMakeTableFunctionResult(SetExprState *setexpr,
@@ -438,9 +495,15 @@ no_function_result:
 
 
 /*
- * Prepare targetlist SRF function call for execution.
- *
- * This is used by nodeProjectSet.c.
+ * ============================================================================
+ * 【中文注释】ExecInitFunctionResultSet —— 准备 targetlist 中的 SRF
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为投影表达式里的集合返回函数（FuncExpr 或运算符 OpExpr 形态）构建
+ *   SetExprState，供 nodeProjectSet 的"每行 N 行输出"语义使用。
+ * 差异：强制允许 SRF（allowSRF=true）/ 需要结果描述符（needDescForSRF=
+ * true，ProjectSet 逐行检查结果类型），并断言最终确实选中了返回集的函数。
+ * ============================================================================
  */
 SetExprState *
 ExecInitFunctionResultSet(Expr *expr,
@@ -483,17 +546,27 @@ ExecInitFunctionResultSet(Expr *expr,
 }
 
 /*
- *		ExecMakeFunctionResultSet
+ * ============================================================================
+ * 【中文注释】ExecMakeFunctionResultSet —— 求值 SRF 参数并调用（逐行协议）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   nodeProjectSet 的核心：每次调用产出目标列展开的一行（或一行结束）。
+ *   三种输入阶段（restart 标签协同）：
+ *   1. 若上轮 Materialize 结果还没取完——从 funcResultStore 逐行读：
+ *      复合结果整体打包成行 Datum 返回；标量结果取第一列；
+ *   2. 参数未缓存（setArgsValid=false）时求值参数（在 argContext 中，
+ *      保证多行模式下参数值不随 per-tuple 重置消失）后调用函数；
+ *      strict+NULL 参数 → 空集；
+ *   3. 函数选择 ValuePerCall 且返回 ExprMultipleResult：缓存参数
+ *     （setArgsValid=true）并注册清理回调，下次调用跳过参数求值直接
+ *      再要一行；
+ *   4. 函数选择 Materialize：校验协议后把 tuplestore 收编
+ *     （ExecPrepareTuplestoreResult），goto restart 从第 1 阶段逐行吐出。
  *
- * Evaluate the arguments to a set-returning function and then call the
- * function itself.  The argument expressions may not contain set-returning
- * functions (the planner is supposed to have separated evaluation for those).
- *
- * This should be called in a short-lived (per-tuple) context, argContext
- * needs to live until all rows have been returned (i.e. *isDone set to
- * ExprEndResult or ExprSingleResult).
- *
- * This is used by nodeProjectSet.c.
+ * 输出约束：*isDone 指示行流状态（Single=此行即终 / Multiple=可续 /
+ * End=结束）；调用方在 per-tuple 上下文调用，argContext 须存活到
+ * 结果取尽（isDone 非 Multiple）。
+ * ============================================================================
  */
 Datum
 ExecMakeFunctionResultSet(SetExprState *fcache,
@@ -692,7 +765,22 @@ restart:
 
 
 /*
- * init_sexpr - initialize a SetExprState node during first use
+ * ============================================================================
+ * 【中文注释】init_sexpr —— SetExprState 一次性初始化
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   首次调用前填充 SetExprState 的运行时元数据：
+ *   1. 权限：EXECUTE 权限检查 + 函数执行钩子（对象访问钩子）；
+ *   2. fmgr：fmgr_info_cxt 绑定函数（信息存到 sexprCxt，防跨查询泄漏）、
+ *      绑定表达式（fmgr_info_set_expr，支持返回 RECORD 的函数 ID 动态化）、
+ *      预分配 fcinfo（nargs 超 PROC_MAX_ARGS 报错防御）；
+ *   3. SRF 契约：函数返回集但调用方不允许（allowSRF=false）时报
+ *      "set-valued function called in context that cannot accept a set"；
+ *   4. 结果行类型推导（needDescForSRF=true 时）：按函数返回类型分类——
+ *      复合类型（查得描述符拷贝进 sexprCxt，funcReturnsTuple=true）、
+ *      标量（造单列描述符）、RECORD（描述符留空，靠运行时 expectedDesc）、
+ *      其他（留 NULL，用到时失败报"cannot accept type record"）。
+ * ============================================================================
  */
 static void
 init_sexpr(Oid foid, Oid input_collation, Expr *node,
@@ -806,8 +894,15 @@ init_sexpr(Oid foid, Oid input_collation, Expr *node,
 }
 
 /*
- * callback function in case a SetExprState needs to be shut down before it
- * has been run to completion
+ * ============================================================================
+ * 【中文注释】ShutdownSetExpr —— SRF 提前终止清理回调
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   经 RegisterExprContextCallback 挂到表达式上下文上，在查询/上下文
+ *   注销（或 SRF 未放完就被弃用）时释放残留资源：清结果槽、关
+ *   tuplestore、复位参数缓存标志。防"槽还指着已释放的 tuplestore"。
+ * 注意：回调的注销由 execUtils 的上下文清理流程统一完成。
+ * ============================================================================
  */
 static void
 ShutdownSetExpr(Datum arg)
@@ -831,7 +926,15 @@ ShutdownSetExpr(Datum arg)
 }
 
 /*
- * Evaluate arguments for a function.
+ * ============================================================================
+ * 【中文注释】ExecEvalFuncArgs —— 批量求值函数实参
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把参数表达式列表逐项 ExecEvalExpr 求值，写进 fcinfo->args
+ *   （value/isnull 对），数量必须与函数声明一致（断言）。
+ * 注意：值分配在当前内存上下文，调用方须保证存活期覆盖全部 SRF 调用
+ * （典型是 argContext，见 ExecMakeFunctionResultSet 的用法）。
+ * ============================================================================
  */
 static void
 ExecEvalFuncArgs(FunctionCallInfo fcinfo,
@@ -856,12 +959,18 @@ ExecEvalFuncArgs(FunctionCallInfo fcinfo,
 }
 
 /*
- *		ExecPrepareTuplestoreResult
- *
- * Subroutine for ExecMakeFunctionResultSet: prepare to extract rows from a
- * tuplestore function result.  We must set up a funcResultSlot (unless
- * already done in a previous call cycle) and verify that the function
- * returned the expected tuple descriptor.
+ * ============================================================================
+ * 【中文注释】ExecPrepareTuplestoreResult —— 收编 Materialize 模式的 tuplestore
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   函数用 SFRM_Materialize 交出结果后，为逐行消费做准备：
+ *   1. 缓存 ResultStore；首次收编时创建结果槽（行类型：优先
+ *      funcResultDesc，其次拷贝 resultDesc——不假定其长命，再次为空则
+ *      报"cannot accept type record"）；
+ *   2. resultDesc 与期望描述符交叉校验（tupledesc_match），动态描述符
+ *      立即释放（防跨查询泄漏）；
+ *   3. 注册 ShutdownSetExpr 兜底清理（防循环内提前放弃）。
+ * ============================================================================
  */
 static void
 ExecPrepareTuplestoreResult(SetExprState *sexpr,
@@ -933,14 +1042,16 @@ ExecPrepareTuplestoreResult(SetExprState *sexpr,
 }
 
 /*
- * Check that function result tuple type (src_tupdesc) matches or can
- * be considered to match what the query expects (dst_tupdesc). If
- * they don't match, ereport.
- *
- * We really only care about number of attributes and data type.
- * Also, we can ignore type mismatch on columns that are dropped in the
- * destination type, so long as the physical storage matches.  This is
- * helpful in some cases involving out-of-date cached plans.
+ * ============================================================================
+ * 【中文注释】tupledesc_match —— 校验函数返回行类型与查询期望一致
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   逐属性比对 dst（查询期望）与 src（函数实际返回）描述符：列数必须
+ *   相同（errdetail_plural 报数）；每列类型可按二进制强制转换（一个
+ *   例外来自缓存计划的陈旧描述符）则不追究；其余必须一致——但 dst 列
+ *   已删除（attisdropped）时允许类型不符，只要物理存储（长度/对齐）
+ *   一致即可（历史遗留的行布局兼容）。
+ * ============================================================================
  */
 static void
 tupledesc_match(TupleDesc dst_tupdesc, TupleDesc src_tupdesc)

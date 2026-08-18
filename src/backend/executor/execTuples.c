@@ -55,6 +55,39 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * ============================================================================
+ * 【中文注释】execTuples.c —— 元组表槽（TupleTableSlot）机制总览
+ * ----------------------------------------------------------------------------
+ * 文件定位：
+ *   执行器的"元组容器"基础设施层。执行器内部从不直接传递裸元组指针，
+ *   而是把元组"塞进"一个 TupleTableSlot（元组表槽）再传递槽指针。槽统一
+ *   承载三类信息：
+ *     1) 元组所属的表（tts_tableOid）、行标识（tts_tid）、元组描述符
+ *        （tts_tupleDescriptor，列类型/名字/约束）；
+ *     2) 已解（deform）出的列值数组 tts_values[] 与 NULL 标记 tts_isnull[]
+ *        （"虚拟元组"视图，避免反复物理解包）；
+ *     3) 资源归属（buffer pin、内存该谁释放、何时释放）。
+ *
+ * 四种槽实现（多态，通过 TupleTableSlotOps 函数指针表分发）：
+ *   - TTSOpsVirtual（虚拟槽）        ：只含 Datum/isnull 数组，无物理元组，
+ *       投影等中间结果的首选，最大限度避免拷贝；
+ *   - TTSOpsHeapTuple（堆元组槽）     ：持有完整的 HeapTuple（含系统列），
+ *       元组内存可由槽负责释放（SHOULDFREE 标志）；
+ *   - TTSOpsMinimalTuple（最小元组槽）：持有 MinimalTuple（去掉了系统列的
+ *       轻量表示，用于排序/物化等中间结果）；
+ *   - TTSOpsBufferHeapTuple（缓冲槽） ：指向磁盘缓冲页内的元组并持有该页的
+ *       buffer pin，实现"零拷贝"扫描（扫描到哪行就 pin 哪页）。
+ *
+ * 设计思想：
+ *   - 懒解包（deform-on-demand）：槽先只持有物理元组，tts_nvalid 记录已解
+ *     出多少列；调用方要哪一列才解到那一列，且增量续解不重算；
+ *   - 惰性物化（materialize）：需要元组独立于底层存储时（如离开 buffer、
+ *     跨上下文使用）再拷到槽自己的内存上下文并置 SHOULDFREE；
+ *   - 不要裸 pfree 元组：用 ExecClearTuple 清槽，从而正确处理 pin 释放、
+ *     内存释放与标志复位。
+ * ============================================================================
+ */
 #include "postgres.h"
 
 #include "access/heaptoast.h"
@@ -88,11 +121,42 @@ const TupleTableSlotOps TTSOpsBufferHeapTuple;
 
 
 /*
- * TupleTableSlotOps implementations.
+ * ============================================================================
+ * 【中文注释】TupleTableSlotOps 实现（四大槽类型）——总体说明
+ * ----------------------------------------------------------------------------
+ * 每套实现都按"槽协议"提供一组回调：init / release（槽生命周期）、clear
+ * （清空槽内元组并释放其持有的资源）、getsomeattrs（按需解出 N 个属性）、
+ * getsysattr（系统列，仅堆/缓冲槽支持）、materialize（把内容物化到槽自身
+ * 内存上下文）、copyslot（整槽复制）、get/copy_heap_tuple、get/copy_minimal
+ * _tuple（物理元组存取，不支持的返回 NULL 或走 copy 路径）。
+ *
+ * 关键不变量：
+ *   - TTS_FLAG_EMPTY：槽为空；TTS_FLAG_SHOULDFREE：槽拥有元组内存，clear
+ *     时必须释放；TTS_FLAG_FIXED：槽的元组描述符固定。
+ *   - 解包/物化的一致性：tts_values 可能指向"未物化的底层元组"，任何跨越
+ *     底层存储生命周期的使用都必须先 materialize。
+ * ============================================================================
  */
 
 /*
- * TupleTableSlotOps implementation for VirtualTupleTableSlot.
+ * ============================================================================
+ * 【中文注释】虚拟槽（VirtualTupleTableSlot）实现
+ * ----------------------------------------------------------------------------
+ * 特点：槽里只存 Datum/isnull 数组，没有物理元组也没有 buffer pin，因此
+ * init/release 都是空操作；clear 仅需释放之前物化时分配的内存。
+ *
+ * getsomeattrs：永不应被调用——虚拟槽在 ExecStoreVirtualTuple 时已把全部
+ * 属性解出（tts_nvalid = natts），调用即编程错误，直接报错。
+ * getsysattr / is_current_xact_tuple：虚拟槽不承载系统列与事务信息，走到
+ * 就报"不支持"，让错误尽早暴露而不是返回垃圾值。
+ *
+ * materialize（核心）：把非按值（by-value）的 Datum 拷贝进 slot 自己的
+ * 内存上下文，使槽不再依赖外部存储。实现上先两遍扫描：
+ *   第一遍只算总需求内存（按对齐规则逐列累加；expanded 对象按展开后的
+ *   平坦大小计），一次 MemoryContextAlloc 分配整块，提高缓存命中与分配
+ *   效率；第二遍逐列 memcpy/EOH_flatten_into 填入，并把 tts_values 改写
+ *   为指向新内存。全部为按值类型时 sz==0，直接返回（无需物化）。
+ * ============================================================================
  */
 static void
 tts_virtual_init(TupleTableSlot *slot)
@@ -310,9 +374,22 @@ tts_virtual_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
 
 
 /*
- * TupleTableSlotOps implementation for HeapTupleTableSlot.
+ * ============================================================================
+ * 【中文注释】堆元组槽（HeapTupleTableSlot）实现
+ * ----------------------------------------------------------------------------
+ * 特点：持有完整 HeapTuple（含事务/系统列信息），用于需要系统列、或元组
+ * 独立于缓冲页存在的场合。tuple 指针为 NULL 时表示槽内容是"虚拟形式"
+ * （只有数组），此时 getsysattr / is_current_xact_tuple 报错。
+ *
+ * clear：SHOULDFREE 时 heap_freetuple；并复位 off（解包偏移）、nvalid。
+ * getsomeattrs：委托给核心函数 slot_deform_heap_tuple 增量解包。
+ * materialize：确保槽自持内存——无 tuple 时按数组 heap_form_tuple 造一个，
+ * 有 tuple 但非自有（无 SHOULDFREE）时 heap_copytuple 拷入槽上下文；解包
+ * 偏移清零强制从新拷贝重新解包，避免 tts_values 指向旧（可能已消失的）元组。
+ * copyslot：在目标槽上下文拷贝一份堆元组后 ExecStoreHeapTuple 存入
+ * （shouldFree=true，目标槽获得所有权）。
+ * ============================================================================
  */
-
 static void
 tts_heap_init(TupleTableSlot *slot)
 {
@@ -502,9 +579,21 @@ tts_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple, bool shouldFree)
 
 
 /*
- * TupleTableSlotOps implementation for MinimalTupleTableSlot.
+ * ============================================================================
+ * 【中文注释】最小元组槽（MinimalTupleTableSlot）实现
+ * ----------------------------------------------------------------------------
+ * 特点：持有 MinimalTuple（MinimalTuple = HeapTupleHeader 去掉系统列
+ * 事务信息的紧凑表示）。排序、hash、物化等中间节点用它减少内存占用。
+ *
+ * 巧妙点：init 时把 mslot->tuple 指向内嵌的 minhdr 伪 HeapTuple——把
+ * MinimalTuple 前面"虚构"出 HeapTupleData 头，从而让 slot_deform_heap_tuple
+ * 按堆元组的方式统一解包；store/materialize 时同步维护 minhdr.t_len 与
+ * t_data（指向 mintuple 偏移 MINIMAL_TUPLE_OFFSET 处）。
+ *
+ * 限制：不提供系统列（getsysattr 报错）与事务信息（is_current_xact_tuple
+ * 报错），与 MinimalTuple 的设计目的一致。
+ * ============================================================================
  */
-
 static void
 tts_minimal_init(TupleTableSlot *slot)
 {
@@ -704,9 +793,25 @@ tts_minimal_store_tuple(TupleTableSlot *slot, MinimalTuple mtup, bool shouldFree
 
 
 /*
- * TupleTableSlotOps implementation for BufferHeapTupleTableSlot.
+ * ============================================================================
+ * 【中文注释】缓冲堆元组槽（BufferHeapTupleTableSlot）实现
+ * ----------------------------------------------------------------------------
+ * 特点：扫描节点的"零拷贝"槽——直接指向磁盘缓冲页中的元组，并持有该页的
+ * buffer pin（保证元组内存一直有效）。release 槽内资源时释放 pin。
+ *
+ * clear：先处理 SHOULDFREE（此时必然已物化、无 pin，断言校验），再释放
+ * buffer pin，最后复位各字段。
+ * materialize：把内容物化进槽内存并解除对 buffer 的依赖（拷贝元组后释放
+ * pin，置 InvalidBuffer），随后才置 SHOULDFREE——顺序保证不存在"既持有
+ * pin 又带 SHOULDFREE"的非法中间态（有断言校验该不变量）。
+ * copyslot 优化：若源槽同类型、未物化且有物理元组，直接引用同一 buffer
+ * 内的元组（共享 pin），只把 HeapTupleData 头拷贝进目标槽内嵌的 tupdata
+ * 以延长寿命；否则退化为整拷贝。
+ *
+ * 附加机制（ts_buffer_heap_store_tuple，见下）：同页连续扫描时避免
+ * 释放再获取 pin 的来回开销；transfer_pin 模式把调用方 pin 直接转移给槽。
+ * ============================================================================
  */
-
 static void
 tts_buffer_heap_init(TupleTableSlot *slot)
 {
@@ -993,25 +1098,32 @@ tts_buffer_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple,
 }
 
 /*
- * slot_deform_heap_tuple
- *		Given a TupleTableSlot, extract data from the slot's physical tuple
- *		into its Datum/isnull arrays.  Data is extracted up through the
- *		reqnatts'th column.  If there are insufficient attributes in the given
- *		tuple, then slot_getmissingattrs() is called to populate the
- *		remainder.  If reqnatts is above the number of attributes in the
- *		slot's TupleDesc, an error is raised.
+ * ============================================================================
+ * 【中文注释】slot_deform_heap_tuple —— 增量解包核心（性能关键路径）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把槽内的物理堆元组按需解出到 tts_values/tts_isnull 数组，最多解到
+ *   reqnatts 列。是 heap_deform_tuple 的"增量版"：tts_nvalid 记录已解
+ *   列数，本次只续解缺失部分，绝不重算已解列。
  *
- *		This is essentially an incremental version of heap_deform_tuple:
- *		on each call we extract attributes up to the one needed, without
- *		re-computing information about previously extracted attributes.
- *		slot->tts_nvalid is the number of attributes already extracted.
- *
- * This is marked as always inline, so the different offp for different types
- * of slots gets optimized away.
- *
- * support_cstring should be passed as a const to allow the compiler only
- * emit code during inlining for cstring deforming when it's required.
- * cstrings can exist in MinimalTuples, but not in HeapTuples.
+ * 性能设计（这是执行器最热的路径之一，值得逐条理解）：
+ *   1. 分段解包，每段用不同优化策略：
+ *      - [0, firstNonGuaranteedAttr)：TupleDescFinalize 保证这些列在元组
+ *        里必然存在且为定长按值类型（attcacheoff 有效），循环完全跳过
+ *        NULL 位图与 natts 读取；
+ *      - [firstNonGuaranteed, firstNullAttr)：利用 attcacheoff 缓存偏移
+ *        快速定位定长列，直到第一个 NULL 为止（NULL 之后偏移不再可缓存）；
+ *      - [firstNullAttr, natts)：一般路径，逐列做对齐/取长度/取数据；
+ *      - 之后：属性数不足时调用 slot_getmissingattrs 补齐（缺失列默认
+ *        NULL 或用 TupleDesc 登记的 missing 默认值），reqnatts 超过
+ *        描述符列数则报错。
+ *   2. off 偏移增量保存到调用方传入的 offp（各种槽各持一份），下次续解
+ *      直接接着走；
+ *   3. support_cstring 作为常量参数传入，编译器内联时把 cstring 特判
+ *      （attlen==-1 的 cstring 类型只出现在 MinimalTuple）整体裁剪掉；
+ *   4. first_null_attr / populate_isnull_array 一次性批量处理 NULL 位图，
+ *      避免逐位判断；attcacheoff 只失效到第一个 NULL 之前。
+ * ============================================================================
  */
 static pg_always_inline void
 slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
@@ -1273,6 +1385,24 @@ done:
 	*offp = off;
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】TTSOps* 全局函数指针表 —— 四种槽类型的多态分发表
+ * ----------------------------------------------------------------------------
+ * 每个槽结构体第一成员是 tts_ops 指针，指向下列常量表之一；执行器代码
+ * 通过 slot->tts_ops->xxx() 调用对应实现，实现"面向接口编程"。
+ *
+ * 各表差异速查：
+ *   - 虚拟槽：get_heap_tuple/get_minimal_tuple 为 NULL（不拥有物理元组），
+ *     需要物理元组时走 copy_heap_tuple/copy_minimal_tuple（新造一个）；
+ *   - 堆元组槽：get_heap_tuple 可用，get_minimal_tuple 为 NULL；
+ *   - 最小元组槽：get_minimal_tuple 可用，get_heap_tuple 为 NULL；
+ *   - 缓冲槽：get_heap_tuple 可用（返回指向缓冲页的元组），
+ *     copy_minimal_tuple 可用（即时转换）。
+ * 执行器上层用 ExecFetchSlotHeapTuple/ExecFetchSlotMinimalTuple 统一取数，
+ * 它们根据"表是否提供 get_* 回调"自动决定是直接引用还是拷贝。
+ * ============================================================================
+ */
 const TupleTableSlotOps TTSOpsVirtual = {
 	.base_slot_size = sizeof(VirtualTupleTableSlot),
 	.init = tts_virtual_init,
@@ -1354,15 +1484,27 @@ const TupleTableSlotOps TTSOpsBufferHeapTuple = {
  * ----------------------------------------------------------------
  */
 
-/* --------------------------------
- *		MakeTupleTableSlot
+/*
+ * ============================================================================
+ * 【中文注释】MakeTupleTableSlot —— 槽工厂（核心构造入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   创建空 TupleTableSlot。tupleDesc 非 NULL 时槽描述符固定（TTS_FLAG_FIXED）
+ *   ——values/isnull 数组与槽结构一次性整体分配（减少内存碎片与指针访问
+ *   次数）；tupleDesc 为 NULL 时只分配裸槽，之后用 ExecSetSlotDescriptor
+ *   绑定描述符（数组另行分配）。
  *
- *		Basic routine to make an empty TupleTableSlot of given
- *		TupleTableSlotType. If tupleDesc is specified the slot's descriptor is
- *		fixed for its lifetime, gaining some efficiency. If that's
- *		undesirable, pass NULL.  'flags' allows any of non-TTS_FLAGS_TRANSIENT
- *		flags to be set in tts_flags.
- * --------------------------------
+ * 细节：
+ *   - isnull 数组按 8 的倍数取整分配——populate_isnull_array 以 8 元素为
+ *     单位批量转换 NULL 位图；
+ *   - 传入的 flags 仅允许非瞬时标志（TTS_FLAGS_TRANSIENT 被强制清除）；
+ *   - 固定描述符时 PinTupleDesc 增加引用计数（槽持有引用）；
+ *   - tts_first_nonguaranteed 决定"哪些列保证在元组中存在"（见
+ *     slot_deform_heap_tuple 的快路径），不满足 NOT NULL 约束的场景
+ *     （TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS 未置位）必须置 0 禁用快路径；
+ *   - 最后调用 tts_ops->init 让具体槽类型做初始化（如 minimal 槽构造
+ *     minhdr 伪元组头）。
+ * ============================================================================
  */
 TupleTableSlot *
 MakeTupleTableSlot(TupleDesc tupleDesc,
@@ -1437,11 +1579,15 @@ MakeTupleTableSlot(TupleDesc tupleDesc,
 	return slot;
 }
 
-/* --------------------------------
- *		ExecAllocTableSlot
- *
- *		Create a tuple table slot within a tuple table (which is just a List).
- * --------------------------------
+/*
+ * ============================================================================
+ * 【中文注释】ExecAllocTableSlot —— 把新槽登记进执行器元组表
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   建槽并 append 到 es_tupleTable 链表。凡"属于执行器"的槽都必须走这里
+ *   登记，这样 ExecEndPlan → ExecResetTupleTable 能统一释放所有槽资源
+ *   （pin、描述符引用计数、内存），各节点无需各自维护清理逻辑。
+ * ============================================================================
  */
 TupleTableSlot *
 ExecAllocTableSlot(List **tupleTable, TupleDesc desc,
@@ -1454,14 +1600,18 @@ ExecAllocTableSlot(List **tupleTable, TupleDesc desc,
 	return slot;
 }
 
-/* --------------------------------
- *		ExecResetTupleTable
+/*
+ * ============================================================================
+ * 【中文注释】ExecResetTupleTable —— 元组表统一资源回收
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历元组表：每个槽先 ExecClearTuple 释放其持有的资源（缓冲 pin、
+ *   元组内存），再调用 release 回调，最后释放描述符引用；shouldFree 为
+ *   真时连槽结构本身与链表一起 pfree。
  *
- *		This releases any resources (buffer pins, tupdesc refcounts)
- *		held by the tuple table, and optionally releases the memory
- *		occupied by the tuple table data structure.
- *		It is expected that this routine be called by ExecEndPlan().
- * --------------------------------
+ * 业务场景：ExecEndPlan 查询收尾时调用（shouldFree=true）；并行 worker
+ * 等场合可先只清资源而保留结构复用。
+ * ============================================================================
  */
 void
 ExecResetTupleTable(List *tupleTable,	/* tuple table */
@@ -1501,14 +1651,18 @@ ExecResetTupleTable(List *tupleTable,	/* tuple table */
 		list_free(tupleTable);
 }
 
-/* --------------------------------
- *		MakeSingleTupleTableSlot
+/*
+ * ============================================================================
+ * 【中文注释】MakeSingleTupleTableSlot / ExecDropSingleTupleTableSlot —— 独立槽
+ * ----------------------------------------------------------------------------
+ * 函数作用（成对）：
+ *   MakeSingleTupleTableSlot：为"游离于主元组表之外"的临时用途造一个槽
+ *   （如触发器、SRF 一次性取数）；ExecDropSingleTupleTableSlot 释放之。
  *
- *		This is a convenience routine for operations that need a standalone
- *		TupleTableSlot not gotten from the main executor tuple table.  It makes
- *		a single slot of given TupleTableSlotType and initializes it to use the
- *		given tuple descriptor.
- * --------------------------------
+ * 注意：后者绝不用于登记在元组表里的槽（那里由 ExecResetTupleTable 统一
+ * 处理）。清理顺序与 ExecResetTupleTable 对单个槽的处理严格一致：
+ *   ExecClearTuple → release 回调 → 释放描述符引用 → 释放数组 → pfree 槽。
+ * ============================================================================
  */
 TupleTableSlot *
 MakeSingleTupleTableSlot(TupleDesc tupdesc,
@@ -1551,15 +1705,18 @@ ExecDropSingleTupleTableSlot(TupleTableSlot *slot)
  * ----------------------------------------------------------------
  */
 
-/* --------------------------------
- *		ExecSetSlotDescriptor
+/*
+ * ============================================================================
+ * 【中文注释】ExecSetSlotDescriptor —— 运行时绑定元组描述符
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   给非固定描述符的槽更换/绑定元组描述符。旧描述符引用、values/isnull
+ *   数组一并释放后重建（先 ExecClearTuple 保证槽为空再动结构，避免悬挂
+ *   引用）。
  *
- *		This function is used to set the tuple descriptor associated
- *		with the slot's tuple.  The passed descriptor must have lifespan
- *		at least equal to the slot's.  If it is a reference-counted descriptor
- *		then the reference count is incremented for as long as the slot holds
- *		a reference.
- * --------------------------------
+ * 适用场景：扫描前才知道返回行类型（如通用节点、临时行类型）的节点；
+ * 若类型固定不变应优先用 MakeTupleTableSlot 的固定描述符模式。
+ * ============================================================================
  */
 void
 ExecSetSlotDescriptor(TupleTableSlot *slot, /* slot to change */
@@ -1604,31 +1761,21 @@ ExecSetSlotDescriptor(TupleTableSlot *slot, /* slot to change */
 		MemoryContextAlloc(slot->tts_mcxt, TYPEALIGN(8, tupdesc->natts * sizeof(bool)));
 }
 
-/* --------------------------------
- *		ExecStoreHeapTuple
+/*
+ * ============================================================================
+ * 【中文注释】ExecStoreHeapTuple —— 存入堆元组（堆元组槽专用）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把堆元组放进 TTSOpsHeapTuple 槽。shouldFree 指示槽清空时是否代释放
+ *   （pfree）元组：
+ *   - true：临时构造的元组（投影/触发器结果），槽接管所有权；
+ *   - false：元组属于更下层的执行节点（如子计划的槽），本层只借用指针，
+ *     且必须保证本层在用完前下层不会释放它——不确定时请 heap_copytuple
+ *     拷贝一份再以 true 存入。
  *
- *		This function is used to store an on-the-fly physical tuple into a specified
- *		slot in the tuple table.
- *
- *		tuple:	tuple to store
- *		slot:	TTSOpsHeapTuple type slot to store it in
- *		shouldFree: true if ExecClearTuple should pfree() the tuple
- *					when done with it
- *
- * shouldFree is normally set 'true' for tuples constructed on-the-fly.  But it
- * can be 'false' when the referenced tuple is held in a tuple table slot
- * belonging to a lower-level executor Proc node.  In this case the lower-level
- * slot retains ownership and responsibility for eventually releasing the
- * tuple.  When this method is used, we must be certain that the upper-level
- * Proc node will lose interest in the tuple sooner than the lower-level one
- * does!  If you're not certain, copy the lower-level tuple with heap_copytuple
- * and let the upper-level table slot assume ownership of the copy!
- *
- * Return value is just the passed-in slot pointer.
- *
- * If the target slot is not guaranteed to be TTSOpsHeapTuple type slot, use
- * the, more expensive, ExecForceStoreHeapTuple().
- * --------------------------------
+ * 注意：仅当目标槽保证是堆元组槽时使用；类型不确定的场合用（更贵的）
+ * ExecForceStoreHeapTuple 自动转换。
+ * ============================================================================
  */
 TupleTableSlot *
 ExecStoreHeapTuple(HeapTuple tuple,
@@ -1651,24 +1798,18 @@ ExecStoreHeapTuple(HeapTuple tuple,
 	return slot;
 }
 
-/* --------------------------------
- *		ExecStoreBufferHeapTuple
+/*
+ * ============================================================================
+ * 【中文注释】ExecStoreBufferHeapTuple —— 存入缓冲页内元组（零拷贝）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把磁盘缓冲页里的元组放进 TTSOpsBufferHeapTuple 槽。槽会自行为该页
+ *   获取 buffer pin（调用方已有 pin 时由 tts_buffer_heap_store_tuple 再
+ *   引用一次），pin 一直持有到槽被清空，保证扫描期间页内元组内存有效。
  *
- *		This function is used to store an on-disk physical tuple from a buffer
- *		into a specified slot in the tuple table.
- *
- *		tuple:	tuple to store
- *		slot:	TTSOpsBufferHeapTuple type slot to store it in
- *		buffer: disk buffer if tuple is in a disk page, else InvalidBuffer
- *
- * The tuple table code acquires a pin on the buffer which is held until the
- * slot is cleared, so that the tuple won't go away on us.
- *
- * Return value is just the passed-in slot pointer.
- *
- * If the target slot is not guaranteed to be TTSOpsBufferHeapTuple type slot,
- * use the, more expensive, ExecForceStoreHeapTuple().
- * --------------------------------
+ * 配套 ExecStorePinnedBufferHeapTuple：把调用方已有 pin 直接"转移"给槽
+ * （调用方不得再释放），省一次引用计数往返。
+ * ============================================================================
  */
 TupleTableSlot *
 ExecStoreBufferHeapTuple(HeapTuple tuple,
@@ -1719,10 +1860,14 @@ ExecStorePinnedBufferHeapTuple(HeapTuple tuple,
 }
 
 /*
- * Store a minimal tuple into TTSOpsMinimalTuple type slot.
- *
- * If the target slot is not guaranteed to be TTSOpsMinimalTuple type slot,
- * use the, more expensive, ExecForceStoreMinimalTuple().
+ * ============================================================================
+ * 【中文注释】ExecStoreMinimalTuple —— 存入最小元组（最小元组槽专用）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 MinimalTuple 放进 TTSOpsMinimalTuple 槽；shouldFree 语义同
+ *   ExecStoreHeapTuple（true=槽接管所有权，清槽时释放）。
+ * 目标槽类型不确定时用 ExecForceStoreMinimalTuple。
+ * ============================================================================
  */
 TupleTableSlot *
 ExecStoreMinimalTuple(MinimalTuple mtup,
@@ -1744,8 +1889,20 @@ ExecStoreMinimalTuple(MinimalTuple mtup,
 }
 
 /*
- * Store a HeapTuple into any kind of slot, performing conversion if
- * necessary.
+ * ============================================================================
+ * 【中文注释】ExecForceStoreHeapTuple —— 向任意类型槽存入堆元组（自动转换）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   不关心目标槽类型的通用存元组入口，按槽类型三分支处理：
+ *   - 堆元组槽：直接存（零拷贝）；
+ *   - 缓冲槽：拷贝进槽内存并置 SHOULDFREE（不能破坏"缓冲槽必须持 pin"
+ *     的约束，因此宁可拷贝）；
+ *   - 其他（虚拟/最小）：解包进 values/isnull 数组后 ExecStoreVirtualTuple
+ *     （虚拟形式）；shouldFree 时先物化再释放传入元组，保证槽内容独立。
+ *
+ * 配套 ExecForceStoreMinimalTuple：同构，只是输入换成 MinimalTuple
+ * （最小槽直接存，其他槽走解包→虚拟存储路径）。
+ * ============================================================================
  */
 void
 ExecForceStoreHeapTuple(HeapTuple tuple,
@@ -1819,16 +1976,22 @@ ExecForceStoreMinimalTuple(MinimalTuple mtup,
 	}
 }
 
-/* --------------------------------
- *		ExecStoreVirtualTuple
- *			Mark a slot as containing a virtual tuple.
- *
- * The protocol for loading a slot with virtual tuple data is:
- *		* Call ExecClearTuple to mark the slot empty.
- *		* Store data into the Datum/isnull arrays.
- *		* Call ExecStoreVirtualTuple to mark the slot valid.
- * This is a bit unclean but it avoids one round of data copying.
- * --------------------------------
+/*
+ * ============================================================================
+ * 【中文注释】ExecStoreVirtualTuple —— 虚拟元组装载协议入口
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   标记槽为"已装载虚拟元组"。使用协议（三板斧，避免一次数据拷贝）：
+ *     1) ExecClearTuple 清空槽；
+ *     2) 直接向 tts_values/tts_isnull 数组写入各列值；
+ *     3) 调用本函数置有效位（清除 EMPTY、tts_nvalid = natts）。
+ * 注意本函数只作标记，不拷贝数据；调用方须保证已写全所有列。
+ * 配套 ExecStoreAllNullTuple：把全部列置 NULL 的便捷装载
+ * （清空→数组清零→标记有效，与 ExecClearTuple 的"空槽"语义相反——
+ * 它是"满槽"）。
+ * ExecStoreHeapTupleDatum：把复合类型 Datum（HeapTupleHeader）解包进
+ * 虚拟槽（依赖 datum 存活，物化前不得释放 datum）。
+ * ============================================================================
  */
 TupleTableSlot *
 ExecStoreVirtualTuple(TupleTableSlot *slot)
@@ -1904,23 +2067,20 @@ ExecStoreHeapTupleDatum(Datum data, TupleTableSlot *slot)
 }
 
 /*
- * ExecFetchSlotHeapTuple - fetch HeapTuple representing the slot's content
+ * ============================================================================
+ * 【中文注释】ExecFetchSlotHeapTuple —— 统一取堆元组（所有槽类型）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   以 HeapTuple 形式返回槽内容。两条路径：
+ *   - 槽实现支持 get_heap_tuple（堆/缓冲槽）：直接返回内部元组指针
+ *     （shouldFree=false，只读，仍依赖槽的存储）；
+ *   - 不支持（虚拟/最小槽）：调用 copy_heap_tuple 即时构造一个
+ *     （shouldFree=true，调用方负责释放）。
  *
- * The returned HeapTuple represents the slot's content as closely as
- * possible.
- *
- * If materialize is true, the contents of the slots will be made independent
- * from the underlying storage (i.e. all buffer pins are released, memory is
- * allocated in the slot's context).
- *
- * If shouldFree is not-NULL it'll be set to true if the returned tuple has
- * been allocated in the calling memory context, and must be freed by the
- * caller (via explicit pfree() or a memory context reset).
- *
- * NB: If materialize is true, modifications of the returned tuple are
- * allowed. But it depends on the type of the slot whether such modifications
- * will also affect the slot's contents. While that is not the nicest
- * behaviour, all such modifications are in the process of being removed.
+ * materialize 参数：为真时先把槽内容物化到槽自身上下文（释放 buffer pin、
+ * 元组归槽所有），保证返回元组及槽内容在后续任意使用中安全——代价是
+ * 一次拷贝。
+ * ============================================================================
  */
 HeapTuple
 ExecFetchSlotHeapTuple(TupleTableSlot *slot, bool materialize, bool *shouldFree)
@@ -1949,26 +2109,18 @@ ExecFetchSlotHeapTuple(TupleTableSlot *slot, bool materialize, bool *shouldFree)
 	}
 }
 
-/* --------------------------------
- *		ExecFetchSlotMinimalTuple
- *			Fetch the slot's minimal physical tuple.
- *
- *		If the given tuple table slot can hold a minimal tuple, indicated by a
- *		non-NULL get_minimal_tuple callback, the function returns the minimal
- *		tuple returned by that callback. It assumes that the minimal tuple
- *		returned by the callback is "owned" by the slot i.e. the slot is
- *		responsible for freeing the memory consumed by the tuple. Hence it sets
- *		*shouldFree to false, indicating that the caller should not free the
- *		memory consumed by the minimal tuple. In this case the returned minimal
- *		tuple should be considered as read-only.
- *
- *		If that callback is not supported, it calls copy_minimal_tuple callback
- *		which is expected to return a copy of minimal tuple representing the
- *		contents of the slot. In this case *shouldFree is set to true,
- *		indicating the caller that it should free the memory consumed by the
- *		minimal tuple. In this case the returned minimal tuple may be written
- *		up.
- * --------------------------------
+/*
+ * ============================================================================
+ * 【中文注释】ExecFetchSlotMinimalTuple —— 统一取最小元组（所有槽类型）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   以 MinimalTuple 形式返回槽内容。支持 get_minimal_tuple 的槽（最小
+ *   槽）直接返回其持有的最小元组（shouldFree=false，只读）；否则调用
+ *   copy_minimal_tuple 构造拷贝（shouldFree=true，可写）。
+ * 配套 ExecFetchSlotHeapTupleDatum：把槽内容转成复合类型 Datum
+ * （heap_copy_tuple_as_datum 会顺带做行类型"福佑"，结果总是全新 palloc
+ * 在调用方上下文，使用后需自行释放）。
+ * ============================================================================
  */
 MinimalTuple
 ExecFetchSlotMinimalTuple(TupleTableSlot *slot,
@@ -2027,11 +2179,14 @@ ExecFetchSlotHeapTupleDatum(TupleTableSlot *slot)
  * ----------------------------------------------------------------
  */
 
-/* ----------------
- *		ExecInitResultTypeTL
- *
- *		Initialize result type, using the plan node's targetlist.
- * ----------------
+/*
+ * ============================================================================
+ * 【中文注释】ExecInitResultTypeTL —— 由 targetlist 推导结果元组描述符
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   用计划节点 targetlist 生成结果元组描述符（ExecTypeFromTL），暂存到
+ *   ps_ResultTupleDesc。后续 ExecInitResultSlot 用它创建结果槽。
+ * ============================================================================
  */
 void
 ExecInitResultTypeTL(PlanState *planstate)
@@ -2050,12 +2205,20 @@ ExecInitResultTypeTL(PlanState *planstate)
  * --------------------------------
  */
 
-/* ----------------
- *		ExecInitResultTupleSlotTL
+/*
+ * ============================================================================
+ * 【中文注释】ExecInitResultSlot / ExecInitResultTupleSlotTL —— 结果槽初始化
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   ExecInitResultSlot：按先前算好的 ps_ResultTupleDesc 在元组表登记一个
+ *   结果槽（tts_ops 决定槽类型），并缓存槽类型到 resultops 字段（配合
+ *   ExecGetResultSlotOps 供上层查询，如 append 求公共槽类型）；
+ *   ExecInitResultTupleSlotTL：一步到位版——先 ExecInitResultTypeTL 再
+ *   ExecInitResultSlot。
  *
- *		Initialize result tuple slot, using the tuple descriptor previously
- *		computed with ExecInitResultTypeTL().
- * ----------------
+ * 业务场景：几乎所有执行节点初始化时都要"准备输出槽"，两函数是节点
+ * 初始化代码的标准开场白。
+ * ============================================================================
  */
 void
 ExecInitResultSlot(PlanState *planstate, const TupleTableSlotOps *tts_ops)
@@ -2085,9 +2248,15 @@ ExecInitResultTupleSlotTL(PlanState *planstate,
 	ExecInitResultSlot(planstate, tts_ops);
 }
 
-/* ----------------
- *		ExecInitScanTupleSlot
- * ----------------
+/*
+ * ============================================================================
+ * 【中文注释】ExecInitScanTupleSlot —— 扫描元组槽初始化
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   为扫描类节点创建 ss_ScanTupleSlot（存放扫描到的原始行）并登记进元组
+ *   表；tupledesc 固定槽的行类型，同时记录扫描槽类型到 scanops 字段
+ *   （供上层 ExecGetScanSlotOps 等查询）。
+ * ============================================================================
  */
 void
 ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
@@ -2102,13 +2271,16 @@ ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
 	scanstate->ps.scanopsset = true;
 }
 
-/* ----------------
- *		ExecInitExtraTupleSlot
- *
- * Return a newly created slot. If tupledesc is non-NULL the slot will have
- * that as its fixed tupledesc. Otherwise the caller needs to use
- * ExecSetSlotDescriptor() to set the descriptor before use.
- * ----------------
+/*
+ * ============================================================================
+ * 【中文注释】ExecInitExtraTupleSlot —— 特殊用途槽
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   创建登记在元组表里的"杂项"槽（无固定描述符或类型各异的中间槽）。
+ *   tupledesc 为 NULL 时调用方须先用 ExecSetSlotDescriptor 绑定。
+ * 配套 ExecInitNullTupleSlot：直接造一个"全 NULL 元组"的槽——外连接
+ * 补空行时用它充当"缺失一侧"的输入行。
+ * ============================================================================
  */
 TupleTableSlot *
 ExecInitExtraTupleSlot(EState *estate,
@@ -2141,11 +2313,19 @@ ExecInitNullTupleSlot(EState *estate, TupleDesc tupType,
  */
 
 /*
- * Fill in missing values for a TupleTableSlot.
+ * ============================================================================
+ * 【中文注释】slot_getmissingattrs —— 补齐缺失列（默认值或 NULL）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   物理元组的列数可能少于描述符（表结构变更/旧元组），把
+ *   [startAttNum, lastAttNum) 区间的列填上：描述符登记了缺失默认值
+ *   （constr->missing，即 ALTER TABLE ... ADD COLUMN ... DEFAULT 的优化）
+ *   则用默认值，否则填 NULL。列号越界时报错。
  *
- * This is only exposed because it's needed for JIT compiled tuple
- * deforming. That exception aside, there should be no callers outside of this
- * file.
+ * 暴露原因：JIT 编译的元组解包需要直接调用它；除此之外只在本文件使用。
+ * 配套 slot_getsomeattrs_int：slot_getsomeattrs 的 JIT 导出包装
+ * （保持可尾调用优化的形状，除委托外不放任何代码）。
+ * ============================================================================
  */
 void
 slot_getmissingattrs(TupleTableSlot *slot, int startAttNum, int lastAttNum)
@@ -2199,17 +2379,23 @@ slot_getsomeattrs_int(TupleTableSlot *slot, int attnum)
 	 */
 }
 
-/* ----------------------------------------------------------------
- *		ExecTypeFromTL
+/*
+ * ============================================================================
+ * 【中文注释】ExecTypeFromTL / ExecCleanTypeFromTL —— 由 targetlist 造描述符
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从（解析/计划阶段的）targetlist 生成结果元组描述符：逐 TargetEntry
+ *   取列名/类型/typmod/排序规则填入模板描述符，再 TupleDescFinalize
+ *   固化（预计算 attcacheoff 等解包加速数据）。
  *
- *		Generate a tuple descriptor for the result tuple of a targetlist.
- *		(A parse/plan tlist must be passed, not an ExprState tlist.)
- *		Note that resjunk columns, if any, are included in the result.
+ * 差异：ExecTypeFromTL 保留 resjunk 列（内部传递用的过滤/排序键列），
+ * ExecCleanTypeFromTL 剔除它们（对外可见的结果行）。
+ * 共同实现 ExecTypeFromTLInternal 以 skipjunk 区分。
  *
- *		Currently there are about 4 different places where we create
- *		TupleDescriptors.  They should all be merged, or perhaps
- *		be rewritten to call BuildDesc().
- * ----------------------------------------------------------------
+ * 相关：ExecTypeFromExprList 处理"裸表达式列表"（无名字，如 SRF
+ * 结果）；ExecTypeSetColNames 给尚未 bless 的 RECORD 描述符补列名
+ * （别名列表驱动，跳过空名与已删除列）。
+ * ============================================================================
  */
 TupleDesc
 ExecTypeFromTL(List *targetList)
@@ -2341,15 +2527,22 @@ ExecTypeSetColNames(TupleDesc typeInfo, List *namesList)
 }
 
 /*
- * BlessTupleDesc - make a completed tuple descriptor useful for SRFs
+ * ============================================================================
+ * 【中文注释】BlessTupleDesc —— "福佑"描述符：给 RECORD 类型正式登记
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   保证用该描述符构造的复合类型 Datum 携带合法的类型信息。来自系统表
+ *   （relcache）的描述符天然合法；临时制造的 RECORD 描述符（tdtypmod<0）
+ *   则调用 assign_record_type_typmod 向 typcache 注册一个正式 typmod，
+ *   之后所有用它的复合 Datum 都能被正确解析（SRF 返回记录行必需）。
+ * 前置条件：描述符已 TupleDescFinalize。
  *
- * Rowtype Datums returned by a function must contain valid type information.
- * This happens "for free" if the tupdesc came from a relcache entry, but
- * not if we have manufactured a tupdesc for a transient RECORD datatype.
- * In that case we have to notify typcache.c of the existence of the type.
- *
- * TupleDescFinalize() must be called on the TupleDesc before calling this
- * function.
+ * 后续函数（TupleDescGetAttInMetadata / BuildTupleFromCStrings）：为
+ * "从 C 字符串批量构造元组"提供支持——前者预取各列的输入函数
+ * （"in"函数）、IO 参数与 typmod；后者把字符串数组逐个调用输入函数
+ * 转成 Datum（NULL 字符串=该列 NULL，但函数仍被调用以支持域约束），
+ * 再 heap_form_tuple 成形。
+ * ============================================================================
  */
 TupleDesc
 BlessTupleDesc(TupleDesc tupdesc)
@@ -2365,9 +2558,14 @@ BlessTupleDesc(TupleDesc tupdesc)
 }
 
 /*
- * TupleDescGetAttInMetadata - Build an AttInMetadata structure based on the
- * supplied TupleDesc. AttInMetadata can be used in conjunction with C strings
- * to produce a properly formed tuple.
+ * ============================================================================
+ * 【中文注释】TupleDescGetAttInMetadata —— 预取列输入信息
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   基于描述符准备 AttInMetadata：福佑描述符 + 为每列预取"输入函数
+ *   （text 转类型的 in 函数）"、IO 参数与 typmod，供
+ *   BuildTupleFromCStrings 批量建元组复用（SRF 返回多行时避免重复查找）。
+ * ============================================================================
  */
 AttInMetadata *
 TupleDescGetAttInMetadata(TupleDesc tupdesc)
@@ -2473,39 +2671,20 @@ BuildTupleFromCStrings(AttInMetadata *attinmeta, char **values)
 }
 
 /*
- * HeapTupleHeaderGetDatum - convert a HeapTupleHeader pointer to a Datum.
+ * ============================================================================
+ * 【中文注释】HeapTupleHeaderGetDatum —— HeapTupleHeader 转复合类型 Datum
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 heap_form_tuple 刚造好的元组头转成复合类型 Datum（供函数返回
+ *  RECORD 行使用）。不允许用于磁盘元组；描述符须已福佑。
  *
- * This must *not* get applied to an on-disk tuple; the tuple should be
- * freshly made by heap_form_tuple or some wrapper routine for it (such as
- * BuildTupleFromCStrings).  Be sure also that the tupledesc used to build
- * the tuple has a properly "blessed" rowtype.
- *
- * Formerly this was a macro equivalent to PointerGetDatum, relying on the
- * fact that heap_form_tuple fills in the appropriate tuple header fields
- * for a composite Datum.  However, we now require that composite Datums not
- * contain any external TOAST pointers.  We do not want heap_form_tuple itself
- * to enforce that; more specifically, the rule applies only to actual Datums
- * and not to HeapTuple structures.  Therefore, HeapTupleHeaderGetDatum is
- * now a function that detects whether there are externally-toasted fields
- * and constructs a new tuple with inlined fields if so.  We still need
- * heap_form_tuple to insert the Datum header fields, because otherwise this
- * code would have no way to obtain a tupledesc for the tuple.
- *
- * Note that if we do build a new tuple, it's palloc'd in the current
- * memory context.  Beware of code that changes context between the initial
- * heap_form_tuple/etc call and calling HeapTuple(Header)GetDatum.
- *
- * For performance-critical callers, it could be worthwhile to take extra
- * steps to ensure that there aren't TOAST pointers in the output of
- * heap_form_tuple to begin with.  It's likely however that the costs of the
- * typcache lookup and tuple disassembly/reassembly are swamped by TOAST
- * dereference costs, so that the benefits of such extra effort would be
- * minimal.
- *
- * XXX it would likely be better to create wrapper functions that produce
- * a composite Datum from the field values in one step.  However, there's
- * enough code using the existing APIs that we couldn't get rid of this
- * hack anytime soon.
+ * 实现要点：
+ *   复合 Datum 不允许含外部 TOAST 指针（行值序列化时无法解引用），因此
+ *   检测到有外部 toast 指针时（HeapTupleHeaderHasExternal），必须查回
+ *   行类型描述符并 toast_flatten_tuple_to_datum 把外联大字段内联展开成
+ *   新元组再返回。无外部指针则直接指针转 Datum 返回。
+ * 注意：新元组分配在调用时的当前内存上下文，调用方不能中途切换上下文。
+ * ============================================================================
  */
 Datum
 HeapTupleHeaderGetDatum(HeapTupleHeader tuple)
@@ -2533,10 +2712,21 @@ HeapTupleHeaderGetDatum(HeapTupleHeader tuple)
 
 
 /*
- * Functions for sending tuples to the frontend (or other specified destination)
- * as though it is a SELECT result. These are used by utility commands that
- * need to project directly to the destination and don't need or want full
- * table function capability. Currently used by EXPLAIN and SHOW ALL.
+ * ============================================================================
+ * 【中文注释】begin_tup_output_tupdesc / do_tup_output / do_text_output_multiline
+ * / end_tup_output —— 面向目标接收者的直通输出
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   给不需要完整执行器、只需把行直接投影给 DestReceiver 的命令（EXPLAIN、
+ *   SHOW ALL）提供极简输出通道：
+ *   - begin_tup_output_tupdesc：建一个临时槽并调用 rStartup 启动接收者；
+ *   - do_tup_output：把 Datum/isnull 数组装进临时虚拟槽后
+ *     dest->receiveSlot 送出；
+ *   - do_text_output_multiline：单 TEXT 列输出，按换行拆段（EXPLAIN 文本
+ *     行适配）；
+ *   - end_tup_output：rShutdown 关停接收者（接收者自身销毁由调用方负责）
+ *     并释放临时槽。
+ * ============================================================================
  */
 TupOutputState *
 begin_tup_output_tupdesc(DestReceiver *dest,

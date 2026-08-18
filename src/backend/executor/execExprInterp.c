@@ -54,6 +54,60 @@
  *
  *-------------------------------------------------------------------------
  */
+
+/*
+ * ============================================================================
+ * 【中文注释】execExprInterp.c —— 表达式 step 列表的解释执行引擎（表达式执行核心）
+ * ----------------------------------------------------------------------------
+ * 文件作用：
+ *   本文件是 PostgreSQL 表达式执行的"运行时"核心：由 execExpr.c 编译生成的
+ *   ExprEvalStep 步列表（存于 ExprState->steps）在这里被逐条解释执行，
+ *   ExecInterpExpr() 是主解释器入口，文件中实现了全部 EEOP_* opcode 的求值逻辑。
+ *   与 execExpr.c 的分工：execExpr.c 负责"编译"——把表达式树展开成平坦的
+ *   step 数组并做各种优化决策；本文件负责"执行"——逐 step 求值，并把复杂
+ *   指令外包给本文件后部的 ExecEval* 辅助函数。二者共同构成 ExprState 的
+ *   完整生命周期。
+ *
+ * 设计思想：
+ *   1. 编译型解释器（flat step list）：
+ *      表达式求值不再采用递归树遍历，而是先把表达式树压平为顺序的
+ *      ExprEvalStep 数组（每个 step 对应一个 opcode 与执行数据 op->d.*）。
+ *      解释器用大 switch（或 JIT 编译后的原生代码）逐条求值，控制流
+ *      （AND/OR 短路、CASE 分支、ON ERROR 跳转等）由 EEO_JUMP/EEO_NEXT 跳转
+ *      指令实现。平坦布局避免了递归调用的开销，同时该布局对 JIT 友好——
+ *      LLVM 可以直接把它翻译为原生机器码。
+ *   2. 两种派发方式（性能要点）：
+ *      - 直接线程化（direct threading，gcc/clang 的计算 goto 扩展）：执行前
+ *        由 ExecReadyInterpretedExpr 把每个 step 的 opcode 域替换为对应实现
+ *        代码块的地址，用 "computed goto" 完成跳转；分支预测更好、跳转更少，
+ *        是已知最快的解释执行方式之一。
+ *      - 开关线程化（switch threading）：标准 C 的 switch 语句派发，兼容所有
+ *        编译器，且编译器能警告遗漏的 opcode 实现。
+ *      两种方式通过本文件的 EEO_* 宏体系（EEO_CASE / EEO_DISPATCH / EEO_NEXT /
+ *      EEO_JUMP）完全屏蔽差异，EEO_SWITCH 在开关方式下是 switch、在直接线程
+ *      方式下为空。
+ *   3. 执行性能细节：
+ *      - step 内嵌常量、槽指针、上下文指针、fcinfo 等，避免运行时查找；
+ *      - 每个 step 的结果写入 op->resvalue/op->resnull（常见情形就是
+ *        state->resvalue/state->resnull），实现"寄存器式"结果传递；
+ *      - 取值用 fetch_att 式的数组直取（配合 FETCHSOME 预变形），避开慢路径；
+ *      - 函数调用是超级热路径，因此拆出 EEOP_FUNCEXPR_STRICT/_1/_2/_FUSAGE
+ *        等专门 opcode，按"是否严格、参数个数、是否统计函数调用"分派；
+ *      - 复杂或罕见指令（数组、JSON、XML、聚合转移等）不内联，改为调用
+ *        本文件后部的导出辅助函数（非 static）——它们与 JIT 共享：JIT 编译器
+ *        直接生成对这些函数的调用，这就是它们被导出的原因。
+ *   4. 快速路径（ExecJust*）：对极简单的表达式（如直接的 Var 引用、Const、
+ *      CASE_TESTVAL+严格函数等），ExecReadyInterpretedExpr 会按 steps_len 与
+ *      opcode 模式匹配专用的 ExecJust* 函数，省去解释器启动开销。
+ *   5. 有效性校验：ExecInterpExprStillValid / CheckExprStillValid 在计划被
+ *      缓存复用、schema 可能已变化时，于首次执行前校验 Var 引用的属性类型
+ *      仍与槽的元组描述符匹配（查表/切换执行函数只做一次），防止类型错乱；
+ *      校验通过后才把 evalfunc 切换为真正的执行函数。
+ *   6. 与 JIT 的协作：exprjit.c（LLVM 编译）直接复制本文件解释器骨架来生成
+ *      原生代码，因此本文件的函数布局、EEO 宏体系被刻意保持稳定，修改时
+ *      需同步考虑 execExprJit.c。
+ * ============================================================================
+ */
 #include "postgres.h"
 
 #include "access/heaptoast.h"
@@ -246,7 +300,35 @@ typedef struct ScalarArrayOpExprHashTable
 #include "lib/simplehash.h"
 
 /*
- * Prepare ExprState for interpreted execution.
+ * ============================================================================
+ * 【中文注释】ExecReadyInterpretedExpr —— 为解释执行准备 ExprState（出口函数）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对外出口：给定编译完成的 ExprState（其中含 steps 数组），完成解释执行
+ *   的全部准备：初始化派发表、挂上"先用校验再执行"的 evalfunc、为极简单
+ *   表达式选择 ExecJust* 快速路径、并将 opcode 替换为代码块地址（直接线程
+ *   方式）。execExpr.c 的 ExecInitExprRec 编译完步骤后会调用本函数收尾。
+ *
+ * 参数：
+ *   state - 已编译好的 ExprState，其后 steps_len >= 1 且最后一步必须是
+ *           EEOP_DONE_RETURN（返回结果）或 EEOP_DONE_NO_RETURN（无结果）。
+ *
+ * 设计思想：
+ *   1. 校验与防重：断言 step 列表非空且以 DONE 步骤收尾；EEO_FLAG_INTERPRETER_
+ *      INITIALIZED 标志防止重复初始化（未来若出现依赖解释执行的其它求值方法
+ *      也不至于重复做）。
+ *   2. "先校验后执行"的延迟接线：把 state->evalfunc 初始化为
+ *      ExecInterpExprStillValid——第一次真正执行时调用它做 schema 兼容性检查
+ *      （计划可能因 DDL 而过期），成功后就原地替换为真正的执行函数
+ *      （evalfunc_private），检查只做一次。
+ *   3. 快速路径选择：按 steps_len（2~5）与 opcode 模式组合匹配 ExecJust* 专用
+ *      函数（如 FETCHSOME+INNER_VAR 两个 step 直接匹配 ExecJustInnerVar），
+ *      避免小表达式也要走完整解释器的启动开销；没有匹配则走通用解释器。
+ *   4. 直接线程化（仅计算 goto 可用时）：把每一步 op->opcode 原地替换为对应
+ *      CASE_* 代码块的地址（EEO_OPCODE 宏从 dispatch_table 查地址），置
+ *      EEO_FLAG_DIRECT_THREADED 标志，此后 ExecEvalStepOp() 需要靠反查表
+ *      reverse_dispatch_table 才能还原 opcode。
+ * ============================================================================
  */
 void
 ExecReadyInterpretedExpr(ExprState *state)
@@ -458,13 +540,49 @@ ExecReadyInterpretedExpr(ExprState *state)
 
 
 /*
- * Evaluate expression identified by "state" in the execution context
- * given by "econtext".  *isnull is set to the is-null flag for the result,
- * and the Datum value is the function result.
+ * ============================================================================
+ * 【中文注释】ExecInterpExpr —— 解释执行表达式 step 列表（核心解释器）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   主解释器：从 state->steps[0] 开始逐条解释执行 ExprEvalStep，直至遇到
+ *   EEOP_DONE_RETURN 为止，把最终结果写入 *isnull 并作为 Datum 返回。每个
+ *   EEOP_* opcode 对应 `EEO_CASE` 中的一个代码块；块内通过 EEO_NEXT()（下一
+ *   step）或 EEO_JUMP()（跳转到指定 step）推进控制流。这是全库最热的执行
+ *   路径之一：任何 SQL 表达式的求值最终都会汇聚到这。
  *
- * As a special case, return the dispatch table's address if state is NULL.
- * This is used by ExecInitInterpreter to set up the dispatch_table global.
- * (Only applies when EEO_USE_COMPUTED_GOTO is defined.)
+ * 参数：
+ *   state   - ExprState：steps 数组、共享结果寄存器 resvalue/resnull、
+ *             resultslot（结果槽）、flags 等。
+ *   econtext- ExprContext：提供 innertuple/outertuple/scantuple/oldtuple/
+ *             newtuple 五个输入元组槽、参数、caseValue/domainValue 等。
+ *   isnull  - 输出：结果是否为 NULL（EEOP_DONE_NO_RETURN 时可为 NULL 指针）。
+ *
+ * 返回值：
+ *   Datum - 表达式的值（DDONE_NO_RETURN 时恒为 (Datum) 0）。
+ *
+ * 设计思想：
+ *   1. 单一 dispatch 循环：开头把五个输入槽指针缓存在局部变量中（相当于
+ *      寄存器，避免每次访存），然后进入 EEO_SWITCH 大循环。直接线程化时
+ *      每个 step 的 opcode 已被替换为代码块地址，EEO_DISPATCH 用计算 goto
+ *      直达目标块；开关方式则回到 starteval 重新 switch。两种方式共享同一
+ *      套 CASE 代码，因此逻辑只写一遍。
+ *   2. op 与结果寄存器约定：op 指向当前 step；每个 step 执行后把结果写到
+ *      *op->resvalue 与 *op->resnull（通常即 state->resvalue/state->resnull，
+ *      编译期按需重定向到临时槽），配合 EEO_NEXT 实现"寄存器式"流水线。
+ *   3. 宏体系语义：
+ *      EEO_NEXT()  = op++ 然后派发（顺序执行下一步）；
+ *      EEO_JUMP(n) = op = &state->steps[n] 然后派发（控制流跳转，供短路
+ *                    求值、CASE 分支、ON ERROR 等使用，跳转目标由编译期
+ *                    算好，无需运行时解释）；
+ *      dispatch_table（静态数组）与 switch case 顺序必须与 execExpr.h 中
+ *      的 enum ExprEvalOp 完全一致（StaticAssertDecl 保证数组长度匹配）。
+ *   4. 特例：state == NULL 时返回 dispatch_table 的地址——这是
+ *      ExecInitInterpreter 在直接线程方式下获取派发表数据的暗号，绝不
+ *      会被当作正常求值调用。
+ *   5. 简单指令尽量内联手写汇编级代码；复杂指令（数组/JSON/聚合等）则
+ *      EEO_CASE 里只写一行调用，委托给本文件后部的 ExecEval* 函数，这些
+ *      函数同样被 JIT 直接调用。
+ * ============================================================================
  */
 static Datum
 ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
@@ -629,6 +747,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 
 	EEO_SWITCH()
 	{
+		/* 【中文注释】EEOP_DONE_RETURN —— 正常收尾：把 state 的结果寄存器
+		 * （resvalue/resnull，由前面的 step 写入）原样返回给调用方。
+		 * EEOP_DONE_NO_RETURN —— 无结果收尾：仅执行副作用（如把值写入
+		 * 结果槽的 Assign 系列），isnull 可为 NULL，恒返回 0。 */
 		EEO_CASE(EEOP_DONE_RETURN)
 		{
 			*isnull = state->resnull;
@@ -641,6 +763,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			return (Datum) 0;
 		}
 
+		/* 【中文注释】EEOP_*_FETCHSOME —— 惰性元组变形：确保取自
+		 * inner/outer/scan/old/new 槽的前 last_var 列已被变形到槽的
+		 * tts_values/tts_isnull 数组中。slot_getsomeattrs 是廉价调用
+		 * （已变形过的部分直接返回），compiler 只对需要的列发出该 step，
+		 * 后续 EEOP_*_VAR 才能安全直取数组元素。CheckOpSlotCompatibility
+		 * 顺带校验槽的实现类型与编译期预期一致。 */
 		EEO_CASE(EEOP_INNER_FETCHSOME)
 		{
 			CheckOpSlotCompatibility(op, innerslot);
@@ -686,6 +814,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_(INNER|OUTER|SCAN|OLD|NEW)_VAR —— 取引用元组槽的
+		 * 普通用户列。依赖前面 FETCHSOME step 已把该列变形好（Assert
+		 * attnum < tts_nvalid 验证），直接从 tts_values/tts_isnull 数组
+		 * 拷贝到结果寄存器——没有 slot_getattr 的边界/类型检查，速度最快。
+		 * 五个变体仅槽来源不同：inner=连接内表、outer=外表、scan=当前
+		 * 扫描关系（单表查询的缺省来源）、old/new=触发器的 OLD/NEW 行。 */
 		EEO_CASE(EEOP_INNER_VAR)
 		{
 			int			attnum = op->d.var.attnum;
@@ -755,6 +889,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_*_SYSVAR —— 系统列（ctid/xmin 等）取值。系统列不
+		 * 在 FETCHSOME 变形范围，必须走 ExecEvalSysVar 经 slot_getsysattr
+		 * 计算（如 ctid 需要从行指针构造）。五个变体对应五个来源槽。 */
 		EEO_CASE(EEOP_INNER_SYSVAR)
 		{
 			ExecEvalSysVar(state, op, econtext, innerslot);
@@ -793,6 +930,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_ASSIGN_*_VAR —— 把引用槽的某一列直接写入结果槽的
+		 * resultnum 列（零拷贝 Datum 搬运）。用于 SELECT 目标列直通、INSERT
+		 * 时把输入行按位写入新行等场景；编译期已做过类型校验，这里不再
+		 * 检查（仅 Assert 下标范围）。EEOP_ASSIGN_TMP / _MAKE_RO 则把当前
+		 * 结果寄存器（临时值）写入结果槽，_MAKE_RO 额外把可变对象转只读
+		 * （后续可能被多路复用读取）。 */
 		EEO_CASE(EEOP_ASSIGN_INNER_VAR)
 		{
 			int			resultnum = op->d.assign_var.resultnum;
@@ -904,6 +1047,8 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_CONST —— 常量：编译期已把值/是否为 NULL 内嵌进 step，
+		 * 直接拷贝到结果寄存器，无任何运行时计算。 */
 		EEO_CASE(EEOP_CONST)
 		{
 			*op->resnull = op->d.constval.isnull;
@@ -913,19 +1058,21 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		}
 
 		/*
-		 * Function-call implementations. Arguments have previously been
-		 * evaluated directly into fcinfo->args.
-		 *
-		 * As both STRICT checks and function-usage are noticeable performance
-		 * wise, and function calls are a very hot-path (they also back
-		 * operators!), it's worth having so many separate opcodes.
-		 *
-		 * Note: the reason for using a temporary variable "d", here and in
-		 * other places, is that some compilers think "*op->resvalue = f();"
-		 * requires them to evaluate op->resvalue into a register before
-		 * calling f(), just in case f() is able to modify op->resvalue
-		 * somehow.  The extra line of code can save a useless register spill
-		 * and reload across the function call.
+		 * 【中文注释】函数调用族（EEOP_FUNCEXPR / _STRICT / _STRICT_1 /
+		 * _STRICT_2 / _FUSAGE / _STRICT_FUSAGE）：实参在编译期已被求值并
+		 * 直接写入 fcinfo->args，这里只做"调函数+收结果"。由于函数调用是
+		 * 最热的热路径（运算符底层也是函数），特意按"是否严格、参数个数
+		 * （1/2/多）、是否统计调用次数（pg_stat_function_calls 等）"拆成
+		 * 六个 opcode，每种形态的手写代码都是最短路径：
+		 * - 非严格：无条件调 fn_addr；
+		 * - 严格：先扫参，遇 NULL 直接短路为 NULL 结果（goto strictfail）
+		 *   不调用函数（严格函数定义：输入含 NULL 则结果恒 NULL）；
+		 * - _FUSAGE：包 pgstat_init/end_function_usage 统计函数调用，
+		 *   不常见，不值得内联。
+		 * 注：这里用临时变量 `d` 接返回值而非直接 *op->resvalue = fn()——
+		 * 某些编译器会误以为 fn() 可能改动 op->resvalue，
+		 * 为保险把 op->resvalue 先压入寄存器再做函数调用，多一行代码可
+		 * 省掉一次无用的寄存器溢出/重载。
 		 */
 		EEO_CASE(EEOP_FUNCEXPR)
 		{
@@ -940,7 +1087,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* strict function call with more than two arguments */
+		/* 严格函数，参数多于 2 个：逐参查 NULL，任一为 NULL 即短路返回 NULL */
 		EEO_CASE(EEOP_FUNCEXPR_STRICT)
 		{
 			FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
@@ -968,7 +1115,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* strict function call with one argument */
+		/* 严格函数，恰好 1 个参数：常见形态（如 abs(x)、upper(s)），单次判空 */
 		EEO_CASE(EEOP_FUNCEXPR_STRICT_1)
 		{
 			FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
@@ -992,7 +1139,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* strict function call with two arguments */
+		/* 严格函数，恰好 2 个参数：最常见形态（如 x = y），二元判空 */
 		EEO_CASE(EEOP_FUNCEXPR_STRICT_2)
 		{
 			FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
@@ -1016,6 +1163,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_FUNCEXPR_FUSAGE / _STRICT_FUSAGE —— 需要 pg_stat
+		 * 函数调用统计的版本（如"函数调用次数/耗时"采样）。不常见，直接
+		 * 委托 out-of-line 实现，避免污染热路径。 */
 		EEO_CASE(EEOP_FUNCEXPR_FUSAGE)
 		{
 			/* not common enough to inline */
@@ -1033,14 +1183,19 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		}
 
 		/*
-		 * If any of its clauses is FALSE, an AND's result is FALSE regardless
-		 * of the states of the rest of the clauses, so we can stop evaluating
-		 * and return FALSE immediately.  If none are FALSE and one or more is
-		 * NULL, we return NULL; otherwise we return TRUE.  This makes sense
-		 * when you interpret NULL as "don't know": perhaps one of the "don't
-		 * knows" would have been FALSE if we'd known its value.  Only when
-		 * all the inputs are known to be TRUE can we state confidently that
-		 * the AND's result is TRUE.
+		 * 【中文注释】EEOP_BOOL_AND_STEP* —— AND 三段式求值（布尔短路
+		 * 语义）：只要有一个子句为 FALSE，整个 AND 恒为 FALSE，可立即
+		 * 短路跳转到 jumpdone；否则若有任意子句为 NULL 则结果 NULL
+		 * （把 NULL 解释为"未知"：未知可能本应是 FALSE）；只有全部子句
+		 * 都确知为 TRUE 时结果才为 TRUE。三段分工：
+		 * - _STEP_FIRST：清空 anynull 标志（每组 AND 的第一步专用），
+		 *   然后落入 _STEP；
+		 * - _STEP：子句结果在结果寄存器中：NULL 则置 anynull；FALSE 则
+		 *   结果寄存器已是 FALSE，可以提前 EEO_JUMP 到 jumpdone 收工；
+		 * - _STEP_LAST：末位子句，无须跳转（跳转目标与自然结束相同，
+		 *   反而更贵）：FALSE 直接收尾；TRUE 且 anynull 则改写结果为
+		 *   NULL；全 TRUE 则保持 TRUE。结果布尔值最初由编译器预置为
+		 *   TRUE（AND 的恒真初值）。
 		 */
 		EEO_CASE(EEOP_BOOL_AND_STEP_FIRST)
 		{
@@ -1100,14 +1255,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		}
 
 		/*
-		 * If any of its clauses is TRUE, an OR's result is TRUE regardless of
-		 * the states of the rest of the clauses, so we can stop evaluating
-		 * and return TRUE immediately.  If none are TRUE and one or more is
-		 * NULL, we return NULL; otherwise we return FALSE.  This makes sense
-		 * when you interpret NULL as "don't know": perhaps one of the "don't
-		 * knows" would have been TRUE if we'd known its value.  Only when all
-		 * the inputs are known to be FALSE can we state confidently that the
-		 * OR's result is FALSE.
+		 * 【中文注释】EEOP_BOOL_OR_STEP* —— OR 三段式求值，与 AND 完全
+		 * 对偶：只要有一个子句为 TRUE 即短路返回 TRUE（NULL 视为"未知"，
+		 * 未知可能本应是 TRUE）；有子句为 NULL 且其余全 FALSE 则结果 NULL；
+		 * 只有全部子句确知为 FALSE 时结果才为 FALSE。_STEP_FIRST 先清空
+		 * anynull 再落入 _STEP；_STEP 遇 TRUE 提前 EEO_JUMP 收工；_STEP_LAST
+		 * 无跳转地合并最终结果。结果初值由编译器预置为 FALSE。
 		 */
 		EEO_CASE(EEOP_BOOL_OR_STEP_FIRST)
 		{
@@ -1166,6 +1319,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_BOOL_NOT_STEP —— NOT 取反：布尔取反对 NULL 也安全
+		 * （NULL 取反仍是 NULL，符合 SQL 语义），因此无视 resnull 直接
+		 * 翻转 Datum 中的布尔位。 */
 		EEO_CASE(EEOP_BOOL_NOT_STEP)
 		{
 			/*
@@ -1179,6 +1335,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_QUAL —— 供 ExecQual() 使用的简化版 AND 步：子句
+		 * 为 FALSE 或 NULL 都视为不合格，直接置 FALSE 跳到 jumpdone；
+		 * 全 TRUE 则保留结果（末位子句时 TRUE 即最终答案）。 */
 		EEO_CASE(EEOP_QUAL)
 		{
 			/* simplified version of BOOL_AND_STEP for use by ExecQual() */
@@ -1201,6 +1360,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_JUMP / _IF_NULL / _IF_NOT_NULL / _IF_NOT_TRUE ——
+		 * 无条件/条件跳转族，是解释器的控制流指令：AND/OR 短路、
+		 * CASE 分支、NULLIF 等全部依赖它们跳到编译期算好的 step 编号。
+		 * 条件跳转以当前结果寄存器的 NULL 位/布尔值决定是否转移。 */
 		EEO_CASE(EEOP_JUMP)
 		{
 			/* Unconditionally jump to target step */
@@ -1234,6 +1397,11 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_NULLTEST_ISNULL / _ISNOTNULL —— 标量 IS [NOT] NULL：
+		 * 把结果寄存器的 NULL 位直接转换为布尔结果（IS NULL = resnull 本身；
+		 * IS NOT NULL = 取反），再清空 NULL 位。
+		 * EEOP_NULLTEST_ROWISNULL / _ROWISNOTNULL —— 行值 IS [NOT] NULL：
+		 * 需按行类型逐字段检查，委托 ExecEvalRowNull/ExecEvalRowNotNull。 */
 		EEO_CASE(EEOP_NULLTEST_ISNULL)
 		{
 			*op->resvalue = BoolGetDatum(*op->resnull);
@@ -1268,6 +1436,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 
 		/* BooleanTest implementations for all booltesttypes */
 
+		/* 【中文注释】EEOP_BOOLTEST_* —— BooleanTest 四种形态（IS TRUE /
+		 * IS NOT TRUE / IS FALSE / IS NOT FALSE）。SQL 语义：NULL 与
+		 * TRUE/FALSE 比较结果见"未知"处理——IS TRUE 对 NULL 为 FALSE，
+		 * IS NOT TRUE 对 NULL 为 TRUE，非 NULL 时等价于布尔取反/原样。 */
 		EEO_CASE(EEOP_BOOLTEST_IS_TRUE)
 		{
 			if (*op->resnull)
@@ -1318,6 +1490,16 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_PARAM_EXEC —— 内部执行参数（PARAM_EXEC，如子计划
+		 * 结果、InitPlan 结果）：按编号取 econtext->ecxt_param_exec_vals；
+		 * 若该参数还挂着待求值的执行计划（execPlan 非空，说明是 InitPlan
+		 * 首次引用），先 ExecSetParamPlan 执行计划把结果填进参数槽再取值。
+		 * EEOP_PARAM_EXTERN —— 外部参数（$1 等 Prepare 参数）：从
+		 * ecxt_param_list_info 取，支持 paramFetch 钩子（动态参数）；
+		 * EEOP_PARAM_CALLBACK —— 允许扩展模块通过回调自定义取值；
+		 * EEOP_PARAM_SET —— 反向写入：把当前结果寄存器值写回某个
+		 * PARAM_EXEC 参数（用于给 InitPlan/子查询结果赋值，供本查询
+		 * 后续引用）。 */
 		EEO_CASE(EEOP_PARAM_EXEC)
 		{
 			/* out of line implementation: too large */
@@ -1347,6 +1529,11 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_CASE_TESTVAL / _EXT —— 读取 CASE 基值（CASE 表达式
+		 * 与域检查共用的 CaseTestExpr 机制的结果）：内联形态从编译期固定的
+		 * 指针读（caseValue 槽在 econtext 中由外层设置），_EXT 形态从
+		 * econtext->caseValue_datum/isNull 读。基值由 `stmt`（WHEN 判定前）
+		 * 预先求值，供 WHEN 相等比较与 THEN 结果共用，避免重复求值。 */
 		EEO_CASE(EEOP_CASE_TESTVAL)
 		{
 			*op->resvalue = *op->d.casetest.value;
@@ -1363,6 +1550,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_MAKE_READONLY —— 把可能被多次读取的 varlena 值强制
+		 * 转只读：展开对象若处于可写状态，后续任何读者都可能就地修改它，
+		 * 因此这里统一 MakeExpandedObjectReadOnlyInternal 收敛为只读快照，
+		 * 保证多路复用安全。 */
 		EEO_CASE(EEOP_MAKE_READONLY)
 		{
 			/*
@@ -1376,6 +1567,11 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_IOCOERCE —— CoerceViaIO（通过类型的 I/O 函数做
+		 * 隐式/显式转换，如 text <-> 其它类型）内联实现，热路径；NULL
+		 * 不调用输出函数。EEOP_IOCOERCE_SAFE 为软错误版本（错误保存到
+		 * ErrorSaveContext 而非直接报错，供 JSON 等需要捕获错误的场景），
+		 * 委托 ExecEvalCoerceViaIOSafe。修改内联版时需同步改 SAFE 版。 */
 		EEO_CASE(EEOP_IOCOERCE)
 		{
 			/*
@@ -1446,6 +1642,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_DISTINCT —— a IS DISTINCT FROM b：
+		 * 先判 NULL（两参都 NULL → FALSE；仅一参 NULL → TRUE），两参都
+		 * 非 NULL 才调用类型标准相等函数，结果取反。NULL 语义与普通 =
+		 * 不同，因此不能复用 EEOP_FUNCEXPR。EEOP_NOT_DISTINCT 为取反版。 */
 		EEO_CASE(EEOP_DISTINCT)
 		{
 			/*
@@ -1487,7 +1687,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* see EEOP_DISTINCT for comments, this is just inverted */
+		/* 同 EEOP_DISTINCT 的中文注释，这里只是结果取反（NOT DISTINCT FROM） */
 		EEO_CASE(EEOP_NOT_DISTINCT)
 		{
 			FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
@@ -1515,6 +1715,11 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_NULLIF —— NULLIF(a, b)：两参都非 NULL 且相等（相等
+		 * 函数返回真）时结果为 NULL，否则返回第一个参数。注意相等比较前
+		 * 若 a 是 varlena，要先把 a 置为只读指针（MakeExpandedObjectReadOnly）
+		 * ——避免比较函数就地修改对象；而最终若返回 a 时仍用原始指针
+		 * （save_arg0），保持可写状态。 */
 		EEO_CASE(EEOP_NULLIF)
 		{
 			/*
@@ -1559,6 +1764,13 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_SQLVALUEFUNCTION —— CURRENT_DATE/CURRENT_TIME/
+		 * CURRENT_USER/CURRENT_SCHEMA 等 SQL 值函数，委托
+		 * ExecEvalSQLValueFunction。
+		 * EEOP_CURRENTOFEXPR —— WHERE CURRENT OF（游标定位），正常计划
+		 * 应已被规划器转成 TidScan 等，执行到这里说明表类型不支持，报错。
+		 * EEOP_NEXTVALUEEXPR —— 序列 nextval：触发序列推进，结果按
+		 * 序列类型转换后返回。 */
 		EEO_CASE(EEOP_SQLVALUEFUNCTION)
 		{
 			/*
@@ -1589,6 +1801,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_RETURNINGEXPR —— 触发器 RETURNING 支持：若 OLD/NEW
+		 * 行不存在（state->flags 里相应位被置位），跳过其后真正求值的
+		 * step，直接返回 NULL；行存在则照常执行。 */
 		EEO_CASE(EEOP_RETURNINGEXPR)
 		{
 			/*
@@ -1606,6 +1821,13 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_ARRAYEXPR —— ARRAY[] 构造：元素已在编译期预分配的
+		 * elemvalues/elemnulls 数组中求值，委托 ExecEvalArrayExpr 组装为
+		 * ArrayType（含多维合并、NULL 位图、维度校验）。
+		 * EEOP_ARRAYCOERCE —— ArrayCoerceExpr：对数组逐元素施加转换
+		 * （元素类型不同时 array_map；二进制兼容时只改头部 elemtype）。
+		 * EEOP_ROW —— ROW(...) 行构造：把已求值字段用 heap_form_tuple
+		 * 组装成复合类型 Datum。 */
 		EEO_CASE(EEOP_ARRAYEXPR)
 		{
 			/* too complex for an inline implementation */
@@ -1630,6 +1852,13 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_ROWCOMPARE_STEP —— 行比较（(a,b) < (c,d)）的逐列
+		 * 步：对当前列对调用比较函数，返回 int32 比较值；严格函数遇
+		 * NULL 或函数结果 NULL 直接跳到 jumpnull（NULL 语义：行比较任
+		 * 一列 NULL 结果即 NULL）；比较值非 0 说明已分出大小，跳到
+		 * jumpdone 收尾；相等则 EEO_NEXT 比较下一列。
+		 * EEOP_ROWCOMPARE_FINAL —— 末列之后把最终 int32 比较值按操作符
+		 * （<、<=、>=、>）换算成布尔结果（EQ/NE 不会出现在这里）。 */
 		EEO_CASE(EEOP_ROWCOMPARE_STEP)
 		{
 			FunctionCallInfo fcinfo = op->d.rowcompare_step.fcinfo_data;
@@ -1694,6 +1923,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_MINMAX —— GREATEST/LEAST（注意不是聚合 MIN/MAX）：
+		 * 跳过 NULL 输入，用比较函数两两挑选极值。EEOP_FIELDSELECT ——
+		 * 复合类型取字段（行表达式 (t).col）。EEOP_FIELDSTORE_DEFORM /
+		 * _FORM —— FieldStore 两步式：先把源行变形到 values/nulls 数组，
+		 * 各字段新值求值覆盖其中若干元素后，_FORM 用 heap_form_tuple 组
+		 * 装新行（如 UPDATE 复合列赋值）。 */
 		EEO_CASE(EEOP_MINMAX)
 		{
 			/* too complex for an inline implementation */
@@ -1726,6 +1961,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_SBSREF_* —— 下标引用族（数组/JSON/域的子下标赋值
+		 * 与取值，SubscriptingRef）：_SUBSCRIPTS 先求值并校验所有下标
+		 * （下标为 NULL 时整个 SubscriptingRef 短路为 NULL）；_OLD 取
+		 * 被替换的旧值（赋值场景构造"原值+改动"需要）、_ASSIGN 执行
+		 * 赋值、_FETCH 执行取值。具体行为由类型相关的 subscriptfunc 回调
+		 * （array_subscript_exec 等）实现。 */
 		EEO_CASE(EEOP_SBSREF_SUBSCRIPTS)
 		{
 			/* Precheck SubscriptingRef subscript(s) */
@@ -1750,6 +1991,13 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_CONVERT_ROWTYPE —— 行类型转换（ConvertRowtypeExpr，
+		 * 如把父表行转成子表行、显式 ::type 行转换）：按属性名重排字段并
+		 * 重打结果类型标记；二进制兼容时仅改复合头类型 OID。
+		 * EEOP_SCALARARRAYOP —— x op ANY/ALL (数组)：逐个数组元素应用
+		 * 操作符，ANY 用 OR 合并、ALL 用 AND 合并，可短路。
+		 * EEOP_HASHED_SCALARARRAYOP —— 常数数组的 x = ANY(...) 优化版：
+		 * 首次求值时把数组元素建哈希表，后续行 O(1) 查表。 */
 		EEO_CASE(EEOP_CONVERT_ROWTYPE)
 		{
 			/* too complex for an inline implementation */
@@ -1774,6 +2022,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_DOMAIN_TESTVAL / _EXT —— 读取域检查的基值（与
+		 * CASE_TESTVAL 同机制，见其注释）：domainValue 在 econtext 中。
+		 * EEOP_DOMAIN_NOTNULL —— 域 NOT NULL 约束检查，违反则报错
+		 * （errsave 支持软错误）。
+		 * EEOP_DOMAIN_CHECK —— 域 CHECK 约束表达式求值后校验，违反
+		 * 则报错；返回 FALSE 或 NULL 都不通过。 */
 		EEO_CASE(EEOP_DOMAIN_TESTVAL)
 		{
 			*op->resvalue = *op->d.casetest.value;
@@ -1806,6 +2060,15 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_HASHDATUM_* —— 哈希元组键合成族（Hash 连接/聚合
+		 * 键值哈希）：用类型哈希函数把各键列依次散列并循环旋转异或合并
+		 * （pg_rotate_left32 保证列顺序敏感、位数充分混合）。
+		 * - _SET_INITVAL：装入种子初值（JOIN 优化后的专用步）；
+		 * - _FIRST：第一列——NULL 输入以 0 参与合并（_FIRST_STRICT 则
+		 *   遇 NULL 直接短路，整个键哈希结果为 NULL，供严格键使用）；
+		 * - _NEXT32(_STRICT)：后续列合并——NULL 列不改变已合并值
+		 *   （等价于 SQL 语义里 NULL 键与任何 NULL 键相等/分组同组）；
+		 * _STRICT 变体遇 NULL 直接使整键为 NULL。 */
 		EEO_CASE(EEOP_HASHDATUM_SET_INITVAL)
 		{
 			*op->resvalue = op->d.hashdatum_initvalue.init_value;
@@ -1913,6 +2176,16 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_XMLEXPR —— XmlExpr（xmlconcat/forest/element/
+		 * parse/pi/root/serialize/IS DOCUMENT）委托 ExecEvalXmlExpr。
+		 * EEOP_JSON_CONSTRUCTOR —— SQL/JSON 构造器（JSON_ARRAY/OBJECT/
+		 * JSON 标量/JSON(...) 解析），委托 ExecEvalJsonConstructor。
+		 * EEOP_IS_JSON —— IS JSON 谓词。
+		 * EEOP_JSONEXPR_PATH —— 对文档执行 jsonpath 并依据 ON EMPTY /
+		 * ON ERROR 决定后续跳转，委托 ExecEvalJsonExprPath（返回值即
+		 * 下一个 step 编号，因此用 EEO_JUMP 而非 EEO_NEXT）。
+		 * EEOP_JSONEXPR_COERCION / _FINISH —— 结果向 RETURNING 类型
+		 * 转换（软错误模式）与事后错误处理两步。 */
 		EEO_CASE(EEOP_XMLEXPR)
 		{
 			/* too complex for an inline implementation */
@@ -1958,6 +2231,13 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_AGGREF —— 聚合引用：结果早由聚合节点按组算好并
+		 * 放入 econtext->ecxt_aggvalues/ecxt_aggnulls，这里按 aggno 直接
+		 * 取数（零计算）。
+		 * EEOP_GROUPING_FUNC —— GROUPING(...) 分组位掩码（计算当前行
+		 * 属于哪个分组集合，用于区分聚合的行被折叠与否）。
+		 * EEOP_WINDOW_FUNC —— 窗口函数引用，同 AGGREF 按 wfuncno 取
+		 * 预计算结果。 */
 		EEO_CASE(EEOP_AGGREF)
 		{
 			/*
@@ -1997,6 +2277,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_MERGE_SUPPORT_FUNC —— MERGE 支持函数：返回当前
+		 * 执行的 MERGE 动作名（'INSERT'/'UPDATE'/'DELETE' 文本），供
+		 * RETURNING 列表使用。EEOP_SUBPLAN —— 子计划（子查询）执行：
+		 * 委托 ExecSubPlan（内含 InitPlan/相关子查询的缓存与参数回填）。 */
 		EEO_CASE(EEOP_MERGE_SUPPORT_FUNC)
 		{
 			/* too complex/uncommon for an inline implementation */
@@ -2013,7 +2297,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* evaluate a strict aggregate deserialization function */
+		/* 【中文注释】EEOP_AGG_STRICT_DESERIALIZE —— 串行聚合的严格反序列化
+		 * 步骤：序列化状态（serialtype datum）为 NULL 时严格反序列化函数
+		 * 不应被调用，直接跳到 jumpnull。
+		 * EEOP_AGG_DESERIALIZE —— 调用反序列化函数把串行聚合状态还原为
+		 * 内存内 transtype 状态；在每输入元组的临时内存上下文中执行，
+		 * 结果自动随元组释放。 */
 		EEO_CASE(EEOP_AGG_STRICT_DESERIALIZE)
 		{
 			/* Don't call a strict deserialization function with NULL input */
@@ -2048,7 +2337,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		 * input is not NULL.
 		 */
 
-		/* when checking more than one argument */
+		/* 【中文注释】EEOP_AGG_STRICT_INPUT_CHECK_* —— 严格转移/组合函数的
+		 * 输入判空步骤：任一输入为 NULL（_ARGS 查 fcinfo 参数数组、
+		 * _NULLS 查独立 nulls 数组、_ARGS_1 是单参数特化）即跳到
+		 * jumpnull，直接按"严格函数遇 NULL 不调用"处理，避免调用。 */
 		EEO_CASE(EEOP_AGG_STRICT_INPUT_CHECK_ARGS)
 		{
 			NullableDatum *args = op->d.agg_strict_input_check.args;
@@ -2064,7 +2356,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* special case for just one argument */
+		/* 单输入特化：只查一个参数是否为 NULL */
 		EEO_CASE(EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1)
 		{
 			NullableDatum *args = op->d.agg_strict_input_check.args;
@@ -2090,10 +2382,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/*
-		 * Check for a NULL pointer to the per-group states.
-		 */
-
+		/* 【中文注释】EEOP_AGG_PLAIN_PERGROUP_NULLCHECK —— 检查本行所属分组
+		 * 的 per-group 状态指针是否已分配（第一个输入行之前为 NULL）：
+		 * 未分配则跳走，由聚合节点负责初始化该分组的状态数组。 */
 		EEO_CASE(EEOP_AGG_PLAIN_PERGROUP_NULLCHECK)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
@@ -2107,17 +2398,19 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		}
 
 		/*
-		 * Different types of aggregate transition functions are implemented
-		 * as different types of steps, to avoid incurring unnecessary
-		 * overhead.  There's a step type for each valid combination of having
-		 * a by value / by reference transition type, [not] needing to the
-		 * initialize the transition value for the first row in a group from
-		 * input, and [not] strict transition function.
-		 *
-		 * Could optimize further by splitting off by-reference for
-		 * fixed-length types, but currently that doesn't seem worth it.
+		 * 【中文注释】EEOP_AGG_PLAIN_TRANS_* —— 普通（无 ORDER BY）聚合
+		 * 转移函数调用族。按三个正交维度拆成 6 个 opcode 以消除运行时
+		 * 分支（聚合是每行必走的超热路径）：
+		 *   维度1 转移值类型：byval（int8 等，值传递）/ byref（text 等，
+		 *   引用传递，需拷入 aggcontext 管理生命周期）；
+		 *   维度2 是否需要用输入值初始化首行转移值（INIT_：组内首行
+		 *   noTransValue 为真时执行 ExecAggInitGroup 用输入值播种）；
+		 *   维度3 转移函数是否严格（STRICT：输入 NULL 则保持原转移值，
+		 *   不调用函数）。
+		 * 每步逻辑：非严格 INIT 首行播种；随后若非 NULL 则调用
+		 * ExecAggPlainTransByVal/ByRef 执行转移；严格时 NULL 输入自然
+		 * 跳过调用。
 		 */
-
 		EEO_CASE(EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
@@ -2145,7 +2438,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* see comments above EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL */
+		/* 同 EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL 的三维度拆分注释（byval+非 INIT+严格） */
 		EEO_CASE(EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
@@ -2163,7 +2456,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* see comments above EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL */
+		/* 同 EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL 的三维度拆分注释（byval+非 INIT+非严格） */
 		EEO_CASE(EEOP_AGG_PLAIN_TRANS_BYVAL)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
@@ -2180,7 +2473,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* see comments above EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL */
+		/* 同 EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL 的三维度拆分注释（byref+INIT+严格） */
 		EEO_CASE(EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
@@ -2201,7 +2494,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* see comments above EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL */
+		/* 同 EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL 的三维度拆分注释（byref+非 INIT+严格） */
 		EEO_CASE(EEOP_AGG_PLAIN_TRANS_STRICT_BYREF)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
@@ -2218,7 +2511,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* see comments above EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL */
+		/* 同 EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL 的三维度拆分注释（byref+非 INIT+非严格） */
 		EEO_CASE(EEOP_AGG_PLAIN_TRANS_BYREF)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
@@ -2235,6 +2528,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* 【中文注释】EEOP_AGG_PRESORTED_DISTINCT_SINGLE / _MULTI —— 预排序
+		 * DISTINCT 聚合的去重判定：假定输入已按排序顺序到达（由查询计划
+		 * 中 ORDER BY 支持），仅需与"上一个输入"比较即可去重。单列版比较
+		 * 上一个 datum，多列版把输入装入 sortslot 后用 ExecQual 比较；
+		 * 与上一个不同（或没有上一个）才需要调用转移函数（返回 true 走
+		 * EEO_NEXT），否则跳过（EEO_JUMP 到 jumpdistinct）。 */
 		EEO_CASE(EEOP_AGG_PRESORTED_DISTINCT_SINGLE)
 		{
 			AggStatePerTrans pertrans = op->d.agg_presorted_distinctcheck.pertrans;
@@ -2257,7 +2556,11 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 				EEO_JUMP(op->d.agg_presorted_distinctcheck.jumpdistinct);
 		}
 
-		/* process single-column ordered aggregate datum */
+		/* 【中文注释】EEOP_AGG_ORDERED_TRANS_DATUM —— 有序聚合（ORDER BY
+		 * 内聚）的单列形态：把已求值的 datum 输入写入 tuplesort 排序
+		 * 状态，聚合结束后统一在排序序上执行转移函数。
+		 * EEOP_AGG_ORDERED_TRANS_TUPLE —— 多列形态：把输入行存入
+		 * sortslot 后整体 tuplesort_puttupleslot。 */
 		EEO_CASE(EEOP_AGG_ORDERED_TRANS_DATUM)
 		{
 			/* too complex for an inline implementation */
@@ -2266,7 +2569,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		/* process multi-column ordered aggregate tuple */
+		/* 有序聚合多列形态：同 EEOP_AGG_ORDERED_TRANS_DATUM，但输入是整行（写入 sortslot 后排序） */
 		EEO_CASE(EEOP_AGG_ORDERED_TRANS_TUPLE)
 		{
 			/* too complex for an inline implementation */
@@ -2289,9 +2592,31 @@ out_error:
 }
 
 /*
- * Expression evaluation callback that performs extra checks before executing
- * the expression. Declared extern so other methods of execution can use it
- * too.
+ * ============================================================================
+ * 【中文注释】ExecInterpExprStillValid —— 先校验再执行的延迟接线入口
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   首次执行表达式时的过渡 evalfunc：先做"表达式与当前 schema 是否仍然
+ *   兼容"的校验（计划可能是在老的 schema 下生成的、被缓存的），通过后把
+ *   evalfunc 换成真正的执行函数并立即执行本次求值。声明为 extern 是因为
+ *   其它执行方式（如 JIT）也要使用同样的校验机制。
+ *
+ * 参数：
+ *   state   - ExprState（steps、evalfunc_private 等）。
+ *   econtext- 求值上下文（提供输入槽，校验需要对照槽的元组描述符）。
+ *   isNull  - 输出：结果是否 NULL。
+ *
+ * 设计思想：
+ *   1. 惰性校验：如果每次执行都做全量校验会拖慢热路径，而校验又必须在
+ *      "任何一次真正求值之前"完成，因此把校验挂成首次调用的回调；本次
+ *      调用里先 CheckExprStillValid 全量检查，然后 state->evalfunc 原地替换
+ *      为 evalfunc_private（真正的执行函数），后续调用不再有任何校验开销。
+ *   2. 该校验能拦截的典型场景：计划缓存复用 + 执行期间 DDL（如 ALTER
+ *      TABLE DROP COLUMN / ALTER COLUMN TYPE）导致 Var 引用的属性类型或
+ *      存在性与槽描述符不符，返回清晰错误而不是内存越界/静默错值。
+ *   3. 由 ExecReadyInterpretedExpr 在准备阶段把 evalfunc 置为本函数；
+ *      校验完成后不可能再回头，因此本函数只被调用一次（每次执行计划）。
+ * ============================================================================
  */
 Datum
 ExecInterpExprStillValid(ExprState *state, ExprContext *econtext, bool *isNull)
@@ -2310,8 +2635,28 @@ ExecInterpExprStillValid(ExprState *state, ExprContext *econtext, bool *isNull)
 }
 
 /*
- * Check that an expression is still valid in the face of potential schema
- * changes since the plan has been created.
+ * ============================================================================
+ * 【中文注释】CheckExprStillValid —— 全量校验表达式与当前 schema 的兼容性
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   遍历 ExprState 的全部 step，对每个 EEOP_*_VAR 步检查其引用的属性：
+ *   编号是否仍在槽描述符内、属性是否被 DROP、类型是否与编译期记录的
+ *   vartype 一致；不一致即报错（拒绝执行过期计划）。
+ *
+ * 参数：
+ *   state   - ExprState（含 steps 数组）。
+ *   econtext- 求值上下文，提供 inner/outer/scan/old/new 五个槽用于对照。
+ *
+ * 设计思想：
+ *   1. 一次性防线：正常流程中计划树本身已注册依赖（plan invalidation），
+ *      schema 变化会导致计划失效重建；本函数是"计划被错误复用"场景的兜底
+ *      防御——代价是首次执行前 O(steps) 的一次遍历，之后再不执行。
+ *   2. 只检查 VAR 步（且由 ExecEvalStepOp 把直接线程化下的 opcode 反查
+ *      回枚举，兼容两种派发模式）；系统列类型永不变，无需检查。
+ *   3. 被 ExecInterpExprStillValid 调用；JIT 等其它求值方式也可复用。
+ *   4. 逐属性的深度校验（类型/丢弃/越界）委托 CheckVarSlotCompatibility，
+ *      这里只负责遍历与分派。
+ * ============================================================================
  */
 void
 CheckExprStillValid(ExprState *state, ExprContext *econtext)
@@ -2380,9 +2725,30 @@ CheckExprStillValid(ExprState *state, ExprContext *econtext)
 }
 
 /*
- * Check whether a user attribute in a slot can be referenced by a Var
- * expression.  This should succeed unless there have been schema changes
- * since the expression tree has been created.
+ * ============================================================================
+ * 【中文注释】CheckVarSlotCompatibility —— 校验 Var 引用的用户列仍与槽描述符兼容
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查槽中第 attnum 个（1 基）属性能否被引用 vartype 类型的 Var 安全
+ *   求值：编号越界、属性已被 DROP、类型与 Var 不符时分别报出明确错误。
+ *
+ * 参数：
+ *   slot   - 提供列定义的元组槽（取 tts_tupleDescriptor）。
+ *   attnum - 1 基属性号（系统列传 <=0，无需检查，类型永不变）。
+ *   vartype- 表达式编译时记录的属性类型 OID。
+ *
+ * 设计思想：
+ *   1. 触发场景：计划在 DDL 之前生成并缓存，执行时 schema 已变——例如
+ *      ALTER TABLE DROP COLUMN 后旧计划仍在执行。正常机制下计划会因依赖
+ *      失效而被重建，这里只是最后一道防线，因此只在首次执行时做一次。
+ *   2. 只查 typid 不查 typmod 的原因：很多情况下槽描述符由
+ *      ExecTypeFromTL() 生成，无法保证 typmod 精确（部分表达式节点不携带
+ *      typmod），而恰好也没有任何关键依赖落在 typmod 上，查了反而误报。
+ *   3. 虚拟生成列（attgenerated == VIRTUAL）不应出现在此处——它们没有
+ *      物理存储，FETCHSOME 前的 Deform 也不会展开它们，出现即内部错误。
+ *   4. 报错采用 SQLSTATE UNDEFINED_COLUMN / DATATYPE_MISMATCH，并把表类型
+ *      与预期类型都打印出来，便于诊断过期计划。
+ * ============================================================================
  */
 static void
 CheckVarSlotCompatibility(TupleTableSlot *slot, int attnum, Oid vartype)
@@ -2437,7 +2803,30 @@ CheckVarSlotCompatibility(TupleTableSlot *slot, int attnum, Oid vartype)
 }
 
 /*
- * Verify that the slot is compatible with a EEOP_*_FETCHSOME operation.
+ * ============================================================================
+ * 【中文注释】CheckOpSlotCompatibility —— 校验 FETCHSOME 步与槽实现类型匹配
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   校验即将执行 slot_getsomeattrs 的槽，其实现类型（tts_ops）与编译期
+ *   记录的预期类型 op->d.fetch.kind 一致。仅编译断言（USE_ASSERT_CHECKING）
+ *   下生效，生产构建为空操作。
+ *
+ * 参数：
+ *   op   - FETCHSOME 步（d.fetch.kind = 编译期预期的 TTSOps 指针）。
+ *   slot - 实际传入的槽。
+ *
+ * 设计思想：
+ *   1. 为什么需要：FETCHSOME 在编译期按某个来源（如 HeapTuple 槽）生成，
+ *      运行时实际传入的可能是另一种实现（如 BufferHeapTuple 槽），两种
+ *      实现 deforming 行为不同但常互换使用；此检查防止开发者"想当然"
+ *      地混用导致读取未变形数组。
+ *   2. 放宽规则：
+ *      - buffer 与 heap 槽可互换（历史上一直如此，统一放宽）；
+ *      - 虚拟槽（Virtual）总是允许——虚拟槽永远无需变形，用哪个
+ *        FETCHSOME 都成立；
+ *      - 其余情况必须与预期种类完全一致。
+ *   3. 被 EEOP_*_FETCHSOME 内联执行与各 ExecJust* 快速路径在取列前调用。
+ * ============================================================================
  */
 static void
 CheckOpSlotCompatibility(ExprEvalStep *op, TupleTableSlot *slot)
@@ -2470,21 +2859,38 @@ CheckOpSlotCompatibility(ExprEvalStep *op, TupleTableSlot *slot)
 }
 
 /*
- * get_cached_rowtype: utility function to lookup a rowtype tupdesc
+ * ============================================================================
+ * 【中文注释】get_cached_rowtype —— 按 (type_id, typmod) 缓存地查找行类型描述符
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   以"带身份校验的缓存"方式获取复合类型的 TupleDesc：命名复合类型走
+ *   类型缓存（typcache，可失效重建），RECORD 类型走 lookup_rowtype_tupdesc。
+ *   用于需要在执行期间反复取行类型描述符的 step（行 IS NULL、字段选择、
+ *   FieldStore、行转换等）。
  *
- * type_id, typmod: identity of the rowtype
- * rowcache: space for caching identity info
- *		(rowcache->cacheptr must be initialized to NULL)
- * changed: if not NULL, *changed is set to true on any update
+ * 参数：
+ *   type_id , typmod - 行类型的身份（type OID 与 typmod）。
+ *   rowcache - ExprEvalRowtypeCache 缓存空间（cacheptr 首次调用前须为 NULL）。
+ *   changed  - 非 NULL 时，任何一次"重新查找"都会置 *changed = true，
+ *              调用方据此重建依赖描述符的中间结构（如属性映射）。
  *
- * The returned TupleDesc is not guaranteed pinned; caller must pin it
- * to use it across any operation that might incur cache invalidation,
- * including for example detoasting of input tuples.
- * (The TupleDesc is always refcounted, so just use IncrTupleDescRefCount.)
+ * 返回值：
+ *   TupleDesc —— 注意：未保证 pin（引用计数已计入），需要跨"可能触发缓存
+ *   失效的操作"（如 detoast 输入元组）使用时，调用方必须自行
+ *   IncrTupleDescRefCount。
  *
- * NOTE: because composite types can change contents, we must be prepared
- * to re-do this during any node execution; cannot call just once during
- * expression initialization.
+ * 设计思想：
+ *   1. 为什么必须"每次执行都可能重查"：复合类型内容可变（ALTER TYPE、
+ *      ALTER TABLE 增删列），缓存身份用 typcache 的 tupDesc_identifier 或
+ *      RECORD 的 (tdtypeid, tdtypmod) 判断，失效后自动重查——因此不能只在
+ *      表达式初始化时查一次就假定永远有效。
+ *   2. 命名类型路径：rowcache->cacheptr 保存 TypeCacheEntry*；用
+ *      "tupdesc_id == 0" 来防御上次调用是 RECORD 类型时 cacheptr 指向
+ *      TupleDesc 而非 TypeCacheEntry 的错位（理论情形，防御便宜）。
+ *   3. RECORD 类型路径：一旦注册（lookup_rowtype_tupdesc）在会话期内不变，
+ *      无需 typcache 条目；lookup 返回的 pin 立即释放，仅保留引用计数。
+ *      两个路径都把"新找到的描述符"存入 rowcache，实现跨行复用。
+ * ============================================================================
  */
 static TupleDesc
 get_cached_rowtype(Oid type_id, int32 typmod,
@@ -2548,10 +2954,31 @@ get_cached_rowtype(Oid type_id, int32 typmod,
 
 
 /*
- * Fast-path functions, for very simple expressions
+ * ============================================================================
+ * 【中文注释】ExecJust* 快速路径函数族 —— 极简单表达式的专用执行器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   由 ExecReadyInterpretedExpr 按 steps_len 与 opcode 模式匹配选中的专用
+ *   求值函数：它们针对"FETCHSOME+VAR"、"CONST"、"CASE_TESTVAL+严格函数"
+ *   等少数固定 step 形态手写最短路径，直接返回结果而非进入解释器主循环。
+ *
+ * 设计思想：
+ *   完整解释器的"启动"开销（哪怕很小）对极简单表达式是可见的；这些形态
+ *   （如 SELECT 里的裸列引用）又极其常见，值得为每种形态特化一个函数。
+ *   每个特化函数对 step 布局有硬编码假设（如 ExecJustVarImpl 假定
+ *   steps[0]=FETCHSOME、steps[1]=VAR），因此 ExecReadyInterpretedExpr 的
+ *   模式匹配必须与这里的布局严格同步——改一边必须改另一边。
+ *   虚拟槽变体（Virt）：假定槽已固定为虚拟槽且无需变形（编译期因此不发
+ *   FETCHSOME），直接读 tts_values/tts_isnull。
+ *   哈希变体：服务 Hash 连接/聚合的键列直接哈希（省去把列值经结果寄存器
+ *   中转），是哈希表构建路径的热点。
+ * ============================================================================
  */
 
-/* implementation of ExecJust(Inner|Outer|Scan)Var */
+/* 【中文注释】ExecJustVarImpl —— (Inner|Outer|Scan)Var 快速路径公共实现：
+		 * 直接用 slot_getattr 取第 attnum 列（slot_getattr 内部自带按需
+		 * 变形，因此无需显式 FETCHSOME，也不需要 Assert 列号范围）。
+		 * 三个包装 ExecJustInnerVar/OuterVar/ScanVar 仅槽来源不同。 */
 static pg_always_inline Datum
 ExecJustVarImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 {
@@ -2568,28 +2995,31 @@ ExecJustVarImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 	return slot_getattr(slot, attnum, isnull);
 }
 
-/* Simple reference to inner Var */
+/* 快速路径：直接引用 inner 关系（连接内表）的一列，委托 ExecJustVarImpl */
 static Datum
 ExecJustInnerVar(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustVarImpl(state, econtext->ecxt_innertuple, isnull);
 }
 
-/* Simple reference to outer Var */
+/* 快速路径：直接引用 outer 关系（连接外表）的一列，委托 ExecJustVarImpl */
 static Datum
 ExecJustOuterVar(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustVarImpl(state, econtext->ecxt_outertuple, isnull);
 }
 
-/* Simple reference to scan Var */
+/* 快速路径：直接引用当前扫描关系的一列，委托 ExecJustVarImpl */
 static Datum
 ExecJustScanVar(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustVarImpl(state, econtext->ecxt_scantuple, isnull);
 }
 
-/* implementation of ExecJustAssign(Inner|Outer|Scan)Var */
+/* 【中文注释】ExecJustAssignVarImpl —— AssignVar 快速路径公共实现：把
+		 * 输入槽第 attnum 列的值（slot_getattr 自带按需变形）直接写入
+		 * 结果槽第 resultnum 列。三个包装 ExecJustAssignInnerVar/OuterVar/
+		 * ScanVar 仅输入槽来源不同。 */
 static pg_always_inline Datum
 ExecJustAssignVarImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull)
 {
@@ -2615,28 +3045,48 @@ ExecJustAssignVarImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull)
 	return 0;
 }
 
-/* Evaluate inner Var and assign to appropriate column of result tuple */
+/* 快速路径：求内表 Var 并写入结果元组对应列 */
 static Datum
 ExecJustAssignInnerVar(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustAssignVarImpl(state, econtext->ecxt_innertuple, isnull);
 }
 
-/* Evaluate outer Var and assign to appropriate column of result tuple */
+/* 快速路径：求外表 Var 并写入结果元组对应列 */
 static Datum
 ExecJustAssignOuterVar(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustAssignVarImpl(state, econtext->ecxt_outertuple, isnull);
 }
 
-/* Evaluate scan Var and assign to appropriate column of result tuple */
+/* 快速路径：求扫描 Var 并写入结果元组对应列 */
 static Datum
 ExecJustAssignScanVar(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustAssignVarImpl(state, econtext->ecxt_scantuple, isnull);
 }
 
-/* Evaluate CASE_TESTVAL and apply a strict function to it */
+/*
+ * ============================================================================
+ * 【中文注释】ExecJustApplyFuncToCase —— CASE_TESTVAL + 严格函数的快速路径
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   特化模式 [EEOP_CASE_TESTVAL, EEOP_FUNCEXPR_STRICT*]：先把 CASE 基值
+ *   拷入 step0 的结果寄存器（即被作为第一个实参），再对严格的函数调用做
+ *   判空与调用。典型场景：CASE 的简单 CASE 表达式——WHEN 子句形如
+ *   caseval = const 且比较运算符底层是严格函数。
+ *
+ * 设计思想：
+ *   1. 省掉的启动：两个 step 的表达式不用进解释器主循环，直接手工串起来。
+ *   2. 数据搬移的来历：CASE_TESTVAL 的结果写入其自身 step 的结果寄存器，
+ *      编译期把该寄存器布局成函数调用的 args[0] 指向的位置，因此这里先
+ *      "物化"基值再让 fn_addr 直接消费。
+ *   3. 严格性：任一步骤的判空不通过则整个表达式结果为 NULL（与解释器
+ *      中 EEOP_FUNCEXPR_STRICT 的 goto strictfail 语义一致）。
+ *   4. 代码中的 XXX 注释提示：若重新设计 CaseTestExpr 机制，这个数据
+ *      搬移也许能消除——属已知的小优化空间。
+ * ============================================================================
+ */
 static Datum
 ExecJustApplyFuncToCase(ExprState *state, ExprContext *econtext, bool *isnull)
 {
@@ -2674,7 +3124,8 @@ ExecJustApplyFuncToCase(ExprState *state, ExprContext *econtext, bool *isnull)
 	return d;
 }
 
-/* Simple Const expression */
+/* 【中文注释】ExecJustConst —— 常量的快速路径：常量值与 NULL 标志在
+		 * 编译期已内嵌进 step，这里只需一次拷贝即可返回。 */
 static Datum
 ExecJustConst(ExprState *state, ExprContext *econtext, bool *isnull)
 {
@@ -2684,7 +3135,11 @@ ExecJustConst(ExprState *state, ExprContext *econtext, bool *isnull)
 	return op->d.constval.value;
 }
 
-/* implementation of ExecJust(Inner|Outer|Scan)VarVirt */
+/* 【中文注释】ExecJustVarVirtImpl —— 虚拟槽版 VAR 快速路径公共实现：
+		 * 编译期已确认槽必为"已固定的虚拟槽"（因而无需也不能变形、没有
+		 * FETCHSOME 步），直接读 tts_values/tts_isnull 数组返回；三个
+		 * Assert 验证编译期判断与运行期事实一致。三个包装（Inner/Outer/
+		 * Scan）仅槽来源不同。 */
 static pg_always_inline Datum
 ExecJustVarVirtImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 {
@@ -2706,28 +3161,30 @@ ExecJustVarVirtImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 	return slot->tts_values[attnum];
 }
 
-/* Like ExecJustInnerVar, optimized for virtual slots */
+/* 虚拟槽版：读内表 Var */
 static Datum
 ExecJustInnerVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustVarVirtImpl(state, econtext->ecxt_innertuple, isnull);
 }
 
-/* Like ExecJustOuterVar, optimized for virtual slots */
+/* 虚拟槽版：读外表 Var */
 static Datum
 ExecJustOuterVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustVarVirtImpl(state, econtext->ecxt_outertuple, isnull);
 }
 
-/* Like ExecJustScanVar, optimized for virtual slots */
+/* 虚拟槽版：读扫描 Var */
 static Datum
 ExecJustScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustVarVirtImpl(state, econtext->ecxt_scantuple, isnull);
 }
 
-/* implementation of ExecJustAssign(Inner|Outer|Scan)VarVirt */
+/* 【中文注释】ExecJustAssignVarVirtImpl —— 虚拟槽版 ASSIGN 快速路径：
+		 * 见 ExecJustAssignVarImpl 注释（槽为虚拟槽，零变形直接搬数组）。
+		 * 三个包装（Inner/Outer/Scan）仅输入槽来源不同。 */
 static pg_always_inline Datum
 ExecJustAssignVarVirtImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull)
 {
@@ -2749,21 +3206,21 @@ ExecJustAssignVarVirtImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull
 	return 0;
 }
 
-/* Like ExecJustAssignInnerVar, optimized for virtual slots */
+/* 虚拟槽版：内表 Var 写入结果元组对应列 */
 static Datum
 ExecJustAssignInnerVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustAssignVarVirtImpl(state, econtext->ecxt_innertuple, isnull);
 }
 
-/* Like ExecJustAssignOuterVar, optimized for virtual slots */
+/* 虚拟槽版：外表 Var 写入结果元组对应列 */
 static Datum
 ExecJustAssignOuterVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustAssignVarVirtImpl(state, econtext->ecxt_outertuple, isnull);
 }
 
-/* Like ExecJustAssignScanVar, optimized for virtual slots */
+/* 虚拟槽版：扫描 Var 写入结果元组对应列 */
 static Datum
 ExecJustAssignScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 {
@@ -2771,7 +3228,23 @@ ExecJustAssignScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 }
 
 /*
- * implementation for hashing an inner Var, seeding with an initial value.
+ * ============================================================================
+ * 【中文注释】ExecJustHashInnerVarWithIV —— 带种子初值的哈希键快速路径
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   特化模式 [FETCHSOME, HASHDATUM_SET_INITVAL, INNER_VAR, HASHDATUM_NEXT32]
+ *   （5 个 step）：把内表 Var 的哈希与指定初值合并。典型调用方是 Hash
+ *   连接的"哈希内表前先对连接键做哈希"路径，其中初值用作哈希种子。
+ *
+ * 设计思想：
+ *   1. 合并步骤在解释器里要四次派发（SET_INITVAL、FETCHSOME、VAR、
+ *      NEXT32），这里手写为一个函数：变形（slot_getsomeattrs）+ 取列 +
+ *      初值左旋一位 + 与列哈希异或（非 NULL 才哈希列；NULL 列保持初值
+ *      参与合并，NULL 键与非 NULL 键仍能同桶，交由相等函数鉴别）。
+ *   2. 与解释器 EEOP_HASHDATUM_NEXT32 的合并公式完全一致
+ *      （hash = rotate_left(hash, 1) ^ value），保证同键两种路径
+ *      产出一致哈希，这是哈希表可互换性的前提。
+ * ============================================================================
  */
 static Datum
 ExecJustHashInnerVarWithIV(ExprState *state, ExprContext *econtext,
@@ -2806,7 +3279,11 @@ ExecJustHashInnerVarWithIV(ExprState *state, ExprContext *econtext,
 	return UInt32GetDatum(hashkey);
 }
 
-/* implementation of ExecJustHash(Inner|Outer)Var */
+/* 【中文注释】ExecJustHashVarImpl —— 单列哈希键快速路径公共实现：
+		 * 模式 [FETCHSOME, VAR, HASHDATUM_FIRST]：变形后取列，非 NULL
+		 * 则返回列哈希值（单列键不需要合并旋转），NULL 返回 0 作为
+		 * 占位（NULL 键同桶语义由相等函数处理）。包装 ExecJustHashOuterVar
+		 * / ExecJustHashInnerVar 仅槽来源不同。 */
 static pg_always_inline Datum
 ExecJustHashVarImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 {
@@ -2830,21 +3307,24 @@ ExecJustHashVarImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 		return (Datum) 0;
 }
 
-/* implementation for hashing an outer Var */
+/* 快速路径：哈希外表 Var（Hash 连接探测侧键） */
 static Datum
 ExecJustHashOuterVar(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustHashVarImpl(state, econtext->ecxt_outertuple, isnull);
 }
 
-/* implementation for hashing an inner Var */
+/* 快速路径：哈希内表 Var（Hash 连接构建侧键） */
 static Datum
 ExecJustHashInnerVar(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustHashVarImpl(state, econtext->ecxt_innertuple, isnull);
 }
 
-/* implementation of ExecJustHash(Inner|Outer)VarVirt */
+/* 【中文注释】ExecJustHashVarVirtImpl —— 虚拟槽版哈希键快速路径：
+		 * 模式 [VAR, HASHDATUM_FIRST]（无 FETCHSOME）。见 ExecJustHashVarImpl
+		 * 注释；虚拟槽免变形直接读数组。包装 ExecJustHashInnerVarVirt 与
+		 * ExecJustHashOuterVarVirt 仅槽来源不同。 */
 static pg_always_inline Datum
 ExecJustHashVarVirtImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 {
@@ -2864,7 +3344,7 @@ ExecJustHashVarVirtImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 		return (Datum) 0;
 }
 
-/* Like ExecJustHashInnerVar, optimized for virtual slots */
+/* 虚拟槽版：哈希内表 Var */
 static Datum
 ExecJustHashInnerVarVirt(ExprState *state, ExprContext *econtext,
 						 bool *isnull)
@@ -2872,7 +3352,7 @@ ExecJustHashInnerVarVirt(ExprState *state, ExprContext *econtext,
 	return ExecJustHashVarVirtImpl(state, econtext->ecxt_innertuple, isnull);
 }
 
-/* Like ExecJustHashOuterVar, optimized for virtual slots */
+/* 虚拟槽版：哈希外表 Var */
 static Datum
 ExecJustHashOuterVarVirt(ExprState *state, ExprContext *econtext,
 						 bool *isnull)
@@ -2881,7 +3361,21 @@ ExecJustHashOuterVarVirt(ExprState *state, ExprContext *econtext,
 }
 
 /*
- * implementation for hashing an outer Var.  Returns NULL on NULL input.
+ * ============================================================================
+ * 【中文注释】ExecJustHashOuterVarStrict —— 严格版外表哈希键快速路径
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   特化模式 [FETCHSOME, OUTER_VAR, HASHDATUM_FIRST_STRICT]：与
+ *   ExecJustHashOuterVar 相同，但键列为 NULL 时直接返回 NULL 结果
+ *   （*isnull = true），而不是用 0 占位。
+ *
+ * 设计思想：
+ *   非严格版用 0 占位意味着"NULL 键也能算出哈希进入哈希表"，适合
+ *   Hash Join 这类在相等性判定阶段再处理 NULL 的场景；严格版则让整
+ *   个表达式的结果为 NULL，供"键为 NULL 时必须跳过/特殊处理"的调用方
+ *   （比如某些 Hash 连接的过滤语义或聚合取键）使用——两种语义都要
+ *   足够快，因此各配一个特化函数。
+ * ============================================================================
  */
 static Datum
 ExecJustHashOuterVarStrict(ExprState *state, ExprContext *econtext,
@@ -2914,8 +3408,21 @@ ExecJustHashOuterVarStrict(ExprState *state, ExprContext *econtext,
 
 #if defined(EEO_USE_COMPUTED_GOTO)
 /*
- * Comparator used when building address->opcode lookup table for
- * ExecEvalStepOp() in the threaded dispatch case.
+ * ============================================================================
+ * 【中文注释】dispatch_compare_ptr —— 跳转目标地址->opcode 反查表的排序比较器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   按 opcode（代码块地址）大小比较两个 ExprEvalOpLookup 条目，供
+ *   qsort（构建 reverse_dispatch_table）与 bsearch（ExecEvalStepOp 反查）
+ *   使用。
+ *
+ * 设计思想：
+ *   direct-threaded 方式下，step 的 opcode 域被替换为代码块地址，运行时
+ *   需要"由地址还原枚举 opcode"（如 ExecInterpExprStillValid 校验时）。
+ *   由于地址不是按枚举顺序递增的，先把 (地址, opcode) 对建成表并按地址
+ *   排序，之后 O(log N) 二分即可反查。地址可以直接比较大小即比较器
+ *   只是数值大小比较——比较语义正确即可，无需关心地址本身含义。
+ * ============================================================================
  */
 static int
 dispatch_compare_ptr(const void *a, const void *b)
@@ -2932,7 +3439,27 @@ dispatch_compare_ptr(const void *a, const void *b)
 #endif
 
 /*
- * Do one-time initialization of interpretation machinery.
+ * ============================================================================
+ * 【中文注释】ExecInitInterpreter —— 解释器的全局一次性初始化
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   只做一次：在 direct-threaded 方式下，把 ExecInterpExpr 内置的
+ *   dispatch_table 静态数组地址取出来存到文件级全局 dispatch_table，
+ *   并构建反向查找表 reverse_dispatch_table（保持有序以便二分）。
+ *
+ * 设计思想：
+ *   1. dispatch_table 是 ExecInterpExpr 内部的 static 局部数组（与枚举
+ *      ExprEvalOp 顺序一致，StaticAssertDecl 保证长度）；为让 ExecInterpExpr
+ *      之外的代码（ExecReadyInterpretedExpr 的 EEO_OPCODE、ExecEvalStepOp
+ *      的反查）也能访问，用"state == NULL 调用 ExecInterpExpr 返回表地址"
+ *      的技巧把它导出到全局。开关方式下不编译 dispatch_table，本函数为空。
+ *   2. 反查表：直接线程化后 step->opcode 是代码块地址，需要还原成
+ *      枚举值时按地址二分查找——这正是 CheckExprStillValid /
+ *      ExecEvalStepOp 的用法。地址对应关系在编译期内稳定（每个 CASE_ 标签
+ *      地址固定），因此一次构建全局复用。
+ *   3. 由 ExecReadyInterpretedExpr 在每个 ExprState 准备时调用，利用
+ *      dispatch_table == NULL 判空保证只初始化一次。
+ * ============================================================================
  */
 static void
 ExecInitInterpreter(void)
@@ -2961,10 +3488,26 @@ ExecInitInterpreter(void)
 }
 
 /*
- * Function to return the opcode of an expression step.
+ * ============================================================================
+ * 【中文注释】ExecEvalStepOp —— 返回表达式 step 的原始 opcode 枚举值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   读取 step 的 opcode 域并还原为 ExprEvalOp 枚举。直接线程化的
+ *   ExprState 里 opcode 域存的是代码块地址而不是枚举，需要时用反查表
+ *   换回枚举；普通状态下直接转型返回。
  *
- * When direct-threading is in use, ExprState->opcode isn't easily
- * decipherable. This function returns the appropriate enum member.
+ * 参数：
+ *   state - ExprState（查 EEO_FLAG_DIRECT_THREADED 决定是否反查）。
+ *   op    - 目标 step。
+ *
+ * 设计思想：
+ *   解释器执行路径本身用不到这个函数（它直接以地址/枚举 dispatch），
+ *   但"需要审视 step 内容的代码"（如 CheckExprStillValid 的逐步校验、
+ *   JIT 代码生成对 step 分类）必须以枚举为准，因此提供统一入口。
+ *   直接线程化时的反查是 bsearch 二分，O(log EEOP_LAST)，只在非热点
+ *   路径使用；未知地址会触发 Assert（说明 dispatch 表与枚举失配，
+ *   属于内部错误）。本函数也被 execExpr.c / exprjit 等模块使用（extern）。
+ * ============================================================================
  */
 ExprEvalOp
 ExecEvalStepOp(ExprState *state, ExprEvalStep *op)
@@ -2990,11 +3533,52 @@ ExecEvalStepOp(ExprState *state, ExprEvalStep *op)
 
 
 /*
- * Out-of-line helper functions for complex instructions.
+ * ============================================================================
+ * 【中文注释】out-of-line 辅助函数区 —— 复杂指令的执行器（对外暴露共享）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   执行解释器主循环中"过于复杂/罕见、不值得内联"的 EEOP_* opcode 的
+ *   辅助函数：数组、行、XML/JSON、域约束、参数、聚合转移、子计划、
+ *   整行 Var 等。它们全部导出（非 static），并与解释器本体共享同一套
+ *   ExprEvalStep/ExprEvalOp 数据结构约定。
+ *
+ * 设计思想：
+ *   1. 内联取舍：主循环 EEO_CASE 里只有"每次执行都走、且代码量小"的
+ *      指令才手写；复杂指令内联既难写出高效代码也会撑爆指令缓存，
+ *      因此一条 EEO_CASE 一行函数调用。
+ *   2. 共享契约：这些函数被多种"执行方式"共用——解释器（本文件）调用、
+ *      JIT 编译（exprjit.c）直接生成对它们的原生调用、以及少量 fast-path
+ *      特化；正因为如此它们必须导出，这是它们能被 JIT 复用的关键。
+ *   3. 状态持久化：凡涉及跨行缓存（行类型缓存 rowcache、哈希表
+ *      elements_tab、属性映射 map 等）都挂在 step 的 d.* 联合体中，
+ *      由这些函数在第一行访问时初始化、后续行直接复用。
+ * ============================================================================
  */
 
 /*
- * Evaluate EEOP_FUNCEXPR_FUSAGE
+ * ============================================================================
+ * 【中文注释】ExecEvalFuncExprFusage / ExecEvalFuncExprStrictFusage ——
+ *              带 pg_stat 函数调用统计的（严格）函数调用
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与内联的 EEOP_FUNCEXPR[_STRICT] 等价的函数调用执行，额外用
+ *   pgstat_init_function_usage / pgstat_end_function_usage 统计函数调用
+ *   次数与耗时（pg_stat_user_functions 的数据来源）。Fusage 版不判严格，
+ *   StrictFusage 版先逐个参数判空、有 NULL 时直接返回 NULL 结果。
+ *
+ * 参数：
+ *   state   - ExprState（执行上下文）。
+ *   op      - FUNCEXPR_FUSAGE / FUNCEXPR_STRICT_FUSAGE 步，实参已由前置
+ *             step 求值填入 fcinfo->args。
+ *   econtext- 未使用（保留签名一致性）。
+ *
+ * 设计思想：
+ *   函数调用统计不是默认开启的（track_functions 关闭时这些 opcode 不会
+ *   被编译出来），因而不常见——这就是它们不进主循环内联的原因。统计
+ *   的开启/关闭由 execExpr.c 编译期根据 GUC 决定发不发 FUSAGE 变体，
+ *   运行时零判断。strict 变体与 EEOP_FUNCEXPR_STRICT 语义一致
+ *   （NULL 输入不调用函数）。
+ * ============================================================================
  */
 void
 ExecEvalFuncExprFusage(ExprState *state, ExprEvalStep *op,
@@ -3015,7 +3599,7 @@ ExecEvalFuncExprFusage(ExprState *state, ExprEvalStep *op,
 }
 
 /*
- * Evaluate EEOP_FUNCEXPR_STRICT_FUSAGE
+ * 严格版 Fusage 调用：实参任一为 NULL 即短路，不调用函数也不做统计
  */
 void
 ExecEvalFuncExprStrictFusage(ExprState *state, ExprEvalStep *op,
@@ -3049,10 +3633,23 @@ ExecEvalFuncExprStrictFusage(ExprState *state, ExprEvalStep *op,
 }
 
 /*
- * Evaluate a PARAM_EXEC parameter.
+ * ============================================================================
+ * 【中文注释】ExecEvalParamExec —— 读取内部执行参数（PARAM_EXEC）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   按 op->d.param.paramid 从 econtext->ecxt_param_exec_vals 数组取值写入
+ *   结果寄存器。PARAM_EXEC 是"执行器内部参数"：InitPlan / 子查询结果、
+ *   被下推的参数化表达式等都通过它传递。
  *
- * PARAM_EXEC params (internal executor parameters) are stored in the
- * ecxt_param_exec_vals array, and can be accessed by array index.
+ * 设计思想：
+ *   1. 惰性求值：若参数还挂着 execPlan（首次访问的 InitPlan 结果参数），
+ *      先调用 ExecSetParamPlan 执行子计划把值填好——从而保证"引用子计划
+ *      结果的表达式"在任意访问顺序下都得到正确值，且子计划只执行一次。
+ *   2. 校验：barrier 语义上，ExecSetParamPlan 完成后必须清掉 execPlan
+ *      （Assert 验证），防止同一 InitPlan 被重复执行。
+ *   3. 数组直取零拷贝：值的生命周期由参数槽管理（通常跨元组稳定或用
+ *      一次就拷贝），这里不做任何拷贝。
+ * ============================================================================
  */
 void
 ExecEvalParamExec(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3072,9 +3669,24 @@ ExecEvalParamExec(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 }
 
 /*
- * Evaluate a PARAM_EXTERN parameter.
+ * ============================================================================
+ * 【中文注释】ExecEvalParamExtern —— 读取外部参数（PARAM_EXTERN）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从 econtext->ecxt_param_list_info（调用方传入的 ParamListInfo）按
+ *   paramId 取 $1/$2... 之类的客户端参数值，写入结果寄存器；参数类型与
+ *   编译期记录不符时报 DATATYPE_MISMATCH，找不到参数报 UNDEFINED_OBJECT。
  *
- * PARAM_EXTERN parameters must be sought in ecxt_param_list_info.
+ * 设计思想：
+ *   1. 动态参数钩子：ParamListInfo->paramFetch 允许调用方（如某些 FDW、
+ *      扩展、PL/pgSQL 的动态绑定）按需现场生成参数值，回调返回的临时
+ *      条目先拷到栈上 prmdata 再使用，避免悬垂指针。
+ *   2. 类型校验：计划编译时记录 paramtype，运行时与 paramFetch/数组提供
+ *      ptype 比对——不同则说明调用方改变了参数类型（典型如 JDBC 驱动
+ *      类型推断变化），必须报错而不是静默错值。
+ *   3. 热路径友好：常规路径（paramInfo 有效 + paramId 在范围 + ptype 有效）
+ *      全部标 likely，跳过错误分支；只有在失败时才进入报错路径。
+ * ============================================================================
  */
 void
 ExecEvalParamExtern(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3116,8 +3728,21 @@ ExecEvalParamExtern(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 }
 
 /*
- * Set value of a param (currently always PARAM_EXEC) from
- * op->res{value,null}.
+ * ============================================================================
+ * 【中文注释】ExecEvalParamSet —— 反向设置 PARAM_EXEC 参数的值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把当前结果寄存器（*op->resvalue / *op->resnull）写入
+ *   econtext->ecxt_param_exec_vals[paramid]，即把刚求出的表达式结果
+ *   存入某内部参数。
+ *
+ * 设计思想：
+ *   与 ExecEvalParamExec 是读写对偶：编译期把"InitPlan 结果参数"的写入
+ *   点编译为 PARAM_SET step（如 UNION 子计划结果的回填、参数化扫描的
+ *   参数装载），随后引用方用 PARAM_EXEC 读取。执行期间该参数可能被
+ *   多次写入（每行改写），读取方总是看到最新值。Assert 确保写入前该
+ *   参数没有挂起的求值计划（PARAM_SET 与 InitPlan 首次求值互斥）。
+ * ============================================================================
  */
 void
 ExecEvalParamSet(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3134,12 +3759,31 @@ ExecEvalParamSet(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 }
 
 /*
- * Evaluate a CoerceViaIO node in soft-error mode.
+ * ============================================================================
+ * 【中文注释】ExecEvalCoerceViaIOSafe —— 软错误模式的 CoerceViaIO
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与内联 EEOP_IOCOERCE 等价但"出错不抛异常"：输入函数调用通过
+ *   ErrorSaveContext 捕获错误（fcinfo_in->context 必须是 ErrorSaveContext），
+ *   出错时结果置 NULL 返回；供 JSON 等需要把转换失败转为 NULL/走
+ *   ON ERROR 语义的场景使用。
  *
- * The source value is in op's result variable.
+ * 参数：
+ *   state - ExprState（未直接使用，保留签名一致性）。
+ *   op    - IOCOERCE_SAFE 步；源值在 *op->resvalue，输出/输入函数的
+ *           fcinfo 与 typmod 等参数已由编译期备好。
  *
- * Note: This implements EEOP_IOCOERCE_SAFE. If you change anything here,
- * also look at the inline code for EEOP_IOCOERCE.
+ * 设计思想：
+ *   1. 流程与 EEOP_IOCOERCE 完全平行：NULL 源值不调用输出函数，直接
+ *      以 NULL 进入输入函数判定（严格输入函数且 str 为 NULL 时不再调用）；
+ *      成功路径的 null 结果一致性用 Assert 保持。
+ *   2. 与内联版的双向维护约定：注释显式要求修改任一方时必须同步审查
+ *      另一方（JIT 直接复用内联版代码，SAFE 版专供软错误路径）。
+ *   3. 软错误的落地：InputFunctionCallSafe 在失败时把错误记录进
+ *      ErrorSaveContext 而非抛异常；这里检查 SOFT_ERROR_OCCURRED 后把
+ *      结果置 NULL——由上层 step（如 JSONEXPR_COERCION_FINISH）决定
+ *      是走 ON ERROR 分支还是保持 NULL。
+ * ============================================================================
  */
 void
 ExecEvalCoerceViaIOSafe(ExprState *state, ExprEvalStep *op)
@@ -3199,7 +3843,26 @@ ExecEvalCoerceViaIOSafe(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate a SQLValueFunction expression.
+ * ============================================================================
+ * 【中文注释】ExecEvalSQLValueFunction —— SQL 值函数（CURRENT_DATE 等）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   计算 SQLValueFunction 节点：CURRENT_DATE/CURRENT_TIME(_N)/
+ *   CURRENT_TIMESTAMP(_N)/LOCALTIME(_N)/LOCALTIMESTAMP(_N)/CURRENT_ROLE/
+ *   CURRENT_USER/USER/SESSION_USER/CURRENT_CATALOG/CURRENT_SCHEMA，结果
+ *   写入结果寄存器。
+ *
+ * 设计思想：
+ *   1. 这些函数值在事务内多次求值也必须一致（如 CURRENT_TIMESTAMP 在
+ *      START TRANSACTION 时冻结），因此底层 GetSQLCurrent* 都基于
+ *      transaction timestamp 的快照语义，本函数只是分派+取结果。
+ *   2. 带精度后缀的形态（_N）由 svf->typmod 控制小数位数。
+ *   3. 大部分形态结果恒非 NULL（resnull 预置 false），仅 current_schema()
+ *      可能返回 NULL（未设置 search_path 前），其余形态也统一按可空
+ *      编码以防将来语义变化。
+ *   4. 用户相关形态直接调用内置函数（current_user 等），保持与函数
+ *      调用一致的语义（如 SET ROLE 影响）。
+ * ============================================================================
  */
 void
 ExecEvalSQLValueFunction(ExprState *state, ExprEvalStep *op)
@@ -3260,13 +3923,20 @@ ExecEvalSQLValueFunction(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Raise error if a CURRENT OF expression is evaluated.
+ * ============================================================================
+ * 【中文注释】ExecEvalCurrentOfExpr —— CURRENT OF 不支持时的错误落点
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   执行到 EEOP_CURRENTOFEXPR 时必然报"不支持"错误。
  *
- * The planner should convert CURRENT OF into a TidScan qualification, or some
- * other special handling in a ForeignScan node.  So we have to be able to do
- * ExecInitExpr on a CurrentOfExpr, but we shouldn't ever actually execute it.
- * If we get here, we suppose we must be dealing with CURRENT OF on a foreign
- * table whose FDW doesn't handle it, and complain accordingly.
+ * 设计思想：
+ *   正常流程中，规划器应把 WHERE CURRENT OF 转换为 TidScan 的定位条件
+ *   （或由 ForeignScan 的 FDW 特殊处理），因此 ExecInitExpr 必须能编译
+ *   CurrentOfExpr 节点（保持接口完整），但解释执行永远不应该走到这里。
+ *   走到这里即意味着：该查询针对的是不处理 CURRENT OF 的表类型
+ *   （如不支持的外表），此时给出清晰的 FEATURE_NOT_SUPPORTED 错误，
+ *   而不是让查询静默返回空结果。
+ * ============================================================================
  */
 void
 ExecEvalCurrentOfExpr(ExprState *state, ExprEvalStep *op)
@@ -3277,7 +3947,22 @@ ExecEvalCurrentOfExpr(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate NextValueExpr.
+ * ============================================================================
+ * 【中文注释】ExecEvalNextValueExpr —— 序列 nextval 求值（NextValueExpr）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   调用 nextval_internal 推进序列并取新值，按序列声明类型（int2/int4/int8）
+ *   转换为对应 Datum 写入结果寄存器。
+ *
+ * 设计思想：
+ *   1. NextValueExpr 在 DEFAULT 表达式/序列默认值场景下由执行器直接求值
+ *      （相对普通函数调用省去 fmgr 包装），是 INSERT 走序列默认值的
+ *      主路径。
+ *   2. 序列推进是全局副作用：每行调用一次必取到互不相同的新值；
+ *      nextval_internal 内部处理序列缓存与 WAL。
+ *   3. 结果非 NULL（预置 resnull=false）；序列类型只允许三种整数类型，
+ *      其它是编译期不可达，运行时撞上按内部错误 elog 处理。
+ * ============================================================================
  */
 void
 ExecEvalNextValueExpr(ExprState *state, ExprEvalStep *op)
@@ -3303,7 +3988,25 @@ ExecEvalNextValueExpr(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate NullTest / IS NULL for rows.
+ * ============================================================================
+ * 【中文注释】ExecEvalRowNull / ExecEvalRowNotNull —— 行值的 IS [NOT] NULL
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   求值 "行变量 IS NULL" / "行变量 IS NOT NULL"：两个薄包装分别把
+ *   checkisnull 置 true/false 后委托公共实现 ExecEvalRowNullInt。
+ *
+ * 设计思想：
+ *   1. 委托结构：真正的实现只有一份（ExecEvalRowNullInt），两个入口
+ *      只差"判空方向"，避免复制代码。
+ *   2. SQL 标准语义（在 ExecEvalRowNullInt 中实现）：
+ *      - R IS NULL 当且仅当 R 的每个字段都是 NULL；
+ *      - R IS NOT NULL 当且仅当 R 没有任何字段为 NULL；
+ *      - 判定是"原始 attisnull"层面的，不做递归（字段本身若是行类型，
+ *        不递归检查其字段）；
+ *      - 零字段的行（空行类型）两者都空洞满足（返回 true）。
+ *      注意这与"行是否等于 NULL 复合值"完全不同——NULL 复合 Datum
+ *      直接当作标量 NULL 处理。
+ * ============================================================================
  */
 void
 ExecEvalRowNull(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3311,16 +4014,38 @@ ExecEvalRowNull(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 	ExecEvalRowNullInt(state, op, econtext, true);
 }
 
-/*
- * Evaluate NullTest / IS NOT NULL for rows.
- */
+/* 行值 IS NOT NULL：同 ExecEvalRowNull 中文注释，checkisnull=false */
 void
 ExecEvalRowNotNull(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 {
 	ExecEvalRowNullInt(state, op, econtext, false);
 }
 
-/* Common code for IS [NOT] NULL on a row value */
+/*
+ * ============================================================================
+ * 【中文注释】ExecEvalRowNullInt —— 行 IS [NOT] NULL 的公共实现（核心）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对结果寄存器中的行 Datum（HeapTupleHeader 复合值）逐字段执行
+ *   attisnull 检查，按 checkisnull 方向汇总出 IS NULL / IS NOT NULL 的
+ *   布尔结果；源值为 NULL 时退化为标量 NULL 判定。
+ *
+ * 参数：
+ *   checkisnull - true 表示求 IS NULL；false 表示求 IS NOT NULL。
+ *
+ * 设计思想：
+ *   1. 槽位约定：输入在 *op->resvalue（前一步求值的行值），输出覆写
+ *      同一寄存器，不额外分配。
+ *   2. NULL 复合值等价于标量 NULL：直接返回 checkisnull，不进入逐字段
+ *      逻辑（与 SQL 语义一致：一个 NULL 的行变量就是"值未知"）。
+ *   3. 行类型缓存：通过 get_cached_rowtype 按 (tupType, tupTypmod) 取
+ *      描述符并缓存于 step 的 rowcache；描述符可能在执行期间因 DDL
+ *      失效，该函数自动重查。
+ *   4. 逐字段判定采用 heap_attisnull（直接用 null bitmap/无位图优化，
+ *      比 heap_getattr 轻）并跳过已丢弃列；一旦出现"反例字段"立即
+ *      返回 false 短路——行通常只有少数字段，最坏 O(natts)。
+ * ============================================================================
+ */
 static void
 ExecEvalRowNullInt(ExprState *state, ExprEvalStep *op,
 				   ExprContext *econtext, bool checkisnull)
@@ -3402,10 +4127,34 @@ ExecEvalRowNullInt(ExprState *state, ExprEvalStep *op,
 }
 
 /*
- * Evaluate an ARRAY[] expression.
+ * ============================================================================
+ * 【中文注释】ExecEvalArrayExpr —— ARRAY[...] 数组构造（核心）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把编译期预分配的 elemvalues/elemnulls 中的各元素组装成 ArrayType：
+ *   一维数组直接 construct_md_array；多维数组（元素本身是子数组）需
+ *   校验各子数组维度一致、合并数据区与 NULL 位图，并做溢出/维度检查。
  *
- * The individual array elements (or subarrays) have already been evaluated
- * into op->d.arrayexpr.elemvalues[]/elemnulls[].
+ * 参数：
+ *   state - ExprState（保留，未直接使用）。
+ *   op    - ARRAYEXPR 步：d.arrayexpr 提供 elemtype、nelems、multidims、
+ *           elemvalues/elemnulls 及元素类型物理属性。
+ *
+ * 设计思想：
+ *   1. 两种形态：
+ *      - 非多维（multidims=false）：元素是标量，一维、下界 1 构造；
+ *      - 多维（multidims=true）：元素应是数组，结果维度 = 子数组维度+1。
+ *   2. 多维合并细节：以第一个非空子数组的维度/下界为基准，其余子数组
+ *      必须完全一致（含下界），否则按 SQL 报 ARRAY_SUBSCRIPT_ERROR；
+ *      运行时还会复核元素类型（编译期推断可能与实际运行类型不同）。
+ *      NULL 子数组与 0 维空数组都标记 haveempty：全部为空时返回空数组，
+ *      部分为空时报维度不一致错误。
+ *   3. 内存规划：先累加各子数组数据字节数与 NULL 位图需要，统一 palloc
+ *      一次并逐块 memcpy（含 64 位对齐安全；位图用 array_bitmap_copy），
+ *      避免逐元素插入的开销与碎片。
+ *   4. 总大小按 AllocSizeIsValid 防溢出（MaxAllocSize 上限），下标乘积
+ *      ArrayCheckBounds 防整型溢出。
+ * ============================================================================
  */
 void
 ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
@@ -3617,9 +4366,26 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate an ArrayCoerceExpr expression.
+ * ============================================================================
+ * 【中文注释】ExecEvalArrayCoerce —— 数组类型转换（ArrayCoerceExpr）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对源数组（在 *op->resvalue）执行元素级类型转换：二进制兼容时仅改写
+ *   数组头部的元素类型 OID；否则用 array_map 对每个元素应用元素转换
+ *   表达式（elemexprstate）。
  *
- * Source array is in step's result variable.
+ * 设计思想：
+ *   1. 两条路径的选择由编译期决定（elemexprstate 是否生成）：
+ *      - NULL（二进制兼容）：转换只涉及"类型标记"，物理布局不变——
+ *        只 detoast+拷贝（DatumGetArrayTypePCopy 保证后续改写头部不污染
+ *        原 datum）后改 ARR_ELEMTYPE；
+ *      - 非 NULL：需要真正的逐元素转换，array_map 复用元素表达式
+ *        状态（elemexprstate 已在 ExecInitExpr 编译好，amstate 为
+ *        ArrayMapState 缓存），避免为每个数组重新初始化。
+ *   2. NULL 数组原样返回 NULL（resnull 已置位，直接 return）。
+ *   3. 典型场景：隐式/显式的元素类型提升（如 int[] -> bigint[]、
+ *      varchar[] -> text[]），以及聚合函数中对数组参数的归并转换。
+ * ============================================================================
  */
 void
 ExecEvalArrayCoerce(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3657,10 +4423,22 @@ ExecEvalArrayCoerce(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 }
 
 /*
- * Evaluate a ROW() expression.
+ * ============================================================================
+ * 【中文注释】ExecEvalRow —— ROW(...) 行构造
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   用编译期备好的行描述符（op->d.row.tupdesc）把已求值字段
+ *   （elemvalues/elemnulls，前置 step 逐字段写入）经 heap_form_tuple
+ *   组装为复合类型 Datum。
  *
- * The individual columns have already been evaluated into
- * op->d.row.elemvalues[]/elemnulls[].
+ * 设计思想：
+ *   1. 列值已在解释器主循环中逐个求值并写入预分配数组，本函数只做
+ *      一次"打包"，因此体积极小、语义清晰。
+ *   2. heap_form_tuple 负责按描述符的物理属性（typbyval/typlen/对齐）
+ *      布置元组并生成 NULL 位图；结果是非 NULL 复合值（resnull=false）。
+ *   3. 典型场景：SELECT ROW(a, b)、行比较/行 IN 的操作数、INSERT 的
+ *      行值构造、把若干列当复合参数传给函数等。
+ * ============================================================================
  */
 void
 ExecEvalRow(ExprState *state, ExprEvalStep *op)
@@ -3677,10 +4455,23 @@ ExecEvalRow(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate GREATEST() or LEAST() expression (note this is *not* MIN()/MAX()).
+ * ============================================================================
+ * 【中文注释】ExecEvalMinMax —— GREATEST / LEAST 多值极值（注意非聚合）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对全部已求值输入（values/nulls 数组）用类型比较函数两两比较，
+ *   挑选最大（GREATEST）或最小（LEAST）值；NULL 输入被忽略，全部为
+ *   NULL 时结果为 NULL。
  *
- * All of the to-be-compared expressions have already been evaluated into
- * op->d.minmax.values[]/nulls[].
+ * 设计思想：
+ *   1. 与聚合 MIN/MAX 的区别：这里是"标量值集合的极值"语义——NULL
+ *      直接跳过（不是"未知"参与排序），只从非 NULL 值中选；全部为
+ *      NULL 才返回 NULL。
+ *   2. 性能：结果寄存器先置 NULL（作为"尚无候选"标志），首个非 NULL
+ *      输入直接采纳，之后每来一个输入与当前极值比较并替换——单遍
+ *      O(n)，比较函数复用编译期备好的 fcinfo（两参数槽复用）。
+ *   3. 比较函数返回 NULL 被视为"不应发生"的防御：跳过该输入继续。
+ * ============================================================================
  */
 void
 ExecEvalMinMax(ExprState *state, ExprEvalStep *op)
@@ -3731,9 +4522,26 @@ ExecEvalMinMax(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate a FieldSelect node.
+ * ============================================================================
+ * 【中文注释】ExecEvalFieldSelect —— 复合类型取字段（(row_expr).col）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从结果寄存器中的复合 Datum 取出 fieldnum 指定字段并覆写回结果
+ *   寄存器；支持普通堆元组复合值与被 detoast 的展开记录（expanded
+ *   record）两种形态。
  *
- * Source record is in step's result variable.
+ * 设计思想：
+ *   1. NULL 复合值 → NULL 字段结果，直接返回。
+ *   2. 展开记录快速路径：VARATT_IS_EXTERNAL_EXPANDED 检测后直接
+ *      expanded_record_get_field，零拷贝取字段（避免先物化为堆元组）。
+ *   3. 普通路径：HeapTupleHeader 上按行类型描述符用 heap_getattr 取，
+ *      描述符经 get_cached_rowtype 缓存（DDL 后自动重查）。
+ *   4. 防御检查：不支持系统列（复合 Datum 里多数系统列无意义）；
+ *      被 DROP 的列返回 NULL（不是错误——编译期就允许引用丢弃列，
+ *      运行期遇到按"该列值视为 NULL"处理）；类型漂移
+ *      （ALTER COLUMN TYPE 后）报 DATATYPE_MISMATCH；typmod 有意不查
+ *      （与 CheckVarSlotCompatibility 同理）。
+ * ============================================================================
  */
 void
 ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3852,13 +4660,26 @@ ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 }
 
 /*
- * Deform source tuple, filling in the step's values/nulls arrays, before
- * evaluating individual new values as part of a FieldStore expression.
- * Subsequent steps will overwrite individual elements of the values/nulls
- * arrays with the new field values, and then FIELDSTORE_FORM will build the
- * new tuple value.
+ * ============================================================================
+ * 【中文注释】ExecEvalFieldStoreDeForm —— FieldStore 前半步：源行变形到数组
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把结果寄存器中的源复合值变形（deform）到 step 的
+ *   d.fieldstore.values/nulls 数组中，为后续"逐字段求新值并覆写"做
+ *   准备；源值为 NULL 时直接把整个数组置为全 NULL（等价于"由 NULL
+ *   行改写各字段"）。
  *
- * Source record is in step's result variable.
+ * 设计思想：
+ *   1. FieldStore 是两步流水线（与 ROW 构造配合实现复合列赋值）：
+ *      DEFORM 展开旧值 → 中间的 FIELD_* step 求新字段值并覆写数组
+ *      元素 → FORMAT 阶段 heap_form_tuple 重装（见 ExecEvalFieldStoreForm）。
+ *   2. 行类型描述符经 get_cached_rowtype 按结果类型缓存；DESCRIPTOR
+ *      列数超过编译期分配上限时 elog 内部错误（DDL 增列但计划未失效
+ *      的兜底，正常情况下不会发生）。
+ *   3. detoast 顺序注意：先 DatumGetHeapTupleHeader 再查描述符——查
+ *      描述符可能触发缓存失效导致数据库访问，而 detoast 也可能访问
+ *      数据库；注释明确要求不得颠倒这两步。
+ * ============================================================================
  */
 void
 ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3907,8 +4728,20 @@ ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econte
 }
 
 /*
- * Compute the new composite datum after each individual field value of a
- * FieldStore expression has been evaluated.
+ * ============================================================================
+ * 【中文注释】ExecEvalFieldStoreForm —— FieldStore 后半步：重装新复合值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在 DEFORM 展开的数组被各字段新值覆写完成后，用 heap_form_tuple
+ *   按结果类型描述符重新组装复合 Datum 并写回结果寄存器。
+ *
+ * 设计思想：
+ *   与 ExecEvalFieldStoreDeForm 严格配对（共用同一 rowcache、同一
+ *   values/nulls 数组）；描述符此时应已在 DEFORM 阶段缓存过
+ *   （"should be valid already"），这里再查一次是廉价防御。组装结果
+ *   恒非 NULL。典型场景：UPDATE 语句对复合列（如 whole-row 字段、
+ *   域上复合）的部分字段赋值。
+ * ============================================================================
  */
 void
 ExecEvalFieldStoreForm(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3929,10 +4762,28 @@ ExecEvalFieldStoreForm(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 }
 
 /*
- * Evaluate a rowtype coercion operation.
- * This may require rearranging field positions.
+ * ============================================================================
+ * 【中文注释】ExecEvalConvertRowtype —— 行类型转换（ConvertRowtypeExpr）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把结果寄存器中的行 Datum 从 inputtype 转为 outputtype：按属性名
+ *   建立映射重排字段（execute_attr_map_tuple），或物理布局兼容时仅重打
+ *   复合头类型标记；结果写回结果寄存器。
  *
- * Source record is in step's result variable.
+ * 设计思想：
+ *   1. 使用场景：显式 ::rowtype 转换、继承/分区子父表行互转、以及
+ *      planner 为整行传参插的类型转换。
+ *   2. 懒构建映射：convert_tuples_by_name 在首次（或类型缓存失效后）
+ *      才构建，缓存在 step 的 map 字段（分配在 per-query 内存，跨行
+ *      复用）；描述符每次用 get_cached_rowtype 取，返回前
+ *      IncrTupleDescRefCount 加 pin（转换函数可能做目录查询触发缓存
+ *      失效），用完后 DecrTupleDescRefCount 释放。
+ *   3. 双路径：map 非 NULL → 完整重排拷贝；map 为 NULL（按名即按物理
+ *      顺序兼容）→ heap_copy_tuple_as_datum 拷贝并重打正确的行类型头
+ *      （复合头里必须含目标类型 OID，因此物理兼容也必须拷贝）。
+ *   4. 弱化断言：输入行可能是 RECORDOID（整行 Var 别名化后），因此只
+ *      断言"输入类型 == 期望或 RECORD"。
+ * ============================================================================
  */
 void
 ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -4020,14 +4871,27 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 }
 
 /*
- * Evaluate "scalar op ANY/ALL (array)".
+ * ============================================================================
+ * 【中文注释】ExecEvalScalarArrayOp —— 标量 op ANY/ALL（数组）求值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对数组的每个元素应用二元操作符（fcinfo->args[0] 为标量、args[1]
+ *   逐元素填入），结果恒为布尔：ANY 用 OR 合并、ALL 用 AND 合并，
+ *   可中途短路。
  *
- * Source array is in our result area, scalar arg is already evaluated into
- * fcinfo->args[0].
- *
- * The operator always yields boolean, and we combine the results across all
- * array elements using OR and AND (for ANY and ALL respectively).  Of course
- * we short-circuit as soon as the result is known.
+ * 设计思想：
+ *   1. 快捷路径：数组为 NULL → 结果 NULL（哪怕操作符非严格）；空数组
+ *      → ANY 为 FALSE、ALL 为 TRUE（对零个元素"存在性"的空洞结论，
+ *      即使标量为 NULL 也不影响）；严格操作符且标量为 NULL → NULL
+ *      （免去空转循环）。
+ *   2. 元素遍历（ExecEvalArrayCompareInternal）：手动按 typlen/typbyval/
+ *      typalign 行走数据区 + NULL 位图（fetch_att 式），避免把元素
+ *      逐一出队为 Datum 数组；元素类型信息首次遇到时
+ *      get_typlenbyvalalign 缓存（元素类型运行期漂移自动重查）。
+ *   3. 短路：OR 一旦得到 TRUE、ALL 一旦得到 FALSE 立即退出循环；
+ *      元素比较返回 NULL 时置 resultnull（三值逻辑：只有出现反例或
+ *      全部定论才覆盖 NULL）。
+ * ============================================================================
  */
 void
 ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
@@ -4101,11 +4965,33 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Shared helper for ExecEvalScalarArrayOp() and the NULL-LHS fallback for
- * non-strict ExecEvalHashedScalarArrayOp().
+ * ============================================================================
+ * 【中文注释】ExecEvalArrayCompareInternal —— 数组逐元素比较的公共内联实现
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   在数组数据区上直接遍历元素，逐个调用比较函数并按 useOr（OR=ANY /
+ *   AND=ALL）合并结果到 *result 与 *resultnull，支持短路。
  *
- * Callers must handle the strict LHS-is-NULL; return NULL fast path prior to
- * calling this.
+ * 参数：
+ *   fcinfo     - 比较函数调用信息（args[0]=标量，args[1] 每轮填元素）。
+ *   arr        - 源数组（已 detoast）。
+ *   typlen/typbyval/typalign - 元素类型的物理属性（调用方已按元素类型备好）。
+ *   useOr      - true=ANY(OR) / false=ALL(AND)。
+ *   result/resultnull - 输出：合并后的布尔结果与 NULL 标志。
+ *
+ * 设计思想：
+ *   1. 双调用方共享：ExecEvalScalarArrayOp（常规 ANY/ALL）与
+ *      ExecEvalHashedScalarArrayOp 构建哈希表时对 NULL 左值的预扫描。
+ *      调用方必须已处理"严格函数 + 标量 NULL"的快路径。
+ *   2. 零装箱遍历：直接在数组数据区按对齐步长行走（fetch_att +
+ *      att_nominal_alignby），NULL 元素从位图判定；避免构造元素数组，
+ *      是解释器里极少数"手写内存行走"的热路径之一。
+ *   3. 三值合并：任何一次比较返回 NULL → 记 resultnull；一旦出现与
+ *      useOr 矛盾的确定结果（OR 得 TRUE / AND 得 FALSE）即短路返回；
+ *      全循环无矛盾时 *result 保持初值（OR 初 FALSE、AND 初 TRUE），
+ *      仅当存在 NULL 结果时才输出 NULL。
+ *   4. 严格性：元素为 NULL 且函数严格时跳过调用直接视为 NULL 结果。
+ * ============================================================================
  */
 static pg_always_inline void
 ExecEvalArrayCompareInternal(FunctionCallInfo fcinfo, ArrayType *arr,
@@ -4198,10 +5084,27 @@ ExecEvalArrayCompareInternal(FunctionCallInfo fcinfo, ArrayType *arr,
 }
 
 /*
- * Hash function for scalar array hash op elements.
+ * ============================================================================
+ * 【中文注释】saop_element_hash / saop_hash_element_match —— 哈希标量数组
+ *              操作的元素哈希与相等回调
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   供 simplehash 哈希表使用的两个回调：
+ *   saop_element_hash 用元素类型默认哈希函数（含 collation 敏感列的
+ *   列排序规则）计算数组元素哈希；saop_hash_element_match 用相等函数
+ *   判定两个元素是否相等。
  *
- * We use the element type's default hash opclass, and the column collation
- * if the type is collation-sensitive.
+ * 设计思想：
+ *   1. 二者通过 tb->private_data 取回 ScalarArrayOpExprHashTable，其内含
+ *      编译期备好的 hash_finfo/hash_fcinfo_data（哈希）与 op->d.
+ *      hashedscalararrayop.fcinfo_data/finfo（相等），避免每次回调重建
+ *      调用上下文。
+ *   2. 哈希表元素只存 Datum（不存 NULL），NULL 用 has_nulls 标志单独
+ *      处理（见 ExecEvalHashedScalarArrayOp）——因此回调里从不出现
+ *      NULL 键，isnull 恒置 false。
+ *   3. 相等回调与 SQL IN 语义完全一致：数组元素与标量用运算符相等性
+ *      判定，结果即 IN/NOT IN 的查表依据。
+ * ============================================================================
  */
 static uint32
 saop_element_hash(struct saophash_hash *tb, Datum key)
@@ -4218,10 +5121,7 @@ saop_element_hash(struct saophash_hash *tb, Datum key)
 	return DatumGetUInt32(hash);
 }
 
-/*
- * Matching function for scalar array hash op elements, to be used in hashtable
- * lookups.
- */
+/* 同 saop_element_hash 中文注释：相等回调（哈希表查表用） */
 static bool
 saop_hash_element_match(struct saophash_hash *tb, Datum key1, Datum key2)
 {
@@ -4241,17 +5141,36 @@ saop_hash_element_match(struct saophash_hash *tb, Datum key1, Datum key2)
 }
 
 /*
- * Evaluate "scalar op ANY (const array)".
+ * ============================================================================
+ * 【中文注释】ExecEvalHashedScalarArrayOp —— 常量数组的 IN/NOT IN 哈希化求值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   求值 "标量 op ANY（常量数组）"（编译器保证数组是常量且非 NULL）：
+ *   首次求值时把数组元素建成哈希表（per-query 内存，后续行复用），
+ *   之后每行 O(1) 查表得到 IN/NOT IN 布尔结果；NULL 与严格性语义单独
+ *   处理。
  *
- * Similar to ExecEvalScalarArrayOp, but optimized for faster repeat lookups
- * by building a hashtable on the first lookup.  This hashtable will be reused
- * by subsequent lookups.  Unlike ExecEvalScalarArrayOp, this version only
- * supports OR semantics.
- *
- * Source array is in our result area, scalar arg is already evaluated into
- * fcinfo->args[0].
- *
- * The operator always yields boolean.
+ * 设计思想：
+ *   1. 与 ExecEvalScalarArrayOp 的分工：后者对任意数组逐元素比较
+ *      （每行 O(n)）；本函数针对"同一常量数组作用于每行"的形态
+ *      （典型如 x IN (1,2,3)），用哈希把每行代价降到 O(1)。
+ *   2. 建表细节（首行）：
+ *      - 数组元素逐个 fetch_att 行走插入 simplehash，NULL 不进表而是
+ *        记 has_nulls 标志；
+ *      - 哈希/相等函数信息与调用上下文在 per-query 内存一次性建好
+ *        （fmgr_info + InitFunctionCallInfoData），跨行复用；
+ *      - 容量按元素数预分配（假定无重复，重复只会让表略大）。
+ *   3. NULL 语义（三路）：
+ *      - 严格函数 + 标量 NULL → 结果 NULL（不查表）；
+ *      - 非严格函数 + 标量 NULL：用缓存的 null_lhs_result（建表时用
+ *        线性扫描 ExecEvalArrayCompareInternal 对"NULL 左值"预评估
+ *        并缓存——非严格函数可能把 NULL 当作与某些值相等！）；
+ *      - 标量非 NULL、查表未命中但数组含 NULL：严格 → NULL（SQL 三值
+ *        语义：元素 NULL 与标量的比较结果未知）；非严格 → 以 NULL 右值
+ *        再调一次函数（结果按 NOT IN 翻转）。
+ *   4. 结果翻转：NOT IN 是 IN 的布尔取反（hashfound 取反；函数比较
+ *      路径再翻转一次相等结果）。
+ * ============================================================================
  */
 void
 ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -4478,7 +5397,23 @@ ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op, ExprContext *eco
 }
 
 /*
- * Evaluate a NOT NULL domain constraint.
+ * ============================================================================
+ * 【中文注释】ExecEvalConstraintNotNull —— 域（domain）NOT NULL 约束检查
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查结果寄存器中的域值是否为 NULL：若是，则按错误上下文
+ *   （escontext）抛出 NOT NULL_VIOLATION 错误（硬错误或软错误，
+ *   取决于调用方设置的 ErrorSaveContext）。
+ *
+ * 设计思想：
+ *   1. 这是域类型检查流水线的一环：compile-time 已把域约束翻译成
+ *      "计算约束表达式 + 本检查 step"；constraint/not null 检查以
+ *      step 形式插入到 CAST 目标域类型的值之后。
+ *   2. 使用 errsave() 走错误上下文：普通求值路径会抛 ERROR；
+ *      而在 UPDATE 的软错误（soft error）场景（如 RETURNING 里触发的
+ *      域约束失败仅需记录）可通过 escontext 捕获，配合 errdatatype
+ *      给出域类型信息（hint 链）。
+ * ============================================================================
  */
 void
 ExecEvalConstraintNotNull(ExprState *state, ExprEvalStep *op)
@@ -4492,7 +5427,23 @@ ExecEvalConstraintNotNull(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate a CHECK domain constraint.
+ * ============================================================================
+ * 【中文注释】ExecEvalConstraintCheck —— 域（domain）CHECK 约束检查
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   前置 step 已把域 CHECK 约束表达式的值求入
+ *   d.domaincheck.checkvalue/checknull；本函数判定失败条件：
+ *   "约束表达式结果为 FALSE（且非 NULL）"即违反，通过 errsave()
+ *   按 escontext 抛出 CHECK_VIOLATION（附约束名与域类型）。
+ *
+ * 设计思想：
+ *   1. SQL 语义：约束表达式为 NULL 或 TRUE 均视为通过；只有显式
+ *      FALSE 才违规（对应 CHECK 约束"未知不拒绝"的三值逻辑）。
+ *   2. 配合 ExecEvalConstraintNotNull 构成域检查的两种 step；
+ *      errdomainconstraint 提供 SQLSTATE/errdetail 的约束链信息。
+ *   3. 软错误路径：由调用方（如 ExecEvalCoerceToDomain 场景下的
+ *      赋值目标）决定是否捕获，实现 RETURNING 等场景的延迟报错。
+ * ============================================================================
  */
 void
 ExecEvalConstraintCheck(ExprState *state, ExprEvalStep *op)
@@ -4509,10 +5460,28 @@ ExecEvalConstraintCheck(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate the various forms of XmlExpr.
+ * ============================================================================
+ * 【中文注释】ExecEvalXmlExpr —— 各形态 XmlExpr（XML 构造/序列化/解析）求值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   按 xexpr->op 分发执行 XML 语义：XMLCONCAT（拼接）、XMLFOREST
+ *   （命名列转 XML 片段）、XMLELEMENT（构造元素）、XMLPARSE（文本
+ *   解析为 xml）、XMLPI（处理指令）、XMLROOT（改根属性）、XMLSERIALIZE
+ *   （序列化为文本）、IS_DOCUMENT（判定文档）。所有参数已由前置 step
+ *   求值到 argvalue/argnull（无名）与 named_argvalue/named_argnull
+ *   （命名）数组，结果写回结果寄存器。
  *
- * Arguments have been evaluated into named_argvalue/named_argnull
- * and/or argvalue/argnull arrays.
+ * 设计思想：
+ *   1. 这是"编译期翻译 + 运行期分派"的典型：XmlExpr 树解析于
+ *      execExpr.c（命名参数与位置参数按名/序分类装入数组），本函数
+ *      只做最终的语义化组装。
+ *   2. NULL 传播遵循各形态规则：XMLFOREST/XMLELEMENT 遇 NULL 参数
+ *      时跳过该列/子元素（保留其余）；XMLPARSE/XMLROOT/XMLSERIALIZE/
+ *      IS_DOCUMENT 的参数为 NULL 时整个表达式结果为 NULL（return）。
+ *   3. 安全细节：XMLFOREST 用 map_sql_value_to_xml_value 对每个值做
+ *      类型化的 XML 转义；XMLSERIALIZE/XMLPARSE 用 xexpr 里编译期
+ *      固化好的 xmloption（DOCUMENT/CONTENT）与 indent 开关。
+ * ============================================================================
  */
 void
 ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
@@ -4727,7 +5696,26 @@ ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate a JSON constructor expression.
+ * ============================================================================
+ * 【中文注释】ExecEvalJsonConstructor —— JSON_ARRAY / JSON_OBJECT /
+ *              JSON / JSON_SCALAR 构造表达式求值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   按构造器类型（JSCTOR_JSON_ARRAY/OBJECT/SCALAR/PARSE）把已求值的
+ *   参数数组（jcstate->arg_values/arg_nulls/arg_types）组装为 json 或
+ *   jsonb 值，结果写回结果寄存器。
+ *
+ * 设计思想：
+ *   1. 双格式统一：依据 RETURNING 子句的 format_type 选择 json_* 还是
+ *      jsonb_* 系列 worker（如 jsonb_build_array_worker），编译期已在
+ *      jcstate 备好输出函数（outfuncid）与类型分类（category）。
+ *   2. 语义开关在构造器里固化：absent_on_null（NULL 参数在 ARRAY/
+ *      OBJECT 中是否省略）与 unique（OBJECT 键唯一性校验）。
+ *   3. JSON_SCALAR：把单个标量值经 datum_to_json(b) 序列化；参数为
+ *      NULL 时结果为 SQL NULL。JSON_PARSE（即 JSON(...) 语法）：对
+ *      text 输入做解析（jsonb 直接 jsonb_from_text；json 类型先
+ *      json_validate 校验文本合法性，通过则原值返回）。
+ * ============================================================================
  */
 void
 ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
@@ -4805,7 +5793,25 @@ ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
 }
 
 /*
- * Evaluate a IS JSON predicate.
+ * ============================================================================
+ * 【中文注释】ExecEvalJsonIsPredicate —— "IS JSON" 谓词求值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判定结果寄存器中的值是否满足 "IS [NOT] JSON [OBJECT|ARRAY|SCALAR
+ *   [WITH UNIQUE KEYS]]" 的指定类型与键唯一性要求，结果为布尔写回
+ *   结果寄存器（原值已被本 step 结果覆盖）。
+ *
+ * 设计思想：
+ *   1. 输入为 NULL → 结果 FALSE（SQL 谓词对 NULL 输入不返回 NULL，
+ *      而是"不是 JSON"为假）。
+ *   2. 按表达式基类型分流：text/json 走文本扫描
+ *      （json_get_first_token 看首 token 定根类型，必要时再做一次
+ *      json_validate 全量解析以支持 WITH UNIQUE KEYS 或 text 合法性）；
+ *      jsonb 直接查根容器位（JB_ROOT_IS_*），键唯一性对 jsonb 是
+ *      结构上恒成立的（构建时已保证），无需再校验。
+ *   3. IS JSON ANY 是恒真快速路径（只要输入非 NULL 且类型为 JSON
+ *      兼容类型）；不支持的类型一律 FALSE。
+ * ============================================================================
  */
 void
 ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
@@ -4891,19 +5897,37 @@ ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * Evaluate a jsonpath against a document, both of which must have been
- * evaluated and their values saved in op->d.jsonexpr.jsestate.
+ * ============================================================================
+ * 【中文注释】ExecEvalJsonExprPath —— SQL/JSON 路径表达式核心求值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对已格式化的文档（jsestate->formatted_expr.value）执行
+ *   jsonpath 查询，实现 JSON_EXISTS / JSON_QUERY / JSON_VALUE 三种
+ *   操作；必要时用输入函数把结果强转成 RETURNING 类型；随后按
+ *   ON EMPTY / ON ERROR 行为决定返回值或跳转目标。
  *
- * If an error occurs during JsonPath* evaluation or when coercing its result
- * to the RETURNING type, JsonExprState.error is set to true, provided the
- * ON ERROR behavior is not ERROR.  Similarly, if JsonPath{Query|Value}() found
- * no matching items, JsonExprState.empty is set to true, provided the ON EMPTY
- * behavior is not ERROR.  That is to signal to the subsequent steps that check
- * those flags to return the ON ERROR / ON EMPTY expression.
+ * 返回值：
+ *   下一个 step 的下标：jump_error、jump_empty、jump_eval_coercion
+ *   或 jump_end（全部存于 op->d.jsonexpr.jsestate）；-1 语义为
+ *   "顺序执行下一 step"。
  *
- * Return value is the step address to be performed next.  It will be one of
- * jump_error, jump_empty, jump_eval_coercion, or jump_end, all given in
- * op->d.jsonexpr.jsestate.
+ * 设计思想：
+ *   1. 软错误管道：throw_error=false 时 JsonPath 求值错误与强转错误
+ *      不直接抛 ERROR，而是置 jsestate->error（NullableDatum）；
+ *      后续 step（如 ExecEvalJsonCoercion）检查该标志决定返回
+ *      ON ERROR 表达式的结果。
+ *   2. ON EMPTY/ON ERROR 统一编排：empty/error 置位后，若配置了
+ *      相应行为表达式则设置 ErrorSaveContext（details_wanted 以便
+ *      报错信息带 DETAIL），跳转到行为表达式 step（jump_empty/
+ *      jump_error）；行为为 NULL 时直接跳到 jump_end；行为为 ERROR
+ *      或未配置则这里直接抛 NO_SQL_JSON_ITEM。
+ *   3. 结果产出路径多样：JSON_VALUE 里，按 RETURNING 类型与
+ *      是否 use_json_coercion/use_io_coercion 决定直接给 Jsonb、
+ *      给序列化字符串、或留待 io 输入函数强转；每行开始时
+ *      memset 复位 error/empty/escontext，保证行间不串状态。
+ *   4. 每次调用都返回显式跳转下标，不依赖解释器顺序执行——这是
+ *      少数需要"运行期决定控制流"的 step。
+ * ============================================================================
  */
 int
 ExecEvalJsonExprPath(ExprState *state, ExprEvalStep *op,
@@ -5103,9 +6127,18 @@ ExecEvalJsonExprPath(ExprState *state, ExprEvalStep *op,
 }
 
 /*
- * Convert the given JsonbValue to its C string representation
+ * ============================================================================
+ * 【中文注释】ExecGetJsonValueItemString —— JsonbValue 转 C 字符串
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 JSON_VALUE 取出的 JsonbValue 转成其 C 字符串表示（供 RETURNING
+ *   类型为标量时调用输入函数强转），jbvNull 通过 *resnull 标记。
  *
- * *resnull is set if the JsonbValue is a jbvNull.
+ * 设计思想：
+ *   各 jsonb 值类型分别走专用输出：字符串直接拷贝、numeric/bool/
+ *   datetime 调对应类型的 *_out 函数（datetime 需携带 typid 分派）、
+ *   数组/对象序列化为 jsonb 文本；出错即内部错误。
+ * ============================================================================
  */
 static char *
 ExecGetJsonValueItemString(JsonbValue *item, bool *resnull)
@@ -5176,11 +6209,25 @@ ExecGetJsonValueItemString(JsonbValue *item, bool *resnull)
 }
 
 /*
- * Coerce a jsonb value produced by ExecEvalJsonExprPath() or an ON ERROR /
- * ON EMPTY behavior expression to the target type.
+ * ============================================================================
+ * 【中文注释】ExecEvalJsonCoercion —— 把 jsonb 结果强转为 RETURNING 类型
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把 ExecEvalJsonExprPath() 或 ON ERROR / ON EMPTY 行为表达式产出的
+ *   jsonb 值，经 json_populate_type() 强转为目标类型（含 typmod 与
+ *   域约束检查），结果写回结果寄存器。
  *
- * Any soft errors that occur here will be checked by
- * EEOP_JSONEXPR_COERCION_FINISH that will run after this.
+ * 设计思想：
+ *   1. JSON_EXISTS 特例（exists_coerce）：结果为布尔；目标为整型或其
+ *      域时用 bool_int4 直接转换（整型的输入函数不接受布尔字面量），
+ *      并顺带做域约束检查（domain_check_safe）；否则把布尔编码成
+ *      jsonb 的 true/false 再走统一路径。
+ *   2. 转换期间的软错误（如类型不匹配）被捕获进 escontext，由紧随的
+ *      EEOP_JSONEXPR_COERCION_FINISH step（ExecEvalJsonCoercionFinish）
+ *      检查并转成 ON ERROR 处理或真实报错。
+ *   3. omit_quotes 控制标量目标类型对字符串/数字引号的取舍，编译期
+ *      依 RETURNING 子句固化。
+ * ============================================================================
  */
 void
 ExecEvalJsonCoercion(ExprState *state, ExprEvalStep *op,
@@ -5234,6 +6281,16 @@ ExecEvalJsonCoercion(ExprState *state, ExprEvalStep *op,
 									   (Node *) escontext);
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】GetJsonBehaviorValueString —— 把 ON ERROR / ON EMPTY 行为
+ *              类型转成可读字符串（用于错误信息）
+ * ----------------------------------------------------------------------------
+ * 设计思想：
+ *   数组顺序必须与 JsonBehaviorType 枚举定义一一对应（注释已强调），
+ *   只服务于 ExecEvalJsonCoercionFinish 的报错信息。
+ * ============================================================================
+ */
 static char *
 GetJsonBehaviorValueString(JsonBehavior *behavior)
 {
@@ -5258,9 +6315,23 @@ GetJsonBehaviorValueString(JsonBehavior *behavior)
 }
 
 /*
- * Checks if an error occurred in ExecEvalJsonCoercion().  If so, this sets
- * JsonExprState.error to trigger the ON ERROR handling steps, unless the
- * error is thrown when coercing a JsonBehavior value.
+ * ============================================================================
+ * 【中文注释】ExecEvalJsonCoercionFinish —— 检查强转软错误并编排
+ *              ON ERROR / ON EMPTY
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   检查 ExecEvalJsonCoercion() 期间是否发生了软错误（SOFT_ERROR_-
+ *   OCCURRED）。若发生：若 jsestate->error/empty 标志表明错误发生在
+ *   ON ERROR / ON EMPTY 行为表达式值的强转中，则直接把该强转错误
+ *   抛为真实 ERROR（错误细节经 errdetail 展示）；否则把结果置 NULL
+ *   并置 jsestate->error，触发后续 ON ERROR 处理 step。
+ *
+ * 设计思想：
+ *   soft-error 两段式：coercion step 用 escontext 捕获一切强转错误，
+ *   本 finish step 判定"错误来自主结果还是行为表达式"——前者走
+ *   ON ERROR 行为编排，后者按 SQL 标准应直接报错（行为值本身非法）；
+ *   处理完复位 escontext 供下一行复用。
+ * ============================================================================
  */
 void
 ExecEvalJsonCoercionFinish(ExprState *state, ExprEvalStep *op)
@@ -5307,13 +6378,22 @@ ExecEvalJsonCoercionFinish(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * ExecEvalGroupingFunc
+ * ============================================================================
+ * 【中文注释】ExecEvalGroupingFunc —— GROUPING() 分组集判定函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   计算 GROUPING(expr...) 的位掩码结果：从右到左为每个参数表达式
+ *   置 1 个 bit（最右侧参数是最低位），某参数不在当前分组集的
+ *   grouping 表达式集合中则对应 bit=1。
  *
- * Computes a bitmask with a bit for each (unevaluated) argument expression
- * (rightmost arg is least significant bit).
- *
- * A bit is set if the corresponding expression is NOT part of the set of
- * grouping expressions in the current grouping set.
+ * 设计思想：
+ *   1. 语义：分组集聚合（GROUP BY GROUPING SETS/CUBE/ROLLUP）中，
+ *      某列在"当前分组集"里没有参与分组时其值应为 NULL，GROUPING()
+ *      用它区分"真 NULL"与"分组产生的 NULL"。
+ *   2. 实现直取 aggstate->grouped_cols（当前分组集实际参与分组的
+ *      属性位图）与编译期记录的参数 attnum 列表逐位构造掩码；
+ *      结果恒非 NULL 的 int4。
+ * ============================================================================
  */
 void
 ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op)
@@ -5338,9 +6418,19 @@ ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op)
 }
 
 /*
- * ExecEvalMergeSupportFunc
+ * ============================================================================
+ * 【中文注释】ExecEvalMergeSupportFunc —— MERGE 的 RETURNING 辅助函数
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   返回当前正在执行的 MERGE action 名称（"INSERT"/"UPDATE"/"DELETE"
+ *   的 text 值），供 MERGE 语句 RETURNING 列表使用。
  *
- * Returns information about the current MERGE action for its RETURNING list.
+ * 设计思想：
+ *   直取 parent ModifyTableState 的 mt_merge_action 当前 action 的
+ *   commandType 映射为字符串；无进行中的 action 属非法状态直接报错
+ *   （DO NOTHING 分支不该走到求值）。文本用 cstring_to_text_with_len
+ *   常量字符串零拷贝组装。
+ * ============================================================================
  */
 void
 ExecEvalMergeSupportFunc(ExprState *state, ExprEvalStep *op,
@@ -5377,7 +6467,19 @@ ExecEvalMergeSupportFunc(ExprState *state, ExprEvalStep *op,
 }
 
 /*
- * Hand off evaluation of a subplan to nodeSubplan.c
+ * ============================================================================
+ * 【中文注释】ExecEvalSubPlan —— 子查询（SubPlan）求值转交
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把子查询求值交给 nodeSubplan.c 的 ExecSubPlan()：按子查询类型
+ *   （标量/EXISTS/IN/ANY/ALL 等）驱动下层执行、缓存结果并做相关化
+ *   参数处理，结果写回结果寄存器。
+ *
+ * 设计思想：
+ *   1. 本文件只做"交接"：sstate 在编译期由 ExecInitSubPlan 建好，
+ *      执行细节（物化、重复执行策略、参数重新扫描）都在 nodeSubplan.c。
+ *   2. check_stack_depth：子查询可嵌套任意深，防止深层递归耗尽栈。
+ * ============================================================================
  */
 void
 ExecEvalSubPlan(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -5391,10 +6493,32 @@ ExecEvalSubPlan(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 }
 
 /*
- * Evaluate a wholerow Var expression.
+ * ============================================================================
+ * 【中文注释】ExecEvalWholeRowVar —— 整行 Var 求值（表名.* / whole-row）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从表达式上下文取到整行 slot，经可选 junkfilter 过滤后组装为
+ *   复合 Datum 返回；首次执行时校验行类型与 Var 声明类型兼容并缓存
+ *   输出描述符（命名复合类型按声明描述符、RECORD 按输入槽描述符）。
  *
- * Returns a Datum whose value is the value of a whole-row range variable
- * with respect to given expression context.
+ * 设计思想：
+ *   1. 取槽分流：INNER/OUTER 取内/外表元组；默认（扫描）路径按
+ *      varreturningtype 取扫描槽或 RETURNING 的 OLD/NEW 槽——OLD/NEW
+ *      行不存在（INSERT 的 OLD / DELETE 的 NEW）时按标志直接返回 NULL。
+ *   2. 类型兼容性首行检查：对命名复合类型，比较属性数、逐列类型；
+ *      仅当源列是 dropped 列时允许类型不同，但物理存储（len/align）
+ *      不同则必须走 slow 路径——每行再检查 dropped 列是否恰好为
+ *      NULL（如过期的缓存计划插入含 dropped 列的表：planner 常产生
+ *      INT4 NULL 而不管 dropped 列原类型）。域上复合先剥到基类型。
+ *   3. 输出描述符：命名类型取声明（必须吸收 attisdropped 标记），
+ *      RECORD 类型取输入槽描述符并尽力从 RTE 的 eref 采列名；均拷贝
+ *      到 per-query 内存并 BlessTupleDesc 后缓存，此后跨行复用。
+ *   4. 组装：toast_build_flattened_tuple 保证 toasted 字段被展开
+ *      （复合 Datum 内不允许存在外部 toast 指针），再打上输出行类型
+ *      的 typeid/typmod 标签。
+ *   5. 为什么不在编译期做描述符检查：整行值经 slot 获取，slot 描述
+ *      符要到运行期才有（见函数内 XXX 注释）。
+ * ============================================================================
  */
 void
 ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -5655,6 +6779,23 @@ ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 	*op->resnull = false;
 }
 
+/*
+ * ============================================================================
+ * 【中文注释】ExecEvalSysVar —— 系统列（ctid/xmin/tableoid/…）求值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   从指定 slot 取 Var 指定的系统属性值（attnum 为负的系统列号），
+ *   结果写回结果寄存器；RETURNING 语境下 OLD/NEW 行整体为 NULL 时
+ *   直接返回 NULL。
+ *
+ * 设计思想：
+ *   1. OLD/NEW 防护：与整行 Var 同理，标志位 EEO_FLAG_OLD/NEW_IS_NULL
+ *      存在时系统列无意义，返回 NULL。
+ *   2. slot_getsysattr 统一处理各类系统列的派生计算（ctid 定位、
+ *      tableoid 取 OID 等），对非法 attnum 自带防御；命中 NULL 属
+ *      "不应发生"，用 unlikely 低成本防御报错。
+ * ============================================================================
+ */
 void
 ExecEvalSysVar(ExprState *state, ExprEvalStep *op, ExprContext *econtext,
 			   TupleTableSlot *slot)
@@ -5683,8 +6824,22 @@ ExecEvalSysVar(ExprState *state, ExprEvalStep *op, ExprContext *econtext,
 }
 
 /*
- * Transition value has not been initialized. This is the first non-NULL input
- * value for a group. We use it as the initial value for transValue.
+ * ============================================================================
+ * 【中文注释】ExecAggInitGroup —— 组的首个非 NULL 输入作为初始转移值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   当某组还没有初始化转移值时（这是该组的第一个非 NULL 输入），
+ *   直接把这个输入值（fcinfo->args[1]）拷贝进 per-tuple 上下文作为
+ *   transValue，并置位 transValueIsNull=false、noTransValue=false。
+ *
+ * 设计思想：
+ *   1. 这是聚合转移的"零调用"优化：min/max/sum 等简单聚合在
+ *      EEOP_AGG_PLAIN_TRANS_* 指令里先查 noTransValue，命中则直接
+ *      采纳输入，跳过对 transfn 的第一次调用。
+ *   2. 拷贝进 aggcontext 的 per-tuple 内存（按 per-tuple 生命周期，
+ *      由聚合框架在组间换 context 释放）；pass-by-ref 才真正拷贝，
+ *      输入类型与 transtype 已被编译期保证二进制兼容，故可直接拷贝。
+ * ============================================================================
  */
 void
 ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup pergroup,
@@ -5709,35 +6864,31 @@ ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup
 }
 
 /*
- * Ensure that the new transition value is stored in the aggcontext,
- * rather than the per-tuple context.  This should be invoked only when
- * we know (a) the transition data type is pass-by-reference, and (b)
- * the newValue is distinct from the oldValue.
+ * ============================================================================
+ * 【中文注释】ExecAggCopyTransValue —— 把新转移值落位到 aggcontext 并
+ *              释放旧值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   保证 pass-by-ref 的转移值存储在 aggcontext 的 per-tuple 上下文
+ *   中（而非 per-tuple 求值上下文），并释放旧转移值。仅当已知新值与
+ *   旧值不同（指针不同）时被调用。
  *
- * NB: This can change the current memory context.
+ * 注意：本函数会切换当前内存上下文（调用方须负责恢复）。
  *
- * We copy the presented newValue into the aggcontext, except when the datum
- * points to a R/W expanded object that is already a child of the aggcontext,
- * in which case we need not copy.  We then delete the oldValue, if not null.
- *
- * If the presented datum points to a R/W expanded object that is a child of
- * some other context, ideally we would just reparent it under the aggcontext.
- * Unfortunately, that doesn't work easily, and it wouldn't help anyway for
- * aggregate-aware transfns.  We expect that a transfn that deals in expanded
- * objects and is aware of the memory management conventions for aggregate
- * transition values will (1) on first call, return a R/W expanded object that
- * is already in the right context, allowing us to do nothing here, and (2) on
- * subsequent calls, modify and return that same object, so that control
- * doesn't even reach here.  However, if we have a generic transfn that
- * returns a new R/W expanded object (probably in the per-tuple context),
- * reparenting that result would cause problems.  We'd pass that R/W object to
- * the next invocation of the transfn, and then it would be at liberty to
- * change or delete that object, and if it deletes it then our own attempt to
- * delete the now-old transvalue afterwards would be a double free.  We avoid
- * this problem by forcing the stored transvalue to always be a flat
- * non-expanded object unless the transfn is visibly doing aggregate-aware
- * memory management.  This is somewhat inefficient, but the best answer to
- * that is to write a smarter transfn.
+ * 设计思想：
+ *   1. 拷贝豁免：newValue 若是已经是 aggcontext 子上下文的可写
+ *      expanded 对象则无需拷贝（聚合感知的 transfn 首调应直接返回
+ *      落位好的对象，此后原地修改并返回同一指针——这样根本走不到
+ *      这里）。
+ *   2. 不 reparent 的理由：若把 generic transfn 返回的可写 expanded
+ *      对象 reparent 到 aggcontext，下一次调用可能删除它，随后我们
+ *      再删旧值会双重释放——因此存储的转移值恒为扁平非 expanded
+ *      对象，除非 transfn 明确做聚合感知的内存管理（这在文档化的
+ *      记忆管理中是被接受的折中）。
+ *   3. NULL 的规范化：新值为 NULL 时置 (Datum) 0，使调用方可以安全
+ *      用指针比较判定新旧是否同一，而不必再判 NULL。
+ *   4. 旧值释放：expanded 用 DeleteExpandedObject，否则 pfree。
+ * ============================================================================
  */
 Datum
 ExecAggCopyTransValue(AggState *aggstate, AggStatePerTrans pertrans,
@@ -5783,10 +6934,25 @@ ExecAggCopyTransValue(AggState *aggstate, AggStatePerTrans pertrans,
 }
 
 /*
- * ExecEvalPreOrderedDistinctSingle
- *		Returns true when the aggregate transition value Datum is distinct
- *		from the previous input Datum and returns false when the input Datum
- *		matches the previous input Datum.
+ * ============================================================================
+ * 【中文注释】ExecEvalPreOrderedDistinctSingle —— 单输入有序聚合的去重
+ *              前判定（按值比较）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对"预先排好序"的单输入聚合（如 DISTINCT 的 ORDERED SET 聚合/
+ *   ORDER BY 排序流），比较当前输入与上一个输入：不同返回 true
+ *   （应开始/继续新值的转移），相同返回 false（跳过转移）。
+ *
+ * 设计思想：
+ *   1. 依赖排序输入流：值相同必相邻，故只需记忆"上一个输入"
+ *      （haslast/lastdatum/lastisnull 挂在 pertrans 上跨行复用）。
+ *   2. 三要素判重：无上一个、NULL 性不同、或非 NULL 且等值函数
+ *      （equalfnOne，编译期选定的默认等值操作符）判不等——任一命中
+ *      即视为新值；换新值时拷贝新 datum 到 aggcontext per-tuple
+ *      内存（先释放旧的 pass-by-ref lastdatum 防泄漏）。
+ *   3. 语义约定：NULL 输入本身参与去重（NULL 与 NULL 视为相等），
+ *      与 SQL DISTINCT 的 NULL 处理一致（由聚合语义决定）。
+ * ============================================================================
  */
 bool
 ExecEvalPreOrderedDistinctSingle(AggState *aggstate, AggStatePerTrans pertrans)
@@ -5826,10 +6992,27 @@ ExecEvalPreOrderedDistinctSingle(AggState *aggstate, AggStatePerTrans pertrans)
 }
 
 /*
- * ExecEvalPreOrderedDistinctMulti
- *		Returns true when the aggregate input is distinct from the previous
- *		input and returns false when the input matches the previous input, or
- *		when there was no previous input.
+ * ============================================================================
+ * 【中文注释】ExecEvalPreOrderedDistinctMulti —— 多输入有序聚合的去重
+ *              前判定（按整行比较）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   与 ExecEvalPreOrderedDistinctSingle 同构，但用
+ *   pertrans->equalfnMulti（编译期生成的等值 Qual 表达式）对整组
+ *   输入做行级比较：与上一个输入行不同返回 true，相同或没有上一个
+ *   输入返回 false。
+ *
+ * 设计思想：
+ *   1. 把当前所有输入值装载进 sortslot 虚拟槽，用 tmpcontext 临时
+ *      把 outer/inner 槽换成 sortslot/uniqslot 后直接 ExecQual 走
+ *      普通表达式求值做行比较——复用通用 ExecQual 免去逐值比较的
+ *      手写逻辑。
+ *   2. 换新行时用 ExecCopySlot 把 sortslot 拷进 uniqslot 留存为
+ *      "上一个输入"；调用前后必须恢复 tmpcontext 的原外/内槽。
+ *   3. 注意 sortslot 装载后 ExecClearTuple + tts_nvalid 手动设置
+ *      标记虚拟槽为已有效，与 ExecStoreVirtualTuple 配合正确初始化
+ *      槽状态。
+ * ============================================================================
  */
 bool
 ExecEvalPreOrderedDistinctMulti(AggState *aggstate, AggStatePerTrans pertrans)
@@ -5876,7 +7059,20 @@ ExecEvalPreOrderedDistinctMulti(AggState *aggstate, AggStatePerTrans pertrans)
 }
 
 /*
- * Invoke ordered transition function, with a datum argument.
+ * ============================================================================
+ * 【中文注释】ExecEvalAggOrderedTransDatum —— 有序聚合：以 datum 形式
+ *              喂给排序器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把当前行的输入值（已在结果寄存器）写入 pertrans->sortstates[setno]
+ *   对应的 tuplesort 实例（tuplesort_putdatum）——有序聚合
+ *   （ORDERED SET 聚合 / DISTINCT + ORDER BY 聚合）运行期先排序再
+ *   顺序喂转移函数的流水线第一环。
+ *
+ * 设计思想：
+ *   datum 形式适用于单输入有序聚合：排序键与有效值合一；排序器在
+ *   编译期已按聚合的比较语义（collation、排序方向）配置好。
+ * ============================================================================
  */
 void
 ExecEvalAggOrderedTransDatum(ExprState *state, ExprEvalStep *op,
@@ -5890,7 +7086,20 @@ ExecEvalAggOrderedTransDatum(ExprState *state, ExprEvalStep *op,
 }
 
 /*
- * Invoke ordered transition function, with a tuple argument.
+ * ============================================================================
+ * 【中文注释】ExecEvalAggOrderedTransTuple —— 有序聚合：以元组形式喂给
+ *              排序器
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   多输入有序聚合版本：把当前行的各输入列装载进 pertrans->sortslot
+ *   虚拟槽（ts_values/ts_isnull 已由前置 FETCH 写入），再以
+ *   tuplesort_puttupleslot 存入对应 setno 的 tuplesort。
+ *
+ * 设计思想：
+ *   与 datum 版互补：排序键为整行（首列或指定列序），后续 final 阶段
+ *   按排序顺序取行喂转移函数；装载后手动置 tts_nvalid 并
+ *   ExecStoreVirtualTuple 完成槽状态标记。
+ * ============================================================================
  */
 void
 ExecEvalAggOrderedTransTuple(ExprState *state, ExprEvalStep *op,
@@ -5905,7 +7114,7 @@ ExecEvalAggOrderedTransTuple(ExprState *state, ExprEvalStep *op,
 	tuplesort_puttupleslot(pertrans->sortstates[setno], pertrans->sortslot);
 }
 
-/* implementation of transition function invocation for byval types */
+/* 【中文注释】byval 转移类型的普通（plain）转移函数调用实现 */
 static pg_always_inline void
 ExecAggPlainTransByVal(AggState *aggstate, AggStatePerTrans pertrans,
 					   AggStatePerGroup pergroup,
@@ -5937,7 +7146,26 @@ ExecAggPlainTransByVal(AggState *aggstate, AggStatePerTrans pertrans,
 	MemoryContextSwitchTo(oldContext);
 }
 
-/* implementation of transition function invocation for byref types */
+/*
+ * ============================================================================
+ * 【中文注释】ExecAggPlainTransByRef —— byref 转移类型的普通转移函数
+ *              调用实现
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   对 pass-by-ref 转移类型：在 per-tuple 上下文里调用转移函数
+ *   （args[0]=旧 transValue、args[1]=当前输入），新值若不是同一指针
+ *   则经 ExecAggCopyTransValue 拷贝到 aggcontext 并释放旧值。
+ *
+ * 设计思想：
+ *   1. 调用前设置 aggstate->curaggcontext/current_set/curpertrans，
+ *      供转移函数内 AggGetAggref()/选择当前分组集等反射 API 使用。
+ *   2. 指针判等的免拷贝优化：若 transfn 就地修改并返回第一个参数
+ *      （通用内存感知 transfn 的惯例），指针相同则跳过拷贝/释放。
+ *   3. NULL 归一化细节（见 ExecAggCopyTransValue 注释）：transValue
+ *      为 NULL 时保证是 (Datum) 0，使指针比较不受数值相等干扰——
+ *      这是热路径，避免为此再加分支。
+ * ============================================================================
+ */
 static pg_always_inline void
 ExecAggPlainTransByRef(AggState *aggstate, AggStatePerTrans pertrans,
 					   AggStatePerGroup pergroup,

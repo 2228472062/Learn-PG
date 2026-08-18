@@ -10,6 +10,22 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * ============================================================================
+ * 【中文注释】execAmi.c —— 执行器访问方法杂项（全局能力分发）
+ * ----------------------------------------------------------------------------
+ * 文件定位：
+ *   与"节点类型无关"的执行器级入口，全部以"按节点类型分发到具体节点
+ *   实现"为工作方式，类似 execProcnode.c 但服务于扫描/重扫控制面：
+ *   - ExecReScan：让计划节点可重新扫描（参数变化后的重执行、嵌套循环
+ *     内层重扫等），分发到各节点的 ExecReScanXxx；
+ *   - ExecMarkPos / ExecRestrPos：标记/恢复扫描位置（MergeJoin 的内层
+ *     回退需要），仅少数节点支持；
+ *   - ExecSupportsMarkRestore / ExecSupportsBackwardScan / 
+ *     ExecMaterializesOutput：给规划器用的"能力查询"（输入是 Path/Plan，
+ *     在规划期静态回答）。
+ * ============================================================================
+ */
 #include "postgres.h"
 
 #include "access/amapi.h"
@@ -68,11 +84,24 @@ static bool IndexSupportsBackwardScan(Oid indexid);
 
 
 /*
- * ExecReScan
- *		Reset a plan node so that its output can be re-scanned.
+ * ============================================================================
+ * 【中文注释】ExecReScan —— 重置节点以便重新扫描（分发入口）
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   执行器的"重扫"总入口，做四件事：
+ *   1. 计费收尾（InstrEndLoop）；
+ *   2. 参数传播——若本节点 chgParam 非空（本节点依赖的参数已变化）：
+ *      先通知 InitPlan（其输出参数可能因此需重算，且 InitPlan 之间的
+ *      依赖顺序受遍历顺序约束）、SubPlan，再向下传播给左右子计划，
+ *      并继续递归（子计划 ExecReScan 时自身 chgParam 也按此法处理）；
+ *   3. 表达式上下文重扫（ReScanExprContext 执行注册的重扫回调，如
+ *      hash 桶位置重算）；
+ *   4. 按节点类型分发到具体 ExecReScanXxx（各节点重开游标/清空状态），
+ *      最后清空本节点 chgParam。
  *
- * Note that if the plan node has parameters that have changed value,
- * the output might be different from last time.
+ * 注意：参数值变了，重扫结果可能与上次不同——这正是 chgParam 机制
+ * 存在的意义（参数化路径/嵌套循环/InitPlan 联动）。
+ * ============================================================================
  */
 void
 ExecReScan(PlanState *node)
@@ -312,17 +341,22 @@ ExecReScan(PlanState *node)
 }
 
 /*
- * ExecMarkPos
+ * ============================================================================
+ * 【中文注释】ExecMarkPos / ExecRestrPos —— 扫描位置标记与恢复
+ * ----------------------------------------------------------------------------
+ * 业务场景（成对使用）：
+ *   MergeJoin 的内层输入需要"回退"（外层新行的键比当前内层键小）：
+ *   MergeJoin 发出 ExecMarkPos 记下当前位置，随后继续推进；需要回退时
+ *   调 ExecRestrPos 恢复到标记位置——恢复后第一次 ExecProcNode 将重放
+ *   标记后的那一行。标记期间节点可以自由移动（甚至到 EOF），恢复即回溯。
  *
- * Marks the current scan position.
+ * 支持节点：Index/IndexOnly（索引 AM 提供 ammarkpos）、CustomScan（标志
+ * 位）、Material/Sort（tuplestore 回溯）、Result（透传子计划）。
+ * 恢复的语义不保证节点结果槽内容：调用方拿到恢复前的结果槽应丢弃。
  *
- * NOTE: mark/restore capability is currently needed only for plan nodes
- * that are the immediate inner child of a MergeJoin node.  Since MergeJoin
- * requires sorted input, there is never any need to support mark/restore in
- * node types that cannot produce sorted output.  There are some cases in
- * which a node can pass through sorted data from its child; if we don't
- * implement mark/restore for such a node type, the planner compensates by
- * inserting a Material node above that node.
+ * 注意：mark/restore 只有 MergeJoin 内层需要；不支持时规划器会自动在
+ * 上方插入 Material 节点兜底（见 ExecSupportsMarkRestore）。
+ * ============================================================================
  */
 void
 ExecMarkPos(PlanState *node)
@@ -409,11 +443,21 @@ ExecRestrPos(PlanState *node)
 }
 
 /*
- * ExecSupportsMarkRestore - does a Path support mark/restore?
- *
- * This is used during planning and so must accept a Path, not a Plan.
- * We keep it here to be adjacent to the routines above, which also must
- * know which plan types support mark/restore.
+ * ============================================================================
+ * 【中文注释】ExecSupportsMarkRestore —— 规划期问询：该 Path 支持 mark/restore 吗
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   规划器在构造 MergeJoin 时用来判断"是否需要给内层垫 Material"。
+ * 关键点：输入是 Path（规划期对象）而非 Plan，看的是 pathtype。
+ * 判断规则：
+ *   - Index/IndexOnly：取决于索引 AM 的 amcanmarkpos（btree 支持，
+ *     hash 等不支持）；
+ *   - Material/Sort：支持（tuplestore 天然可回溯）；
+ *   - CustomScan：看 CUSTOMPATH_SUPPORT_MARK_RESTORE 标志；
+ *   - Result：有子计划且子计划支持才支持（三类无子计划的 Result 变体
+ *     均不支持）；
+ *   - Append/MergeAppend：仅当最终会折叠成单子计划时按子计划回答。
+ * ============================================================================
  */
 bool
 ExecSupportsMarkRestore(Path *pathnode)
@@ -501,12 +545,24 @@ ExecSupportsMarkRestore(Path *pathnode)
 }
 
 /*
- * ExecSupportsBackwardScan - does a plan type support backwards scanning?
+ * ============================================================================
+ * 【中文注释】ExecSupportsBackwardScan —— 规划期问询：支持反向扫描吗
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判定给定计划子树能否从后往前扫（DECLARE CURSOR ... SCROLL / 游标
+ *   倒退需要）。传递整个计划树——因为许多节点把反向能力"借用"给子计划。
  *
- * Ideally, all plan types would support backwards scan, but that seems
- * unlikely to happen soon.  In some cases, a plan node passes the backwards
- * scan down to its children, and so supports backwards scan only if its
- * children do.  Therefore, this routine must be passed a complete plan tree.
+ * 规则速览：
+ *   - parallel_aware 一律不支持（各 worker 各扫一段，无回溯记账）；
+ *   - 透传类：Result/SubqueryScan 看子计划，LockRows/Limit 看外子计划；
+ *   - Append：全部子计划支持且无异步计划（异步交错打乱了顺序）才行；
+ *   - Index/IndexOnly：看索引 AM 的 amcanbackward（见 IndexSupports
+ *     BackwardScan，查 pg_class+AM API 表）；
+ *   - 天然支持：SeqScan/Tid(范围)/Function/Values/Cte/Material/Sort
+ *     （都不求值 tlist，重扫即回溯）；
+ *   - 不支持：SampleScan（TABLESAMPLE 简化）、Gather、IncrementalSort
+ *     （只缓冲当前组）、CustomScan（除非标志位）及其他。
+ * ============================================================================
  */
 bool
 ExecSupportsBackwardScan(Plan *node)
@@ -597,8 +653,13 @@ ExecSupportsBackwardScan(Plan *node)
 }
 
 /*
- * An IndexScan or IndexOnlyScan node supports backward scan only if the
- * index's AM does.
+ * ============================================================================
+ * 【中文注释】IndexSupportsBackwardScan —— 索引 AM 是否支持反向扫描
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   经 pg_class（取 relam）→ GetIndexAmRoutineByAmId（取 AM API 结构）
+ *   两步查询索引 AM 的 amcanbackward 能力位。
+ * ============================================================================
  */
 static bool
 IndexSupportsBackwardScan(Oid indexid)
@@ -625,12 +686,15 @@ IndexSupportsBackwardScan(Oid indexid)
 }
 
 /*
- * ExecMaterializesOutput - does a plan type materialize its output?
- *
- * Returns true if the plan node type is one that automatically materializes
- * its output (typically by keeping it in a tuplestore).  For such plans,
- * a rescan without any parameter change will have zero startup cost and
- * very low per-tuple cost.
+ * ============================================================================
+ * 【中文注释】ExecMaterializesOutput —— 该节点会物化输出吗
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   判定节点类型是否把输出整存（典型是 tuplestore）：Material、Sort、
+ *   FunctionScan、TableFuncScan、CteScan、NamedTuplestoreScan、
+ *   WorkTableScan 是。这类计划"无参数变化的重扫"启动成本≈0、逐行成本
+ *   极低——规划器据此评估重复扫描代价（嵌套循环内层重扫等）。
+ * ============================================================================
  */
 bool
 ExecMaterializesOutput(NodeTag plantype)

@@ -12,6 +12,30 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * ============================================================================
+ * 【中文注释】execJunk.c —— "垃圾属性"（junk attribute）过滤机制
+ * ----------------------------------------------------------------------------
+ * 业务含义：
+ *   执行器内部元组里有一部分列是"给执行器自己用的、绝不出门"的数据，
+ *   称为 junk 属性：例如系统列 ctid（UPDATE/DELETE 定位行用）、子查询
+ *   内部用的排序键/分组键列、SELECT DISTINCT 的重分组列等。它们仍随
+ *   计划节点到处传递，但在最外层输出、或写入磁盘前必须被剥掉。
+ *
+ * 实现思路（JunkFilter）：
+ *   - 顶层初始化时用 ExecInitJunkFilter 依据 targetlist 建过滤对象：
+ *     由非 junk 项生成"干净"元组描述符，并计算映射表 cleanMap
+ *     （clean 第 i 列 ← 原元组第 cleanMap[i] 列）；
+ *   - 输出前用 ExecFilterJunk 按映射表把数据"转置"成一个不含 junk 列的
+ *     虚拟槽（纯内存搬运，无元组重组）；
+ *   - 需要取某个 junk 列的值时用 ExecFindJunkAttribute（按 resname 找
+ *     resno，如 "ctid"/"junk_sort"）再 slot_getattr 读取。
+ *
+ * 变体：ExecInitJunkFilterConversion 用于"行类型转换"场景——干净描述符
+ * 由调用方给定（可含已删除列，映射为 NULL 输出），用于触发器新旧行
+ * 转换等场合。
+ * ============================================================================
+ */
 #include "postgres.h"
 
 #include "executor/executor.h"
@@ -48,13 +72,18 @@
  */
 
 /*
- * ExecInitJunkFilter
+ * ============================================================================
+ * 【中文注释】ExecInitJunkFilter —— 建立 junk 过滤器
+ * ----------------------------------------------------------------------------
+ * 参数：
+ *   targetList：源计划的 targetlist（junk 项由 tle->resjunk 标识）；
+ *   slot：可选——调用方预置的结果槽，否则内部新建虚拟槽。
+ * 返回：JunkFilter{干净描述符, 映射表, 结果槽}。
  *
- * Initialize the Junk filter.
- *
- * The source targetlist is passed in.  The output tuple descriptor is
- * built from the non-junk tlist entries.
- * An optional resultSlot can be passed as well; otherwise, we create one.
+ * 映射表语义：cleanMap[clean第i列] = 原元组属性号（tle->resno）。
+ * 注意"干净长度"来自 ExecCleanTypeFromTL（剔除 junk 项后重建描述符），
+ * 与"非 junk 项个数"严格一致（断言校验）。
+ * ============================================================================
  */
 JunkFilter *
 ExecInitJunkFilter(List *targetList, TupleTableSlot *slot)
@@ -124,14 +153,17 @@ ExecInitJunkFilter(List *targetList, TupleTableSlot *slot)
 }
 
 /*
- * ExecInitJunkFilterConversion
+ * ============================================================================
+ * 【中文注释】ExecInitJunkFilterConversion —— 行类型转换版过滤器
+ * ----------------------------------------------------------------------------
+ * 差异点：
+ *   干净描述符不推导，由调用方直接给定（cleanTupType，可能含已删除列）；
+ *   调用方须自行保证"非删除列与非 junk 项逐列对应"。映射表用 palloc0
+ *   初始化——已删除列映射保持 0，ExecFilterJunk 见 0 即输出 NULL。
  *
- * Initialize a JunkFilter for rowtype conversions.
- *
- * Here, we are given the target "clean" tuple descriptor rather than
- * inferring it from the targetlist.  The target descriptor can contain
- * deleted columns.  It is assumed that the caller has checked that the
- * non-deleted columns match up with the non-junk columns of the targetlist.
+ * 业务场景：触发器行类型转换（RI 触发器新旧行 → 目标表行类型）等
+ * "原行类型 → 目标行类型"的搬运。
+ * ============================================================================
  */
 JunkFilter *
 ExecInitJunkFilterConversion(List *targetList,
@@ -201,10 +233,16 @@ ExecInitJunkFilterConversion(List *targetList,
 }
 
 /*
- * ExecFindJunkAttribute
- *
- * Locate the specified junk attribute in the junk filter's targetlist,
- * and return its resno.  Returns InvalidAttrNumber if not found.
+ * ============================================================================
+ * 【中文注释】ExecFindJunkAttribute / ExecFindJunkAttributeInTlist —— 定位 junk 列
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   按 resname 在 targetlist 里找 junk 列，返回其 resno（供 slot_getattr
+ *   使用）；找不到返回 InvalidAttrNumber。命名规范：junk 列的名字由规划器
+ *   固定给出（"ctid"、"junk_sort"、"junk_filter" 等）。
+ * ExecFindJunkAttribute 走过滤器内的 tlist；InTlist 版本可直接用于任意
+ * 子计划的 tlist（无需先建 JunkFilter）。
+ * ============================================================================
  */
 AttrNumber
 ExecFindJunkAttribute(JunkFilter *junkfilter, const char *attrName)
@@ -239,9 +277,14 @@ ExecFindJunkAttributeInTlist(List *targetlist, const char *attrName)
 }
 
 /*
- * ExecFilterJunk
- *
- * Construct and return a slot with all the junk attributes removed.
+ * ============================================================================
+ * 【中文注释】ExecFilterJunk —— 剥掉 junk 列，产出"干净"槽
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   把含 junk 列的原槽按映射表转置到结果槽，返回"干净虚拟元组"。
+ *   零拷贝：只做数组级 Datum 搬运（slot_getallattrs 解出全部列后按
+ *   cleanMap 拷贝 values/isnull 对），最后 ExecStoreVirtualTuple 定稿。
+ * ============================================================================
  */
 TupleTableSlot *
 ExecFilterJunk(JunkFilter *junkfilter, TupleTableSlot *slot)

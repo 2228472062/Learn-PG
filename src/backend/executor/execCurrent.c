@@ -10,6 +10,34 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * ============================================================================
+ * 【中文注释】execCurrent.c —— WHERE CURRENT OF 游标定位
+ * ----------------------------------------------------------------------------
+ * 业务场景：
+ *   UPDATE/DELETE ... WHERE CURRENT OF cursor：不指定行条件，而是"改/删
+ *   游标当前正指着的那一行"。执行器需要回答一个问题：给定游标名和表 OID，
+ *   该表当前被游标扫到的行是哪个（返回其 TID）。
+ *
+ * 两条实现策略（execCurrentOf）：
+ *   1. 游标带 FOR UPDATE/SHARE（有 es_rowmarks）：
+ *      ExecRowMark 里已经记录了当前行的 curCtid（加锁时就拿到了），直接
+ *      取出来即可。要求游标对该表恰好有一个 FOR UPDATE/SHARE 引用。
+ *   2. 普通（不可更新/不敏感）游标：
+ *      沿游标计划树找"扫这个表的扫描节点"（search_plan_tree），从其扫描
+ *      槽/索引扫描描述里取出当前 TID。要求计划是"简单可更新"形态
+ *      （扫描没有被聚合/MergeAppend 等遮挡），否则报错。
+ *
+ * 返回值语义：true=找到 TID；false=游标合法但当前不在该表的行上
+ * （继承场景：当前行来自兄弟子表，本表无事可做）；其余情况报错。
+ *
+ * 配套：
+ *   - fetch_cursor_param_value：CURRENT OF 后跟参数时取 REFCURSOR 参数值；
+ *   - search_plan_tree：递归搜计划树找候选扫描，多个候选必须拒绝
+ *     （无法确定哪个贡献了当前输出行），并汇总 chgParam 指示的
+ *     待重扫（pending_rescan）状态。
+ * ============================================================================
+ */
 #include "postgres.h"
 
 #include "access/genam.h"
@@ -29,16 +57,24 @@ static ScanState *search_plan_tree(PlanState *node, Oid table_oid,
 
 
 /*
- * execCurrentOf
+ * ============================================================================
+ * 【中文注释】execCurrentOf —— CURRENT OF 表达式求值（主入口）
+ * ----------------------------------------------------------------------------
+ * 参数：
+ *   cexpr：CURRENT OF 表达式（含游标名或参数号）；
+ *   econtext：求值上下文（取参数用）；
+ *   table_oid：目标表 OID；
+ *   current_tid：输出参数，填当前行 TID。
  *
- * Given a CURRENT OF expression and the OID of a table, determine which row
- * of the table is currently being scanned by the cursor named by CURRENT OF,
- * and return the row's TID into *current_tid.
+ * 流程：
+ *   1. 解析游标名（可能藏在参数里）→ 查 Portal → 校验是单 SELECT 且
+ *      非 held 游标；
+ *   2. 按是否有行锁（es_rowmarks）分两条路取 TID（见文件头）；
+ *   3. 游标未定位在行上（atStart/atEnd）按 SQL 规范报错；
+ *   4. 返回 true/false。
  *
- * Returns true if a row was identified.  Returns false if the cursor is valid
- * for the table but is not currently scanning a row of the table (this is a
- * legal situation in inheritance cases).  Raises error if cursor is not a
- * valid updatable scan of the specified table.
+ * 错误消息统一带上游标名与表名，方便用户定位。
+ * ============================================================================
  */
 bool
 execCurrentOf(CurrentOfExpr *cexpr,
@@ -249,9 +285,14 @@ execCurrentOf(CurrentOfExpr *cexpr,
 }
 
 /*
- * fetch_cursor_param_value
- *
- * Fetch the string value of a param, verifying it is of type REFCURSOR.
+ * ============================================================================
+ * 【中文注释】fetch_cursor_param_value —— 取 REFCURSOR 类型参数值
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   CURRENT OF 游标名是 PREPARE 参数时，从 ParamListInfo 取字符串值并
+ *   校验参数类型确实是 refcursor（预防钩子返回意外内容）。refcursor 的
+ *   I/O 复用 text 的，直接 TextDatumGetCString 得到游标名。
+ * ============================================================================
  */
 static char *
 fetch_cursor_param_value(ExprContext *econtext, int paramId)
@@ -293,21 +334,23 @@ fetch_cursor_param_value(ExprContext *econtext, int paramId)
 }
 
 /*
- * search_plan_tree
+ * ============================================================================
+ * 【中文注释】search_plan_tree —— 计划树中定位目标表的扫描节点
+ * ----------------------------------------------------------------------------
+ * 函数作用：
+ *   递归下钻找"扫描 table_oid 的扫描节点"。目标不只是"找到一个"，而是
+ *   "找到且唯一"——必须能确定是它贡献了计划树当前的输出行，因此多个
+ *   候选一律返回 NULL（拒绝）。
  *
- * Search through a PlanState tree for a scan node on the specified table.
- * Return NULL if not found or multiple candidates.
+ * 可穿透的节点：关系扫描（直接比对 ss_currentRelation）、Append（只当前
+ * 激活的那个输入才可能定位在行上，其余在 EOF 或未启动；注意 MergeAppend
+ * 不可穿透——所有输入都活跃）、Result/Limit（始终透传输入当前行）、
+ * SubqueryScan（子计划在 subplan 字段）。ForeignScan/CustomScan 不向下
+ * 钻（无法知道输出行与子计划的对应关系）。
  *
- * CAUTION: this function is not charged simply with finding some candidate
- * scan, but with ensuring that that scan returned the plan tree's current
- * output row.  That's why we must reject multiple-match cases.
- *
- * If a candidate is found, set *pending_rescan to true if that candidate
- * or any node above it has a pending rescan action, i.e. chgParam != NULL.
- * That indicates that we shouldn't consider the node to be positioned on a
- * valid tuple, even if its own state would indicate that it is.  (Caller
- * must initialize *pending_rescan to false, and should not trust its state
- * if multiple candidates are found.)
+ * 附带输出 pending_rescan：候选节点及其祖先任一有 chgParam（参数变了、
+ * 即将重扫）时置 true——即使节点看起来定位在行上也不能算数。
+ * ============================================================================
  */
 static ScanState *
 search_plan_tree(PlanState *node, Oid table_oid,
