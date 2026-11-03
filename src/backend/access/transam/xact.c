@@ -14,6 +14,17 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * 中文注释：
+ * 本文件实现 PostgreSQL 顶层事务管理，主要包括：
+ *   1. 事务/子事务状态机（TransState 与 TBlockState）；
+ *   2. 事务的启动、提交、两阶段提交（PREPARE）、中止与清理；
+ *   3. XID/命令 ID 分配、事务时间戳、并行模式等状态访问器；
+ *   4. 保存点（SAVEPOINT）与内部子事务支持；
+ *   5. 事务 WAL 记录（XLOG_XACT_COMMIT/ABORT）的写入与恢复重放；
+ *   6. 事务回调，以及 BEGIN/COMMIT/ROLLBACK 等事务块命令的接口实现。
+ * 更完整的背景说明见 src/backend/access/transam/README。
+ */
 
 #include "postgres.h"
 
@@ -76,6 +87,7 @@
 
 /*
  *	User-tweakable parameters
+ *	（中文）用户可调参数：默认/当前事务隔离级别、只读属性、可延迟属性以及同步提交设置。
  */
 int			DefaultXactIsoLevel = XACT_READ_COMMITTED;
 int			XactIsoLevel = XACT_READ_COMMITTED;
@@ -97,6 +109,9 @@ int			synchronous_commit = SYNCHRONOUS_COMMIT_ON;
  * system tables.  We also ensure that during logical decoding we never
  * directly access the tableam or heap APIs because we are checking for the
  * concurrent aborts only in systable_* APIs.
+ *	（中文）CheckXidAlive 指向一个可能仍在进行的（子）事务 XID，目前用于逻辑解码。
+ *	（中文）解码期间该事务可能被中止，此时会跳过该事务；因此从系统表取出元组后需要检查它是否已中止。
+ *	（中文）逻辑解码期间只通过 systable_* API 检查并发中止，不直接使用 tableam/heap API。
  */
 TransactionId CheckXidAlive = InvalidTransactionId;
 bool		bsysscan = false;
@@ -123,6 +138,13 @@ bool		bsysscan = false;
  * or sub-committed in the parent at the time the parallel operation began.
  * The XIDs are stored sorted in numerical order (not logical order) to make
  * lookups as fast as possible.
+ *	（中文）并行 worker 只保存一个 TransactionStateData，因此需要额外记录顶层事务信息：
+ *	（中文）XactTopFullTransactionId 保存顶层事务的完整 XID；普通后端与
+ *	TopTransactionStateData.fullTransactionId 相同，
+ *	（中文）并行 worker 中则从启动并行操作的父后端复制。
+ *	（中文）nParallelCurrentXids/ParallelCurrentXids 保存并行操作开始时父事务中所有当前或已提交子事务
+ *	的 XID，
+ *	（中文）按 XID 数值升序排列以便快速查找；普通后端中数量为 0、指针为 NULL。
  */
 static FullTransactionId XactTopFullTransactionId = {InvalidTransactionId};
 static int	nParallelCurrentXids = 0;
@@ -134,20 +156,23 @@ static TransactionId *ParallelCurrentXids;
  * so we remember to do certain things later on in the transaction. This is
  * globally accessible, so can be set from anywhere in the code that requires
  * recording flags.
+ *	（中文）记录顶层事务期间发生的事件标志，供事务后续阶段判断需要执行哪些操作；
+ *	（中文）该变量全局可访问，任何需要记录标志的代码都可以设置它。
  */
 int			MyXactFlags;
 
 /*
  *	transaction states - transaction state from server perspective
+ *	（中文）服务端视角的事务底层状态：空闲、启动、进行中、提交中、中止中、准备中。
  */
 typedef enum TransState
 {
-	TRANS_DEFAULT,				/* idle */
-	TRANS_START,				/* transaction starting */
-	TRANS_INPROGRESS,			/* inside a valid transaction */
-	TRANS_COMMIT,				/* commit in progress */
-	TRANS_ABORT,				/* abort in progress */
-	TRANS_PREPARE,				/* prepare in progress */
+	TRANS_DEFAULT,				/* idle（空闲，不在事务中） */
+	TRANS_START,				/* transaction starting（事务正在启动） */
+	TRANS_INPROGRESS,			/* inside a valid transaction（处于有效事务中） */
+	TRANS_COMMIT,				/* commit in progress（正在提交） */
+	TRANS_ABORT,				/* abort in progress（正在中止） */
+	TRANS_PREPARE,				/* prepare in progress（正在准备两阶段提交） */
 } TransState;
 
 /*
@@ -155,34 +180,35 @@ typedef enum TransState
  *
  * Note: the subtransaction states are used only for non-topmost
  * transactions; the others appear only in the topmost transaction.
+ *	（中文）客户端查询视角的事务块状态。子事务状态只用于非最顶层事务，其余状态只出现在最顶层事务中。
  */
 typedef enum TBlockState
 {
-	/* not-in-transaction-block states */
-	TBLOCK_DEFAULT,				/* idle */
-	TBLOCK_STARTED,				/* running single-query transaction */
+	/* not-in-transaction-block states（不在事务块中的状态） */
+	TBLOCK_DEFAULT,				/* idle（空闲，不在事务块中） */
+	TBLOCK_STARTED,				/* running single-query transaction（正在执行单条语句事务） */
 
-	/* transaction block states */
-	TBLOCK_BEGIN,				/* starting transaction block */
-	TBLOCK_INPROGRESS,			/* live transaction */
-	TBLOCK_IMPLICIT_INPROGRESS, /* live transaction after implicit BEGIN */
-	TBLOCK_PARALLEL_INPROGRESS, /* live transaction inside parallel worker */
-	TBLOCK_END,					/* COMMIT received */
-	TBLOCK_ABORT,				/* failed xact, awaiting ROLLBACK */
-	TBLOCK_ABORT_END,			/* failed xact, ROLLBACK received */
-	TBLOCK_ABORT_PENDING,		/* live xact, ROLLBACK received */
-	TBLOCK_PREPARE,				/* live xact, PREPARE received */
+	/* transaction block states（事务块状态） */
+	TBLOCK_BEGIN,				/* starting transaction block（正在开始事务块） */
+	TBLOCK_INPROGRESS,			/* live transaction（活动事务） */
+	TBLOCK_IMPLICIT_INPROGRESS, /* live transaction after implicit BEGIN（隐式 BEGIN 后的活动事务） */
+	TBLOCK_PARALLEL_INPROGRESS, /* live transaction inside parallel worker（并行 worker 内的活动事务） */
+	TBLOCK_END,					/* COMMIT received（收到 COMMIT） */
+	TBLOCK_ABORT,				/* failed xact, awaiting ROLLBACK（事务失败，等待 ROLLBACK） */
+	TBLOCK_ABORT_END,			/* failed xact, ROLLBACK received（事务失败，已收到 ROLLBACK） */
+	TBLOCK_ABORT_PENDING,		/* live xact, ROLLBACK received（活动事务收到 ROLLBACK） */
+	TBLOCK_PREPARE,				/* live xact, PREPARE received（活动事务收到 PREPARE） */
 
-	/* subtransaction states */
-	TBLOCK_SUBBEGIN,			/* starting a subtransaction */
-	TBLOCK_SUBINPROGRESS,		/* live subtransaction */
-	TBLOCK_SUBRELEASE,			/* RELEASE received */
-	TBLOCK_SUBCOMMIT,			/* COMMIT received while TBLOCK_SUBINPROGRESS */
-	TBLOCK_SUBABORT,			/* failed subxact, awaiting ROLLBACK */
-	TBLOCK_SUBABORT_END,		/* failed subxact, ROLLBACK received */
-	TBLOCK_SUBABORT_PENDING,	/* live subxact, ROLLBACK received */
-	TBLOCK_SUBRESTART,			/* live subxact, ROLLBACK TO received */
-	TBLOCK_SUBABORT_RESTART,	/* failed subxact, ROLLBACK TO received */
+	/* subtransaction states（子事务状态） */
+	TBLOCK_SUBBEGIN,			/* starting a subtransaction（正在开始子事务） */
+	TBLOCK_SUBINPROGRESS,		/* live subtransaction（活动子事务） */
+	TBLOCK_SUBRELEASE,			/* RELEASE received（收到 RELEASE） */
+	TBLOCK_SUBCOMMIT,			/* COMMIT received while TBLOCK_SUBINPROGRESS（子事务进行中收到 COMMIT） */
+	TBLOCK_SUBABORT,			/* failed subxact, awaiting ROLLBACK（子事务失败，等待 ROLLBACK） */
+	TBLOCK_SUBABORT_END,		/* failed subxact, ROLLBACK received（子事务失败，已收到 ROLLBACK） */
+	TBLOCK_SUBABORT_PENDING,	/* live subxact, ROLLBACK received（活动子事务收到 ROLLBACK） */
+	TBLOCK_SUBRESTART,			/* live subxact, ROLLBACK TO received（活动子事务收到 ROLLBACK TO） */
+	TBLOCK_SUBABORT_RESTART,	/* failed subxact, ROLLBACK TO received（失败子事务收到 ROLLBACK TO） */
 } TBlockState;
 
 /*
@@ -191,53 +217,57 @@ typedef enum TBlockState
  * Note: parallelModeLevel counts the number of unmatched EnterParallelMode
  * calls done at this transaction level.  parallelChildXact is true if any
  * upper transaction level has nonzero parallelModeLevel.
+ *	（中文）事务状态结构：每个顶层事务和每个子事务都对应一个 TransactionStateData。
+ *	（中文）parallelModeLevel 表示当前事务层级上未配对的 EnterParallelMode 调用次数；
+ *	（中文）parallelChildXact 表示任一上层事务是否处于并行模式。
  */
 typedef struct TransactionStateData
 {
-	FullTransactionId fullTransactionId;	/* my FullTransactionId */
-	SubTransactionId subTransactionId;	/* my subxact ID */
-	char	   *name;			/* savepoint name, if any */
-	int			savepointLevel; /* savepoint level */
-	TransState	state;			/* low-level state */
-	TBlockState blockState;		/* high-level state */
-	int			nestingLevel;	/* transaction nesting depth */
-	int			gucNestLevel;	/* GUC context nesting depth */
-	MemoryContext curTransactionContext;	/* my xact-lifetime context */
-	ResourceOwner curTransactionOwner;	/* my query resources */
-	MemoryContext priorContext; /* CurrentMemoryContext before xact started */
-	TransactionId *childXids;	/* subcommitted child XIDs, in XID order */
-	int			nChildXids;		/* # of subcommitted child XIDs */
-	int			maxChildXids;	/* allocated size of childXids[] */
-	Oid			prevUser;		/* previous CurrentUserId setting */
-	int			prevSecContext; /* previous SecurityRestrictionContext */
-	bool		prevXactReadOnly;	/* entry-time xact r/o state */
-	bool		startedInRecovery;	/* did we start in recovery? */
-	bool		didLogXid;		/* has xid been included in WAL record? */
-	int			parallelModeLevel;	/* Enter/ExitParallelMode counter */
-	bool		parallelChildXact;	/* is any parent transaction parallel? */
-	bool		chain;			/* start a new block after this one */
-	bool		topXidLogged;	/* for a subxact: is top-level XID logged? */
-	struct TransactionStateData *parent;	/* back link to parent */
+	FullTransactionId fullTransactionId;	/* my FullTransactionId（本事务的完整事务 ID，含 epoch） */
+	SubTransactionId subTransactionId;	/* my subxact ID（本事务的子事务 ID） */
+	char	   *name;			/* savepoint name, if any（保存点名称，如果有） */
+	int			savepointLevel; /* savepoint level（保存点层级） */
+	TransState	state;			/* low-level state（底层事务状态，TransState） */
+	TBlockState blockState;		/* high-level state（高层事务块状态，TBlockState） */
+	int			nestingLevel;	/* transaction nesting depth（事务嵌套深度） */
+	int			gucNestLevel;	/* GUC context nesting depth（GUC 上下文嵌套深度） */
+	MemoryContext curTransactionContext;	/* my xact-lifetime context（本事务生命周期的内存上下文） */
+	ResourceOwner curTransactionOwner;	/* my query resources（本查询的资源所有者） */
+	MemoryContext priorContext; /* CurrentMemoryContext before xact started（事务开始前的 CurrentMemoryContext） */
+	TransactionId *childXids;	/* subcommitted child XIDs, in XID order（已提交子事务的 XID 数组，按 XID 排序） */
+	int			nChildXids;		/* # of subcommitted child XIDs（已提交子事务 XID 的数量） */
+	int			maxChildXids;	/* allocated size of childXids[]（childXids[] 的已分配大小） */
+	Oid			prevUser;		/* previous CurrentUserId setting（之前的 CurrentUserId 设置） */
+	int			prevSecContext; /* previous SecurityRestrictionContext（之前的 SecurityRestrictionContext） */
+	bool		prevXactReadOnly;	/* entry-time xact r/o state（进入事务时的只读状态） */
+	bool		startedInRecovery;	/* did we start in recovery?（是否在恢复期间启动） */
+	bool		didLogXid;		/* has xid been included in WAL record?（XID 是否已写入 WAL 记录） */
+	int			parallelModeLevel;	/* Enter/ExitParallelMode counter（EnterParallelMode/ExitParallelMode 的配对计数） */
+	bool		parallelChildXact;	/* is any parent transaction parallel?（任一父事务是否处于并行模式） */
+	bool		chain;			/* start a new block after this one（本事务结束后是否开始新事务块，AND CHAIN） */
+	bool		topXidLogged;	/* for a subxact: is top-level XID logged?（对子事务而言，顶层 XID 是否已记录） */
+	struct TransactionStateData *parent;	/* back link to parent（指向父事务状态的回链） */
 } TransactionStateData;
 
-typedef TransactionStateData *TransactionState;
+typedef TransactionStateData *TransactionState;	/* 指向事务状态结构的指针类型 */
 
 /*
  * Serialized representation used to transmit transaction state to parallel
  * workers through shared memory.
+ *	（中文）用于通过共享内存把事务状态传递给并行 worker 的序列化结构。
  */
 typedef struct SerializedTransactionState
 {
-	int			xactIsoLevel;
-	bool		xactDeferrable;
-	FullTransactionId topFullTransactionId;
-	FullTransactionId currentFullTransactionId;
-	CommandId	currentCommandId;
-	int			nParallelCurrentXids;
-	TransactionId parallelCurrentXids[FLEXIBLE_ARRAY_MEMBER];
+	int			xactIsoLevel;	/* 事务隔离级别 */
+	bool		xactDeferrable;	/* 事务是否可延迟 */
+	FullTransactionId topFullTransactionId;	/* 顶层事务的完整事务 ID */
+	FullTransactionId currentFullTransactionId;	/* 当前事务的完整事务 ID */
+	CommandId	currentCommandId;	/* 当前命令 ID */
+	int			nParallelCurrentXids;	/* 当前 XID 列表的长度 */
+	TransactionId parallelCurrentXids[FLEXIBLE_ARRAY_MEMBER];	/* 当前有效的 XID 列表（柔性数组） */
 } SerializedTransactionState;
 
-/* The size of SerializedTransactionState, not including the final array. */
+/* The size of SerializedTransactionState, not including the final array（不含末尾柔性数组的结构大小）. */
 #define SerializedTransactionStateHeaderSize \
 	offsetof(SerializedTransactionState, parallelCurrentXids)
 
@@ -245,6 +275,8 @@ typedef struct SerializedTransactionState
  * CurrentTransactionState always points to the current transaction state
  * block.  It will point to TopTransactionStateData when not in a
  * transaction at all, or when in a top-level transaction.
+ *	（中文）CurrentTransactionState 始终指向当前事务状态块；不在事务中或处于顶层事务时，它指向
+ *	TopTransactionStateData。
  */
 static TransactionStateData TopTransactionStateData = {
 	.state = TRANS_DEFAULT,
@@ -255,6 +287,7 @@ static TransactionStateData TopTransactionStateData = {
 /*
  * unreportedXids holds XIDs of all subtransactions that have not yet been
  * reported in an XLOG_XACT_ASSIGNMENT record.
+ *	（中文）unreportedXids 保存尚未在 XLOG_XACT_ASSIGNMENT 记录中报告的子事务 XID。
  */
 static int	nUnreportedXids;
 static TransactionId unreportedXids[PGPROC_MAX_CACHED_SUBXIDS];
@@ -264,6 +297,7 @@ static TransactionState CurrentTransactionState = &TopTransactionStateData;
 /*
  * The subtransaction ID and command ID assignment counters are global
  * to a whole transaction, so we do not keep them in the state stack.
+ *	（中文）子事务 ID 和命令 ID 分配计数器对整个事务全局有效，因此不放入事务状态栈。
  */
 static SubTransactionId currentSubTransactionId;
 static CommandId currentCommandId;
@@ -278,6 +312,10 @@ static bool currentCommandIdUsed;
  *
  * These do not change as we enter and exit subtransactions, so we don't
  * keep them inside the TransactionState stack.
+ *	（中文）xactStartTimestamp 是 transaction_timestamp() 的值；stmtStartTimestamp 是
+ *	statement_timestamp() 的值；
+ *	（中文）xactStopTimestamp 是记录提交/中止 WAL 记录的时间，若跳过了 WAL 记录，则为随后首次调用
+ *	（中文）GetCurrentTransactionStopTimestamp() 的时间。这些值在进出子事务时不变，因此不放在状态栈中。
  */
 static TimestampTz xactStartTimestamp;
 static TimestampTz stmtStartTimestamp;
@@ -286,26 +324,31 @@ static TimestampTz xactStopTimestamp;
 /*
  * GID to be used for preparing the current transaction.  This is also
  * global to a whole transaction, so we don't keep it in the state stack.
+ *	（中文）当前事务用于 PREPARE TRANSACTION 的 GID；对整个事务全局有效，不放入状态栈。
  */
 static char *prepareGID;
 
 /*
  * Some commands want to force synchronous commit.
+ *	（中文）某些命令需要强制同步提交，此标志用于记录该需求。
  */
 static bool forceSyncCommit = false;
 
-/* Flag for logging statements in a transaction. */
+/* Flag for logging statements in a transaction（是否对本事务中的语句进行采样记录）. */
 bool		xact_is_sampled = false;
 
 /*
  * Private context for transaction-abort work --- we reserve space for this
  * at startup to ensure that AbortTransaction and AbortSubTransaction can work
  * when we've run out of memory.
+ *	（中文）事务中止专用私有上下文：启动时预留，保证即使内存耗尽，AbortTransaction 和
+ *	（中文）AbortSubTransaction 仍能完成工作。
  */
 static MemoryContext TransactionAbortContext = NULL;
 
 /*
  * List of add-on start- and end-of-xact callbacks
+ *	（中文）事务开始/结束回调链表。
  */
 typedef struct XactCallbackItem
 {
@@ -318,6 +361,7 @@ static XactCallbackItem *Xact_callbacks = NULL;
 
 /*
  * List of add-on start- and end-of-subxact callbacks
+ *	（中文）子事务开始/结束回调链表。
  */
 typedef struct SubXactCallbackItem
 {
@@ -329,7 +373,7 @@ typedef struct SubXactCallbackItem
 static SubXactCallbackItem *SubXact_callbacks = NULL;
 
 
-/* local function prototypes */
+/* local function prototypes（本地静态函数原型声明） */
 static void AssignTransactionId(TransactionState s);
 static void AbortTransaction(void);
 static void AtAbort_Memory(void);
@@ -376,6 +420,7 @@ static const char *TransStateAsString(TransState state);
 
 /* ----------------------------------------------------------------
  *	transaction state accessors
+ *	（中文）事务状态访问器：查询/分配事务 ID、子事务 ID、命令 ID、时间戳，并处理并行模式等状态。
  * ----------------------------------------------------------------
  */
 
@@ -384,6 +429,11 @@ static const char *TransStateAsString(TransState state);
  *
  *	This returns true if we are inside a valid transaction; that is,
  *	it is safe to initiate database access, take heavyweight locks, etc.
+ */
+/*
+ * 中文注释：
+ * 判断当前是否处于有效事务中（TRANS_INPROGRESS）。只有此时才可以安全地访问数据库、获取重量级锁等；
+ * 启动、提交、中止等过渡状态均视为无效。
  */
 bool
 IsTransactionState(void)
@@ -405,6 +455,10 @@ IsTransactionState(void)
  *
  *	This returns true if we are within an aborted transaction block.
  */
+/*
+ * 中文注释：
+ * 判断当前是否处于已中止的事务块中（TBLOCK_ABORT 或 TBLOCK_SUBABORT）。
+ */
 bool
 IsAbortedTransactionBlockState(void)
 {
@@ -424,6 +478,10 @@ IsAbortedTransactionBlockState(void)
  * This will return the XID of the main transaction, assigning one if
  * it's not yet set.  Be careful to call this only inside a valid xact.
  */
+/*
+ * 中文注释：
+ * 返回顶层事务的 XID；若尚未分配则为其分配一个。只能在有效事务内调用。
+ */
 TransactionId
 GetTopTransactionId(void)
 {
@@ -439,6 +497,10 @@ GetTopTransactionId(void)
  * It will return InvalidTransactionId if we are not currently inside a
  * transaction, or inside a transaction that hasn't yet been assigned an XID.
  */
+/*
+ * 中文注释：
+ * 返回顶层事务已分配的 XID；不在事务中或尚未分配 XID 时返回 InvalidTransactionId。
+ */
 TransactionId
 GetTopTransactionIdIfAny(void)
 {
@@ -451,6 +513,10 @@ GetTopTransactionIdIfAny(void)
  * This will return the XID of the current transaction (main or sub
  * transaction), assigning one if it's not yet set.  Be careful to call this
  * only inside a valid xact.
+ */
+/*
+ * 中文注释：
+ * 返回当前事务（顶层事务或子事务）的 XID；若尚未分配则分配。
  */
 TransactionId
 GetCurrentTransactionId(void)
@@ -469,6 +535,10 @@ GetCurrentTransactionId(void)
  * It will return InvalidTransactionId if we are not currently inside a
  * transaction, or inside a transaction that hasn't been assigned an XID yet.
  */
+/*
+ * 中文注释：
+ * 返回当前事务已分配的 XID；不在事务中或尚未分配时返回 InvalidTransactionId。
+ */
 TransactionId
 GetCurrentTransactionIdIfAny(void)
 {
@@ -480,6 +550,10 @@ GetCurrentTransactionIdIfAny(void)
  *
  * This will return the FullTransactionId of the main transaction, assigning
  * one if it's not yet set.  Be careful to call this only inside a valid xact.
+ */
+/*
+ * 中文注释：
+ * 返回顶层事务的 FullTransactionId（包含 epoch）；若尚未分配则分配。
  */
 FullTransactionId
 GetTopFullTransactionId(void)
@@ -497,6 +571,10 @@ GetTopFullTransactionId(void)
  * inside a transaction, or inside a transaction that hasn't yet been assigned
  * one.
  */
+/*
+ * 中文注释：
+ * 返回顶层事务已分配的 FullTransactionId；否则返回 InvalidFullTransactionId。
+ */
 FullTransactionId
 GetTopFullTransactionIdIfAny(void)
 {
@@ -509,6 +587,10 @@ GetTopFullTransactionIdIfAny(void)
  * This will return the FullTransactionId of the current transaction (main or
  * sub transaction), assigning one if it's not yet set.  Be careful to call
  * this only inside a valid xact.
+ */
+/*
+ * 中文注释：
+ * 返回当前事务（顶层或子事务）的 FullTransactionId；若尚未分配则分配。
  */
 FullTransactionId
 GetCurrentFullTransactionId(void)
@@ -528,6 +610,10 @@ GetCurrentFullTransactionId(void)
  * inside a transaction, or inside a transaction that hasn't been assigned one
  * yet.
  */
+/*
+ * 中文注释：
+ * 返回当前事务已分配的 FullTransactionId；否则返回 InvalidFullTransactionId。
+ */
 FullTransactionId
 GetCurrentFullTransactionIdIfAny(void)
 {
@@ -538,6 +624,10 @@ GetCurrentFullTransactionIdIfAny(void)
  *	MarkCurrentTransactionIdLoggedIfAny
  *
  * Remember that the current xid - if it is assigned - now has been wal logged.
+ */
+/*
+ * 中文注释：
+ * 如果当前 XID 已分配，则标记它已经写入 WAL 记录，避免重复记录。
  */
 void
 MarkCurrentTransactionIdLoggedIfAny(void)
@@ -556,6 +646,11 @@ MarkCurrentTransactionIdLoggedIfAny(void)
  * This returns true if effective_wal_level is logical and we are inside
  * a valid subtransaction, for which the assignment was not yet written to
  * any WAL record.
+ */
+/*
+ * 中文注释：
+ * 判断当前子事务对应的顶层 XID 是否还需要写入 WAL。逻辑解码要求子事务操作也记录顶层 XID；当
+ * wal_level=logical 且处于有效子事务、其 XID 尚未写入任何 WAL 记录时返回 true。
  */
 bool
 IsSubxactTopXidLogPending(void)
@@ -589,6 +684,10 @@ IsSubxactTopXidLogPending(void)
  * Remember that the top transaction id for the current subtransaction is WAL
  * logged now.
  */
+/*
+ * 中文注释：
+ * 标记当前子事务的顶层 XID 已经写入 WAL。
+ */
 void
 MarkSubxactTopXidLogged(void)
 {
@@ -604,6 +703,11 @@ MarkSubxactTopXidLogged(void)
  * XID.  Once we have a value, return that same value for the remainder of the
  * current transaction.  This is meant to provide the reference point for the
  * age(xid) function, but might be useful for other maintenance tasks as well.
+ */
+/*
+ * 中文注释：
+ * 获取事务 XID；若未分配则读取下一个将要分配的 XID，并在本事务剩余时间内保持该值稳定。主要用于
+ * age(xid) 等维护操作。
  */
 TransactionId
 GetStableLatestTransactionId(void)
@@ -632,6 +736,10 @@ GetStableLatestTransactionId(void)
  * Also, any parent TransactionStates that don't yet have XIDs are assigned
  * one; this maintains the invariant that a child transaction has an XID
  * following its parent's.
+ */
+/*
+ * 中文注释：
+ * 为指定事务状态分配新的永久 FullTransactionId。PostgreSQL 采用惰性分配：直到需要时才给事务分配 XID；同时会为尚未分配 XID 的父事务也分配 XID，以保证子事务的 XID 总是晚于父事务。
  */
 static void
 AssignTransactionId(TransactionState s)
@@ -789,6 +897,10 @@ AssignTransactionId(TransactionState s)
 /*
  *	GetCurrentSubTransactionId
  */
+/*
+ * 中文注释：
+ * 返回当前子事务 ID（来自全局子事务 ID 计数器）。
+ */
 SubTransactionId
 GetCurrentSubTransactionId(void)
 {
@@ -802,6 +914,10 @@ GetCurrentSubTransactionId(void)
  *
  * Test if the specified subxact ID is still active.  Note caller is
  * responsible for checking whether this ID is relevant to the current xact.
+ */
+/*
+ * 中文注释：
+ * 判断给定子事务 ID 是否仍处于活动状态；调用者需自行确认该 ID 属于当前事务。
  */
 bool
 SubTransactionIsActive(SubTransactionId subxid)
@@ -826,6 +942,11 @@ SubTransactionIsActive(SubTransactionId subxid)
  * inserted/updated/deleted tuples.  false means the ID is being fetched
  * for read-only purposes (ie, as a snapshot validity cutoff).  See
  * CommandCounterIncrement() for discussion.
+ */
+/*
+ * 中文注释：
+ * 返回当前命令 ID。used=true 表示调用者要用该 ID 标记插入/更新/删除的元组；false 表示仅用于只读目的
+ * （如作为快照可见性截止点）。详见 CommandCounterIncrement() 的说明。
  */
 CommandId
 GetCurrentCommandId(bool used)
@@ -857,6 +978,11 @@ GetCurrentCommandId(bool used)
  * infrastructure must call this to provide those values before
  * calling StartTransaction() or SetCurrentStatementStartTimestamp().
  */
+/*
+ * 中文注释：
+ * 供并行 worker 使用：继承父事务的事务时间戳和语句时间戳，必须在 StartTransaction() 或
+ * SetCurrentStatementStartTimestamp() 之前调用。
+ */
 void
 SetParallelStartTimestamps(TimestampTz xact_ts, TimestampTz stmt_ts)
 {
@@ -868,6 +994,10 @@ SetParallelStartTimestamps(TimestampTz xact_ts, TimestampTz stmt_ts)
 /*
  *	GetCurrentTransactionStartTimestamp
  */
+/*
+ * 中文注释：
+ * 返回 transaction_timestamp() 的值（事务开始时间）。
+ */
 TimestampTz
 GetCurrentTransactionStartTimestamp(void)
 {
@@ -876,6 +1006,10 @@ GetCurrentTransactionStartTimestamp(void)
 
 /*
  *	GetCurrentStatementStartTimestamp
+ */
+/*
+ * 中文注释：
+ * 返回 statement_timestamp() 的值（当前语句开始时间）。
  */
 TimestampTz
 GetCurrentStatementStartTimestamp(void)
@@ -888,6 +1022,10 @@ GetCurrentStatementStartTimestamp(void)
  *
  * If the transaction stop time hasn't already been set, which can happen if
  * we decided we don't need to log an XLOG record, set xactStopTimestamp.
+ */
+/*
+ * 中文注释：
+ * 返回事务停止时间。如果尚未设置（例如无需写 WAL 记录），则在此处将 xactStopTimestamp 设为当前时间。
  */
 TimestampTz
 GetCurrentTransactionStopTimestamp(void)
@@ -912,6 +1050,10 @@ GetCurrentTransactionStopTimestamp(void)
  * In a parallel worker, this should already have been provided by a call
  * to SetParallelStartTimestamps().
  */
+/*
+ * 中文注释：
+ * 设置当前语句开始时间戳。并行 worker 中该值应由 SetParallelStartTimestamps() 提前提供。
+ */
 void
 SetCurrentStatementStartTimestamp(void)
 {
@@ -927,6 +1069,10 @@ SetCurrentStatementStartTimestamp(void)
  * Note: this will return zero when not inside any transaction, one when
  * inside a top-level transaction, etc.
  */
+/*
+ * 中文注释：
+ * 返回当前事务嵌套层级：不在事务中为 0，顶层事务为 1，每进入一层子事务加 1。
+ */
 int
 GetCurrentTransactionNestLevel(void)
 {
@@ -938,6 +1084,11 @@ GetCurrentTransactionNestLevel(void)
 
 /*
  *	TransactionIdIsCurrentTransactionId
+ */
+/*
+ * 中文注释：
+ * 判断给定 XID 是否属于当前事务（包括当前事务已提交的子事务）。普通后端遍历状态栈中的 XID；并行
+ * worker 则查询启动并行操作时复制的 ParallelCurrentXids 列表。
  */
 bool
 TransactionIdIsCurrentTransactionId(TransactionId xid)
@@ -1040,6 +1191,11 @@ TransactionIdIsCurrentTransactionId(TransactionId xid)
  * in progress. Recovery might have ended since so RecoveryInProgress() might
  * return false already.
  */
+/*
+ * 中文注释：
+ * 判断当前事务是否在数据库恢复期间启动。恢复可能已经结束，因此 RecoveryInProgress() 现在可能返回
+ * false。
+ */
 bool
 TransactionStartedDuringRecovery(void)
 {
@@ -1057,6 +1213,11 @@ TransactionStartedDuringRecovery(void)
  * Note: subtransactions of the topmost read-only transaction are also
  * read-only, because they inherit read-only mode from the transaction, and
  * thus can't change to read-write mode (see check_transaction_read_only).
+ */
+/*
+ * 中文注释：
+ * 返回只读事务的嵌套层级：0 表示不在只读事务中，1 表示顶层事务只读，2 表示一级子事务只读……顶层只读
+ * 事务的所有子事务也必然是只读的。
  */
 int
 GetTopReadOnlyTransactionNestLevel(void)
@@ -1077,6 +1238,11 @@ GetTopReadOnlyTransactionNestLevel(void)
 /*
  *	EnterParallelMode
  */
+/*
+ * 中文注释：
+ * 进入并行模式：递增当前事务层级的 parallelModeLevel 计数；并行模式下禁止执行会改变后端本地状态的操
+ * 作。
+ */
 void
 EnterParallelMode(void)
 {
@@ -1089,6 +1255,10 @@ EnterParallelMode(void)
 
 /*
  *	ExitParallelMode
+ */
+/*
+ * 中文注释：
+ * 退出并行模式：递减 parallelModeLevel 计数。
  */
 void
 ExitParallelMode(void)
@@ -1115,6 +1285,11 @@ ExitParallelMode(void)
  * that's initiated a parallel operation; for most purposes that context
  * has all the same restrictions.
  */
+/*
+ * 中文注释：
+ * 判断当前是否处于并行操作中（并行 leader 或 worker）。并行模式会限制许多操作；处于并行事务的子事务
+ * 中时同样视为并行模式。
+ */
 bool
 IsInParallelMode(void)
 {
@@ -1125,6 +1300,11 @@ IsInParallelMode(void)
 
 /*
  *	CommandCounterIncrement
+ */
+/*
+ * 中文注释：
+ * 递增命令 ID，使当前事务中后续命令能够看到此前命令所做的修改。这是 PostgreSQL 语句内可见性机制的核
+ * 心。
  */
 void
 CommandCounterIncrement(void)
@@ -1178,6 +1358,10 @@ CommandCounterIncrement(void)
  * persist and restore this variable.  So long as all callers use
  * PreventInTransactionBlock(), that omission has no consequences.
  */
+/*
+ * 中文注释：
+ * 允许命令强制当前顶层事务同步提交（例如某些需要落盘后才返回的操作）。
+ */
 void
 ForceSyncCommit(void)
 {
@@ -1187,11 +1371,16 @@ ForceSyncCommit(void)
 
 /* ----------------------------------------------------------------
  *						StartTransaction stuff
+ *	（中文）StartTransaction 相关：事务启动时的内存上下文、资源所有者和本地缓存初始化。
  * ----------------------------------------------------------------
  */
 
 /*
  *	AtStart_Cache
+ */
+/*
+ * 中文注释：
+ * 接收并处理启动事务前已经到达的失效消息，使本地缓存与共享目录状态保持一致。
  */
 static void
 AtStart_Cache(void)
@@ -1201,6 +1390,11 @@ AtStart_Cache(void)
 
 /*
  *	AtStart_Memory
+ */
+/*
+ * 中文注释：
+ * 记录事务开始前的内存上下文；必要时创建 TransactionAbortContext（供中止清理使用）
+ * 和 TopTransactionContext，然后把 TopTransactionContext 设为当前内存上下文。
  */
 static void
 AtStart_Memory(void)
@@ -1252,6 +1446,10 @@ AtStart_Memory(void)
 /*
  *	AtStart_ResourceOwner
  */
+/*
+ * 中文注释：
+ * 为顶层事务创建资源所有者，用于跟踪事务期间获取的资源。
+ */
 static void
 AtStart_ResourceOwner(void)
 {
@@ -1274,11 +1472,16 @@ AtStart_ResourceOwner(void)
 
 /* ----------------------------------------------------------------
  *						StartSubTransaction stuff
+ *	（中文）StartSubTransaction 相关：子事务启动时的内存上下文和资源所有者初始化。
  * ----------------------------------------------------------------
  */
 
 /*
  * AtSubStart_Memory
+ */
+/*
+ * 中文注释：
+ * 子事务开始时创建子事务内存上下文；子事务提交时其内容会合并到父上下文。
  */
 static void
 AtSubStart_Memory(void)
@@ -1309,6 +1512,10 @@ AtSubStart_Memory(void)
 /*
  * AtSubStart_ResourceOwner
  */
+/*
+ * 中文注释：
+ * 子事务开始时创建子事务资源所有者，并挂到父资源所有者下。
+ */
 static void
 AtSubStart_ResourceOwner(void)
 {
@@ -1330,6 +1537,7 @@ AtSubStart_ResourceOwner(void)
 
 /* ----------------------------------------------------------------
  *						CommitTransaction stuff
+ *	（中文）CommitTransaction 相关：事务提交的 WAL 记录、内存清理和子事务 XID 合并。
  * ----------------------------------------------------------------
  */
 
@@ -1340,6 +1548,11 @@ AtSubStart_ResourceOwner(void)
  * if the xact has no XID.  (We compute that here just because it's easier.)
  *
  * If you change this function, see RecordTransactionCommitPrepared also.
+ */
+/*
+ * 中文注释：
+ * 记录顶层事务的提交：向 WAL 写入 XLOG_XACT_COMMIT（或 XLOG_XACT_COMMIT_COMPACT）记录，处理同步提交、提交时间戳、复制等；返回事务及其子事务中的最大 XID。若修改此函数，请同时检查
+ * RecordTransactionCommitPrepared 及两阶段提交相关代码。
  */
 static TransactionId
 RecordTransactionCommit(void)
@@ -1357,6 +1570,12 @@ RecordTransactionCommit(void)
 	SharedInvalidationMessage *invalMessages = NULL;
 	bool		RelcacheInitFileInval = false;
 	bool		wrote_xlog;
+
+	/*
+	 * 中文注释：只有已分配 XID 的事务才需要写提交 WAL；没有 XID 且没有副作用的事务可以跳过。
+	 * 写提交记录前要收集待删除文件、已提交子事务 XID、失效消息、统计项等附加数据，
+	 * 并处理同步提交、复制源推进和提交时间戳。
+	 */
 
 	/*
 	 * Log pending invalidations for logical decoding of in-progress
@@ -1617,6 +1836,11 @@ cleanup:
 /*
  *	AtCCI_LocalCache
  */
+/*
+ * 中文注释：
+ * CommandCounterIncrement() 的本地缓存处理部分：先让待处理的 relation map 变更可见，
+ * 再处理本地失效消息，使下一条命令看到最新的目录和缓存状态。
+ */
 static void
 AtCCI_LocalCache(void)
 {
@@ -1635,6 +1859,11 @@ AtCCI_LocalCache(void)
 
 /*
  *	AtCommit_Memory
+ */
+/*
+ * 中文注释：
+ * 顶层事务提交后的内存清理：切回事务开始前的内存上下文，并重置 TopTransactionContext
+ * （保留上下文对象本身，但释放其中的全部事务级分配）。
  */
 static void
 AtCommit_Memory(void)
@@ -1667,11 +1896,17 @@ AtCommit_Memory(void)
 
 /* ----------------------------------------------------------------
  *						CommitSubTransaction stuff
+ *	（中文）CommitSubTransaction 相关：子事务提交时把 XID 和内存上下文上交给父事务。
  * ----------------------------------------------------------------
  */
 
 /*
  * AtSubCommit_Memory
+ */
+/*
+ * 中文注释：
+ * 子事务提交时切回父事务的内存上下文；若子事务上下文为空则直接删除，
+ * 避免大量“空子事务”造成内存泄漏。
  */
 static void
 AtSubCommit_Memory(void)
@@ -1701,6 +1936,10 @@ AtSubCommit_Memory(void)
  * AtSubCommit_childXids
  *
  * Pass my own XID and my child XIDs up to my parent as committed children.
+ */
+/*
+ * 中文注释：
+ * 子事务提交时，把自己的 XID 和所有子 XID 上交给父事务，记录为父事务的已提交子事务。
  */
 static void
 AtSubCommit_childXids(void)
@@ -1783,6 +2022,7 @@ AtSubCommit_childXids(void)
 
 /* ----------------------------------------------------------------
  *						AbortTransaction stuff
+ *	（中文）AbortTransaction 相关：事务中止时的 WAL 记录、内存与资源所有者恢复。
  * ----------------------------------------------------------------
  */
 
@@ -1791,6 +2031,12 @@ AtSubCommit_childXids(void)
  *
  * Returns latest XID among xact and its children, or InvalidTransactionId
  * if the xact has no XID.  (We compute that here just because it's easier.)
+ */
+/*
+ * 中文注释：
+ * 记录事务/子事务的中止：若已分配有效 XID，则写 XLOG_XACT_ABORT 记录，并在 pg_xact 中
+ * 把该事务（及其子事务）标记为中止。中止记录不需要立即刷盘，因为崩溃恢复默认就认为
+ * 未提交的事务已中止。返回事务及其子事务中的最大 XID。
  */
 static TransactionId
 RecordTransactionAbort(bool isSubXact)
@@ -1805,6 +2051,11 @@ RecordTransactionAbort(bool isSubXact)
 	TransactionId *children;
 	TimestampTz xact_time;
 	bool		replorigin;
+
+	/*
+	 * 中文注释：没有有效 XID 的事务无需记录中止；有 XID 时写中止记录并在 pg_xact 中标记中止。
+	 * 中止记录不要求立即刷盘，因为崩溃后未提交事务本来就会被视为中止。
+	 */
 
 	/*
 	 * If we haven't been assigned an XID, nobody will care whether we aborted
@@ -1922,6 +2173,10 @@ RecordTransactionAbort(bool isSubXact)
 /*
  *	AtAbort_Memory
  */
+/*
+ * 中文注释：
+ * 事务中止后恢复内存上下文，确保后续清理工作使用正确的上下文。
+ */
 static void
 AtAbort_Memory(void)
 {
@@ -1942,6 +2197,11 @@ AtAbort_Memory(void)
 /*
  * AtSubAbort_Memory
  */
+/*
+ * 中文注释：
+ * 子事务中止后切换到事务中止专用上下文（TransactionAbortContext），
+ * 以保证即使内存紧张也能安全完成清理工作。
+ */
 static void
 AtSubAbort_Memory(void)
 {
@@ -1953,6 +2213,10 @@ AtSubAbort_Memory(void)
 
 /*
  *	AtAbort_ResourceOwner
+ */
+/*
+ * 中文注释：
+ * 事务中止后恢复/清理资源所有者。
  */
 static void
 AtAbort_ResourceOwner(void)
@@ -1967,6 +2231,11 @@ AtAbort_ResourceOwner(void)
 /*
  * AtSubAbort_ResourceOwner
  */
+/*
+ * 中文注释：
+ * 子事务中止时把 CurrentResourceOwner 指向该子事务的资源所有者，
+ * 以便后续清理它持有的资源。
+ */
 static void
 AtSubAbort_ResourceOwner(void)
 {
@@ -1979,6 +2248,10 @@ AtSubAbort_ResourceOwner(void)
 
 /*
  * AtSubAbort_childXids
+ */
+/*
+ * 中文注释：
+ * 子事务中止时清理其已提交子事务的 XID 记录，因为这些子事务已随之中止。
  */
 static void
 AtSubAbort_childXids(void)
@@ -2006,11 +2279,17 @@ AtSubAbort_childXids(void)
 
 /* ----------------------------------------------------------------
  *						CleanupTransaction stuff
+ *	（中文）CleanupTransaction 相关：事务中止后的内存清理。
  * ----------------------------------------------------------------
  */
 
 /*
  *	AtCleanup_Memory
+ */
+/*
+ * 中文注释：
+ * 事务完全结束后的内存清理：切回事务开始前的上下文，重置事务中止上下文，
+ * 重置 TopTransactionContext 并清空相关指针。
  */
 static void
 AtCleanup_Memory(void)
@@ -2054,11 +2333,17 @@ AtCleanup_Memory(void)
 
 /* ----------------------------------------------------------------
  *						CleanupSubTransaction stuff
+ *	（中文）CleanupSubTransaction 相关：子事务清理阶段的内存清理。
  * ----------------------------------------------------------------
  */
 
 /*
  * AtSubCleanup_Memory
+ */
+/*
+ * 中文注释：
+ * 子事务清理阶段的内存清理：切回子事务开始前的上下文，重置事务中止上下文，
+ * 并删除子事务内存上下文及其所有子上下文。
  */
 static void
 AtSubCleanup_Memory(void)
@@ -2096,17 +2381,34 @@ AtSubCleanup_Memory(void)
 
 /* ----------------------------------------------------------------
  *						interface routines
+ *	（中文）接口例程：事务启动/提交/准备/中止/清理命令的入口，以及事务块和回调接口。
  * ----------------------------------------------------------------
  */
 
 /*
  *	StartTransaction
  */
+/*
+ * 中文注释：
+ * 启动一个顶层事务：复位事务状态与各字段，确定只读/隔离级别，创建内存上下文和资源所有者，分配虚拟事
+ * 务 ID，设置时间戳并初始化各子系统，最终进入 TRANS_INPROGRESS 状态。
+ */
 static void
 StartTransaction(void)
 {
 	TransactionState s;
 	VirtualTransactionId vxid;
+
+	/*
+	 * 中文注释（执行流程）：
+	 * 1. 将状态栈复位到顶层，并把底层状态置为 TRANS_START；
+	 * 2. 初始化嵌套层级、子事务 ID、命令 ID、XID 记账等事务字段；
+	 * 3. 设置隔离级别、只读/可延迟属性，并保存用户 ID 与安全上下文；
+	 * 4. 创建事务内存上下文和资源所有者；
+	 * 5. 分配虚拟事务 ID（vxid）并登记到 ProcArray；
+	 * 6. 设置事务/语句时间戳，初始化 GUC、缓存、触发器、统计等子系统；
+	 * 7. 把状态置为 TRANS_INPROGRESS，事务正式有效。
+	 */
 
 	/*
 	 * Let's just make sure the state stack is empty
@@ -2266,6 +2568,12 @@ StartTransaction(void)
  *
  * NB: if you change this routine, better look at PrepareTransaction too!
  */
+/*
+ * 中文注释：
+ * 顶层事务提交主流程：先执行延迟触发器和关闭游标等预提交工作，再调用回调、清理并行操作、检查序列化
+ * 冲突；随后写 WAL 提交记录、从 ProcArray 移除事务、按顺序释放资源并清理本地状态。若修改此函数，务
+ * 必同步检查 PrepareTransaction。
+ */
 static void
 CommitTransaction(void)
 {
@@ -2274,6 +2582,17 @@ CommitTransaction(void)
 	bool		is_parallel_worker;
 
 	is_parallel_worker = (s->blockState == TBLOCK_PARALLEL_INPROGRESS);
+
+	/*
+	 * 中文注释（执行流程）：
+	 * 1. 预提交阶段：触发延迟触发器并关闭所有打开的 Portal；
+	 * 2. 调用事务回调，清理未完成的并行操作、延迟触发器和 ON COMMIT 动作；
+	 * 3. 同步未写 WAL 的文件，关闭大对象，发送 NOTIFY，检查序列化冲突；
+	 * 4. 把底层状态置为 TRANS_COMMIT，调用 RecordTransactionCommit() 写 WAL 并持久化提交；
+	 * 5. 从 ProcArray 中移除本事务，使其他后端不再看到它；
+	 * 6. 按“其他后端可见资源 -> 锁 -> 后端本地资源”的顺序释放资源并清理各子系统；
+	 * 7. 删除资源所有者和事务内存上下文，复位字段，回到 TRANS_DEFAULT。
+	 */
 
 	/* Enforce parallel mode restrictions during parallel worker commit. */
 	if (is_parallel_worker)
@@ -2555,6 +2874,12 @@ CommitTransaction(void)
  *
  * NB: if you change this routine, better look at CommitTransaction too!
  */
+/*
+ * 中文注释：
+ * 两阶段提交的第一阶段：执行预提交工作，检查临时对象和导出快照等限制，写 prepare WAL 记录并创建全局
+ * 事务，然后把锁和资源转移给 prepared 事务，最后清理后端本地状态。若修改此函数，务必同步检查
+ * CommitTransaction。
+ */
 static void
 PrepareTransaction(void)
 {
@@ -2564,6 +2889,16 @@ PrepareTransaction(void)
 	TimestampTz prepared_at;
 
 	Assert(!IsInParallelMode());
+
+	/*
+	 * 中文注释（执行流程）：
+	 * 1. 与提交类似地执行预提交工作（触发器、Portal、回调、ON COMMIT 动作）；
+	 * 2. 禁止对访问过临时对象或导出过快照的事务执行 PREPARE；
+	 * 3. 把状态置为 TRANS_PREPARE，调用 MarkAsPreparing() 预留 GID；
+	 * 4. 各子系统通过 AtPrepare_* 收集 2PC 状态，EndPrepare() 真正写 prepare WAL 记录；
+	 * 5. 把锁和资源转移给 prepared 事务的 PGPROC，并从 ProcArray 清除当前事务；
+	 * 6. 清理后端本地状态并回到 TRANS_DEFAULT；后续由其他后端执行 COMMIT/ROLLBACK PREPARED。
+	 */
 
 	ShowTransactionState("PrepareTransaction");
 
@@ -2851,12 +3186,29 @@ PrepareTransaction(void)
 /*
  *	AbortTransaction
  */
+/*
+ * 中文注释：
+ * 顶层事务中止主流程：尽快释放轻量锁，恢复用户 ID/安全上下文和内存上下文，停止并行操作，写中止 WAL
+ * 记录，从 ProcArray 移除事务，然后按与提交相反的顺序释放资源和清理状态。状态保持 TRANS_ABORT，直到
+ * CleanupTransaction。
+ */
 static void
 AbortTransaction(void)
 {
 	TransactionState s = CurrentTransactionState;
 	TransactionId latestXid;
 	bool		is_parallel_worker;
+
+	/*
+	 * 中文注释（执行流程）：
+	 * 1. 持有中断，禁用事务超时，并恢复可用的内存上下文和资源所有者；
+	 * 2. 尽快释放轻量锁、缓冲区内容锁和等待状态，清理 WAL 插入与超时状态；
+	 * 3. 把底层状态置为 TRANS_ABORT，恢复用户 ID 与安全上下文；
+	 * 4. 停止并行操作，中止触发器、Portal、大对象、NOTIFY、两阶段状态等；
+	 * 5. 调用 RecordTransactionAbort() 写中止 WAL 记录；
+	 * 6. 从 ProcArray 移除事务，按与提交相反的顺序释放资源；
+	 * 7. 状态保持 TRANS_ABORT，等待 CleanupTransaction() 做最终清理。
+	 */
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
@@ -3058,6 +3410,11 @@ AbortTransaction(void)
 /*
  *	CleanupTransaction
  */
+/*
+ * 中文注释：
+ * 事务中止后的清理阶段：释放 Portal 内存和快照，删除资源所有者和事务内存上下文，复位事务状态字段，
+ * 最终回到 TRANS_DEFAULT 空闲状态。
+ */
 static void
 CleanupTransaction(void)
 {
@@ -3107,6 +3464,11 @@ CleanupTransaction(void)
 
 /*
  *	StartTransactionCommand
+ */
+/*
+ * 中文注释：
+ * 每条 SQL 命令开始时调用。根据当前 blockState 决定是启动新事务，还是沿用已有事务/子事务；最后切换
+ * 到事务级内存上下文。
  */
 void
 StartTransactionCommand(void)
@@ -3185,6 +3547,10 @@ StartTransactionCommand(void)
  * GUC system resets the characteristics at transaction end, so for example
  * just skipping the reset in StartTransaction() won't work.)
  */
+/*
+ * 中文注释：
+ * 保存当前事务特征（隔离级别、只读、可延迟），供 COMMIT/ROLLBACK AND CHAIN 在开启新事务时恢复。
+ */
 void
 SaveTransactionCharacteristics(SavedTransactionCharacteristics *s)
 {
@@ -3193,6 +3559,10 @@ SaveTransactionCharacteristics(SavedTransactionCharacteristics *s)
 	s->save_XactDeferrable = XactDeferrable;
 }
 
+/*
+ * 中文注释：
+ * 恢复先前保存的事务特征，用于事务链（AND CHAIN）。
+ */
 void
 RestoreTransactionCharacteristics(const SavedTransactionCharacteristics *s)
 {
@@ -3205,6 +3575,11 @@ RestoreTransactionCharacteristics(const SavedTransactionCharacteristics *s)
  *	CommitTransactionCommand -- a wrapper function handling the
  *		loop over subtransactions to avoid a potentially dangerous recursion
  *		in CommitTransactionCommandInternal().
+ */
+/*
+ * 中文注释：
+ * 包装函数：反复调用 CommitTransactionCommandInternal()，以循环代替递归，避免大量嵌套子事务导致栈溢
+ * 出。
  */
 void
 CommitTransactionCommand(void)
@@ -3224,6 +3599,11 @@ CommitTransactionCommand(void)
  *		subtransactions more than one iterations could be required.  Returns
  *		true when no more iterations required, false otherwise.
  */
+/*
+ * 中文注释：
+ * 执行一次 COMMIT 处理迭代。根据 blockState 完成顶层提交、子事务提交、保存点释放、清理中止事务等；
+ * 若还需继续处理父事务则返回 false。
+ */
 static bool
 CommitTransactionCommandInternal(void)
 {
@@ -3232,6 +3612,19 @@ CommitTransactionCommandInternal(void)
 
 	/* Must save in case we need to restore below */
 	SaveTransactionCharacteristics(&savetc);
+
+	/*
+	 * 中文注释（事务块状态机）：
+	 * - TBLOCK_STARTED：单条语句事务，直接提交并回到空闲；
+	 * - TBLOCK_BEGIN：BEGIN 完成，进入 TBLOCK_INPROGRESS；
+	 * - TBLOCK_INPROGRESS/TBLOCK_SUBINPROGRESS：命令结束，递增命令 ID；
+	 * - TBLOCK_END：执行顶层提交（支持 AND CHAIN）；
+	 * - TBLOCK_ABORT/SUBABORT：保持失败状态，等待 ROLLBACK；
+	 * - TBLOCK_ABORT_END/ABORT_PENDING：清理，或先中止再清理；
+	 * - TBLOCK_PREPARE：执行两阶段提交的 prepare；
+	 * - TBLOCK_SUBBEGIN/SUBRELEASE/SUBCOMMIT/SUBRESTART：启动、释放、提交或重启子事务。
+	 * 返回 false 表示还需要继续处理父事务。
+	 */
 
 	switch (s->blockState)
 	{
@@ -3500,6 +3893,10 @@ CommitTransactionCommandInternal(void)
  *		loop over subtransactions to avoid potentially dangerous recursion in
  *		AbortCurrentTransactionInternal().
  */
+/*
+ * 中文注释：
+ * 包装函数：反复调用 AbortCurrentTransactionInternal()，以循环代替递归处理多层子事务中止。
+ */
 void
 AbortCurrentTransaction(void)
 {
@@ -3518,10 +3915,25 @@ AbortCurrentTransaction(void)
  *		subtransactions more than one iterations could be required.  Returns
  *		true when no more iterations required, false otherwise.
  */
+/*
+ * 中文注释：
+ * 执行一次事务中止处理迭代。根据 blockState 中止顶层事务或子事务并做相应清理；若还需处理父事务则返
+ * 回 false。
+ */
 static bool
 AbortCurrentTransactionInternal(void)
 {
 	TransactionState s = CurrentTransactionState;
+
+	/*
+	 * 中文注释（中止状态机）：
+	 * - 空闲状态直接返回；事务启动失败（TRANS_START）时先修正状态再中止；
+	 * - 单条语句、隐式事务或 BEGIN 阶段失败：中止并清理，回到空闲；
+	 * - TBLOCK_INPROGRESS：中止后保持 TBLOCK_ABORT，等待用户 ROLLBACK；
+	 * - TBLOCK_END/PREPARE：提交或准备阶段失败，中止并清理；
+	 * - 子事务失败：只中止当前子事务并进入 TBLOCK_SUBABORT；
+	 * - 子事务启动/释放/提交/重启失败：中止并弹出子事务，返回 false 继续处理父事务。
+	 */
 
 	switch (s->blockState)
 	{
@@ -3697,6 +4109,11 @@ AbortCurrentTransactionInternal(void)
  *	convenient to centralize the check here instead of making callers do it.)
  *	stmtType: statement type name, for error messages.
  */
+/*
+ * 中文注释：
+ * 供不能在事务块中执行的语句调用（这类语句通常有不可回滚的副作用或需要内部提交）。若已处于事务块、
+ * 用户定义函数或子事务中则报错；成功返回即可保证语句完成后立即提交。
+ */
 void
 PreventInTransactionBlock(bool isTopLevel, const char *stmtType)
 {
@@ -3760,12 +4177,20 @@ PreventInTransactionBlock(bool isTopLevel, const char *stmtType)
  *	inside a function.
  *	stmtType: statement type name, for warning or error messages.
  */
+/*
+ * 中文注释：
+ * 若当前不在事务块中则发出警告；用于在事务块外执行没有持久效果的语句（如 DECLARE CURSOR）。
+ */
 void
 WarnNoTransactionBlock(bool isTopLevel, const char *stmtType)
 {
 	CheckTransactionBlock(isTopLevel, false, stmtType);
 }
 
+/*
+ * 中文注释：
+ * 若当前不在事务块中则报错；用于必须在事务块内执行的语句。
+ */
 void
 RequireTransactionBlock(bool isTopLevel, const char *stmtType)
 {
@@ -3774,6 +4199,10 @@ RequireTransactionBlock(bool isTopLevel, const char *stmtType)
 
 /*
  * This is the implementation of the above two.
+ */
+/*
+ * 中文注释：
+ * WarnNoTransactionBlock 和 RequireTransactionBlock 的共同实现。
  */
 static void
 CheckTransactionBlock(bool isTopLevel, bool throwError, const char *stmtType)
@@ -3819,6 +4248,10 @@ CheckTransactionBlock(bool isTopLevel, bool throwError, const char *stmtType)
  *	isTopLevel: passed down from ProcessUtility to determine whether we are
  *	inside a function.
  */
+/*
+ * 中文注释：
+ * 判断当前是否位于事务块中。需要区分“事务块内执行”和“单条命令执行”行为的语句（如 ANALYZE）使用它。
+ */
 bool
 IsInTransactionBlock(bool isTopLevel)
 {
@@ -3854,6 +4287,10 @@ IsInTransactionBlock(bool isTopLevel)
  * At transaction end, the callback occurs post-commit or post-abort, so the
  * callback functions can only do noncritical cleanup.
  */
+/*
+ * 中文注释：
+ * 注册事务开始/结束回调。主要供动态加载模块使用；回调在提交或中止之后执行，因此只能做非关键清理。
+ */
 void
 RegisterXactCallback(XactCallback callback, void *arg)
 {
@@ -3867,6 +4304,10 @@ RegisterXactCallback(XactCallback callback, void *arg)
 	Xact_callbacks = item;
 }
 
+/*
+ * 中文注释：
+ * 注销之前注册的事务回调。
+ */
 void
 UnregisterXactCallback(XactCallback callback, void *arg)
 {
@@ -3888,6 +4329,10 @@ UnregisterXactCallback(XactCallback callback, void *arg)
 	}
 }
 
+/*
+ * 中文注释：
+ * 按注册顺序调用所有事务回调，通知当前事务事件（开始、预提交、提交、中止等）。
+ */
 static void
 CallXactCallbacks(XactEvent event)
 {
@@ -3914,6 +4359,10 @@ CallXactCallbacks(XactEvent event)
  * subtransaction start, the callback is called when the subtransaction has
  * finished initializing.
  */
+/*
+ * 中文注释：
+ * 注册子事务开始/结束回调。
+ */
 void
 RegisterSubXactCallback(SubXactCallback callback, void *arg)
 {
@@ -3927,6 +4376,10 @@ RegisterSubXactCallback(SubXactCallback callback, void *arg)
 	SubXact_callbacks = item;
 }
 
+/*
+ * 中文注释：
+ * 注销之前注册的子事务回调。
+ */
 void
 UnregisterSubXactCallback(SubXactCallback callback, void *arg)
 {
@@ -3948,6 +4401,10 @@ UnregisterSubXactCallback(SubXactCallback callback, void *arg)
 	}
 }
 
+/*
+ * 中文注释：
+ * 调用所有子事务回调，通知子事务事件（开始、提交、中止等）。
+ */
 static void
 CallSubXactCallbacks(SubXactEvent event,
 					 SubTransactionId mySubid,
@@ -3967,12 +4424,18 @@ CallSubXactCallbacks(SubXactEvent event,
 
 /* ----------------------------------------------------------------
  *					   transaction block support
+ *	（中文）事务块支持：BEGIN/COMMIT/ROLLBACK、保存点以及事务块状态查询等用户级操作。
  * ----------------------------------------------------------------
  */
 
 /*
  *	BeginTransactionBlock
  *		This executes a BEGIN command.
+ */
+/*
+ * 中文注释：
+ * 执行 BEGIN 命令：把 blockState 从 TBLOCK_STARTED/TBLOCK_IMPLICIT_INPROGRESS 切到 TBLOCK_BEGIN，实
+ * 际事务启动由后续 StartTransactionCommand/CommitTransactionCommand 完成。
  */
 void
 BeginTransactionBlock(void)
@@ -4042,6 +4505,11 @@ BeginTransactionBlock(void)
  * We do it this way because it's not convenient to change memory context,
  * resource owner, etc while executing inside a Portal.
  */
+/*
+ * 中文注释：
+ * 执行 PREPARE TRANSACTION 命令：先按 COMMIT 处理，再把顶层 blockState 改为 TBLOCK_PREPARE，并保存
+ * GID。真正工作由随后的 PrepareTransaction() 完成；返回 true 表示 PREPARE，false 表示实际执行了回滚。
+ */
 bool
 PrepareTransactionBlock(const char *gid)
 {
@@ -4093,6 +4561,12 @@ PrepareTransactionBlock(const char *gid)
  * The real work will be done in the upcoming CommitTransactionCommand().
  * We do it this way because it's not convenient to change memory context,
  * resource owner, etc while executing inside a Portal.
+ */
+/*
+ * 中文注释：
+ * 执行 COMMIT 命令：只修改 blockState（顶层为 TBLOCK_END，子事务为 TBLOCK_SUBCOMMIT，失败事务为
+ * TBLOCK_ABORT_END 等），真正提交由 CommitTransactionCommand 完成；返回 true 表示提交，false 表示回
+ * 滚。
  */
 bool
 EndTransactionBlock(bool chain)
@@ -4254,6 +4728,11 @@ EndTransactionBlock(bool chain)
  *
  * As above, we don't actually do anything here except change blockState.
  */
+/*
+ * 中文注释：
+ * 执行 ROLLBACK 命令：只把 blockState 标记为待中止/待清理状态，真正回滚由 CommitTransactionCommand
+ * 完成。
+ */
 void
 UserAbortTransactionBlock(bool chain)
 {
@@ -4376,6 +4855,11 @@ UserAbortTransactionBlock(bool chain)
  * without a lot of ceremony.  We do not expect caller to do
  * CommitTransactionCommand/StartTransactionCommand.
  */
+/*
+ * 中文注释：
+ * 在尚未进入事务块时启动隐式事务块（TBLOCK_IMPLICIT_INPROGRESS）。由 postgres.c 主循环直接调用，不
+ * 在 Portal 内。
+ */
 void
 BeginImplicitTransactionBlock(void)
 {
@@ -4401,6 +4885,10 @@ BeginImplicitTransactionBlock(void)
  * Like EndTransactionBlock, we just make any needed blockState change here.
  * The real work will be done in the upcoming CommitTransactionCommand().
  */
+/*
+ * 中文注释：
+ * 结束隐式事务块，把状态改回 TBLOCK_STARTED，使 CommitTransactionCommand 像处理单条语句一样提交它。
+ */
 void
 EndImplicitTransactionBlock(void)
 {
@@ -4422,6 +4910,11 @@ EndImplicitTransactionBlock(void)
 /*
  * DefineSavepoint
  *		This executes a SAVEPOINT command.
+ */
+/*
+ * 中文注释：
+ * 执行 SAVEPOINT 命令：检查并行模式限制，为当前事务压入一个新的子事务状态并记录保存点名称；子事务的
+ * 实际初始化在 StartSubTransaction 完成。
  */
 void
 DefineSavepoint(const char *name)
@@ -4507,6 +5000,11 @@ DefineSavepoint(const char *name)
  *		This executes a RELEASE command.
  *
  * As above, we don't actually do anything here except change blockState.
+ */
+/*
+ * 中文注释：
+ * 执行 RELEASE SAVEPOINT：查找目标保存点，把从当前子事务到目标之间的所有子事务标记为
+ * TBLOCK_SUBRELEASE，待 CommitTransactionCommand 统一提交。
  */
 void
 ReleaseSavepoint(const char *name)
@@ -4616,6 +5114,11 @@ ReleaseSavepoint(const char *name)
  *		This executes a ROLLBACK TO <savepoint> command.
  *
  * As above, we don't actually do anything here except change blockState.
+ */
+/*
+ * 中文注释：
+ * 执行 ROLLBACK TO SAVEPOINT：查找目标保存点，把其上的子事务标记为待中止，并把目标子事务标记为待重
+ * 启；实际回滚与重建由 CommitTransactionCommand 完成。
  */
 void
 RollbackToSavepoint(const char *name)
@@ -4744,6 +5247,11 @@ RollbackToSavepoint(const char *name)
  *		automatically does CommitTransactionCommand/StartTransactionCommand
  *		instead of expecting the caller to do it.
  */
+/*
+ * 中文注释：
+ * 内部使用的子事务启动函数。与 DefineSavepoint 类似，但允许在 TBLOCK_STARTED、隐式事务、并行 worker、COMMIT/PREPARE 等状态下调用，适合函数内以及 COMMIT 时触发的延迟触发器使用；它会自动执行
+ * CommitTransactionCommand/StartTransactionCommand。
+ */
 void
 BeginInternalSubTransaction(const char *name)
 {
@@ -4818,6 +5326,11 @@ BeginInternalSubTransaction(const char *name)
  * savepoint name (if any).
  * NB: do NOT use CommitTransactionCommand/StartTransactionCommand with this.
  */
+/*
+ * 中文注释：
+ * 提交（RELEASE）最内层子事务，不依赖保存点名称。调用者不要同时使用
+ * CommitTransactionCommand/StartTransactionCommand。
+ */
 void
 ReleaseCurrentSubTransaction(void)
 {
@@ -4845,6 +5358,11 @@ ReleaseCurrentSubTransaction(void)
  * ROLLBACK and RELEASE (ie, abort) the innermost subtransaction, regardless
  * of its savepoint name (if any).
  * NB: do NOT use CommitTransactionCommand/StartTransactionCommand with this.
+ */
+/*
+ * 中文注释：
+ * 中止并释放最内层子事务，不依赖保存点名称。调用者不要同时使用
+ * CommitTransactionCommand/StartTransactionCommand。
  */
 void
 RollbackAndReleaseCurrentSubTransaction(void)
@@ -4911,6 +5429,11 @@ RollbackAndReleaseCurrentSubTransaction(void)
  *	This routine is provided for error recovery purposes.  It aborts any
  *	active transaction or transaction block, leaving the system in a known
  *	idle state.
+ */
+/*
+ * 中文注释：
+ * 错误恢复例程：中止任何活动事务或事务块，把系统恢复到已知的空闲状态。即使事务状态已损坏也应尽量可
+ * 用。
  */
 void
 AbortOutOfAnyTransaction(void)
@@ -5021,6 +5544,10 @@ AbortOutOfAnyTransaction(void)
 /*
  * IsTransactionBlock --- are we within a transaction block?
  */
+/*
+ * 中文注释：
+ * 判断当前是否处于事务块中。
+ */
 bool
 IsTransactionBlock(void)
 {
@@ -5039,6 +5566,10 @@ IsTransactionBlock(void)
  *
  * This should match up with IsTransactionBlock and IsTransactionState.
  */
+/*
+ * 中文注释：
+ * 判断当前是否处于事务中或事务块中；返回 false 表示后端真正空闲。
+ */
 bool
 IsTransactionOrTransactionBlock(void)
 {
@@ -5052,6 +5583,10 @@ IsTransactionOrTransactionBlock(void)
 
 /*
  * TransactionBlockStatusCode - return status code to send in ReadyForQuery
+ */
+/*
+ * 中文注释：
+ * 返回 ReadyForQuery 消息中的事务状态码：'T' 表示在事务块中，'E' 表示处于失败事务中，'I' 表示空闲。
  */
 char
 TransactionBlockStatusCode(void)
@@ -5094,6 +5629,10 @@ TransactionBlockStatusCode(void)
 /*
  * IsSubTransaction
  */
+/*
+ * 中文注释：
+ * 判断当前是否处于子事务中（嵌套层级大于 1）。
+ */
 bool
 IsSubTransaction(void)
 {
@@ -5116,6 +5655,11 @@ IsSubTransaction(void)
  * push a dummy transaction block, and when control returns to the main
  * idle loop, CommitTransactionCommand will be called, and we'll come here
  * to finish starting the subtransaction.
+ */
+/*
+ * 中文注释：
+ * 完成子事务的启动。之所以与 PushTransaction 分开，是因为 SAVEPOINT 命令在 Portal 内执行，不能在
+ * Portal 中切换内存上下文和资源所有者；等控制返回主循环后再在这里完成初始化。
  */
 static void
 StartSubTransaction(void)
@@ -5153,6 +5697,11 @@ StartSubTransaction(void)
  *
  *	The caller has to make sure to always reassign CurrentTransactionState
  *	if it has a local pointer to it after calling this function.
+ */
+/*
+ * 中文注释：
+ * 提交当前子事务：调用子事务提交回调，合并子事务资源到父事务，把 XID 上交给父事务，然后弹出状态栈。
+ * 调用后必须重新获取 CurrentTransactionState。
  */
 static void
 CommitSubTransaction(void)
@@ -5268,6 +5817,10 @@ CommitSubTransaction(void)
 
 /*
  * AbortSubTransaction
+ */
+/*
+ * 中文注释：
+ * 中止当前子事务：释放子事务资源、回滚其修改、清理状态并记录必要的中止信息，最后弹出状态栈。
  */
 static void
 AbortSubTransaction(void)
@@ -5438,6 +5991,11 @@ AbortSubTransaction(void)
  *	The caller has to make sure to always reassign CurrentTransactionState
  *	if it has a local pointer to it after calling this function.
  */
+/*
+ * 中文注释：
+ * 子事务中止后的清理：释放子事务内存上下文和资源所有者，然后弹出状态栈。调用后必须重新获取
+ * CurrentTransactionState。
+ */
 static void
 CleanupSubTransaction(void)
 {
@@ -5470,6 +6028,11 @@ CleanupSubTransaction(void)
  *
  *	The caller has to make sure to always reassign CurrentTransactionState
  *	if it has a local pointer to it after calling this function.
+ */
+/*
+ * 中文注释：
+ * 为子事务创建新的 TransactionState 栈条目，并复制父事务的只读状态、用户 ID、安全上下文等信息。调用
+ * 后必须重新获取 CurrentTransactionState。
  */
 static void
 PushTransaction(void)
@@ -5533,6 +6096,11 @@ PushTransaction(void)
  *	The caller has to make sure to always reassign CurrentTransactionState
  *	if it has a local pointer to it after calling this function.
  */
+/*
+ * 中文注释：
+ * 弹出当前子事务状态，回到父事务状态，并恢复父事务的内存上下文和资源所有者。调用后必须重新获取
+ * CurrentTransactionState。
+ */
 static void
 PopTransaction(void)
 {
@@ -5567,6 +6135,11 @@ PopTransaction(void)
  *		SerializeTransactionState.  It would be OK to overestimate slightly,
  *		but it's simple for us to work out the precise value, so we do.
  */
+/*
+ * 中文注释：
+ * 估算 SerializeTransactionState() 需要的共享内存空间大小。精确计算虽然稍多几行代码，但可以避免浪费
+ * 空间。
+ */
 Size
 EstimateTransactionStateSpace(void)
 {
@@ -5594,6 +6167,11 @@ EstimateTransactionStateSpace(void)
  * caller-supplied buffer big enough to hold the number of bytes reported by
  * EstimateTransactionStateSpace().  We emit the XIDs in sorted order for the
  * convenience of the receiving process.
+ */
+/*
+ * 中文注释：
+ * 把并行 worker 需要的事务状态序列化到调用者提供的缓冲区：隔离级别、可延迟属性、顶层/当前
+ * FullTransactionId、当前命令 ID 以及当前有效的 XID 列表（按数值排序）。
  */
 void
 SerializeTransactionState(Size maxsize, char *start_address)
@@ -5666,6 +6244,10 @@ SerializeTransactionState(Size maxsize, char *start_address)
  *		Start a parallel worker transaction, restoring the relevant
  *		transaction state serialized by SerializeTransactionState.
  */
+/*
+ * 中文注释：
+ * 并行 worker 启动事务：从 SerializeTransactionState 产生的状态缓冲区恢复事务特征和 XID 信息。
+ */
 void
 StartParallelWorkerTransaction(char *tstatespace)
 {
@@ -5691,6 +6273,10 @@ StartParallelWorkerTransaction(char *tstatespace)
  * EndParallelWorkerTransaction
  *		End a parallel worker transaction.
  */
+/*
+ * 中文注释：
+ * 结束并行 worker 的事务。
+ */
 void
 EndParallelWorkerTransaction(void)
 {
@@ -5703,6 +6289,10 @@ EndParallelWorkerTransaction(void)
  * ShowTransactionState
  *		Debug support
  */
+/*
+ * 中文注释：
+ * 调试辅助函数：输出当前事务状态栈。
+ */
 static void
 ShowTransactionState(const char *str)
 {
@@ -5714,6 +6304,10 @@ ShowTransactionState(const char *str)
 /*
  * ShowTransactionStateRec
  *		Recursive subroutine for ShowTransactionState
+ */
+/*
+ * 中文注释：
+ * ShowTransactionState 的递归子程序，逐层输出事务状态。
  */
 static void
 ShowTransactionStateRec(const char *str, TransactionState s)
@@ -5761,6 +6355,10 @@ ShowTransactionStateRec(const char *str, TransactionState s)
 /*
  * BlockStateAsString
  *		Debug support
+ */
+/*
+ * 中文注释：
+ * 调试辅助函数：把 TBlockState 枚举转换为可读字符串。
  */
 static const char *
 BlockStateAsString(TBlockState blockState)
@@ -5815,6 +6413,10 @@ BlockStateAsString(TBlockState blockState)
  * TransStateAsString
  *		Debug support
  */
+/*
+ * 中文注释：
+ * 调试辅助函数：把 TransState 枚举转换为可读字符串。
+ */
 static const char *
 TransStateAsString(TransState state)
 {
@@ -5845,6 +6447,11 @@ TransStateAsString(TransState state)
  * the caller should *not* pfree() it (this is a change from pre-8.4 code!).
  * If there are no subxacts, *ptr is set to NULL.
  */
+/*
+ * 中文注释：
+ * 获取当前事务已提交子事务的 XID 列表，返回子事务数量，*ptr 指向 TransactionId 数组。数组分配在
+ * TopTransactionContext 中，调用者不要 pfree；没有子事务时 *ptr 为 NULL。
+ */
 int
 xactGetCommittedChildren(TransactionId **ptr)
 {
@@ -5868,6 +6475,10 @@ xactGetCommittedChildren(TransactionId **ptr)
  *
  * A 2pc commit will be emitted when twophase_xid is valid, a plain one
  * otherwise.
+ */
+/*
+ * 中文注释：
+ * 构造并写入提交 WAL 记录。twophase_xid 有效时写两阶段提交记录，否则写普通提交记录。
  */
 XLogRecPtr
 XactLogCommitRecord(TimestampTz commit_time,
@@ -6041,6 +6652,10 @@ XactLogCommitRecord(TimestampTz commit_time,
  * A 2pc abort will be emitted when twophase_xid is valid, a plain one
  * otherwise.
  */
+/*
+ * 中文注释：
+ * 构造并写入中止 WAL 记录。twophase_xid 有效时写两阶段中止记录，否则写普通中止记录。
+ */
 XLogRecPtr
 XactLogAbortRecord(TimestampTz abort_time,
 				   int nsubxacts, TransactionId *subxacts,
@@ -6184,6 +6799,11 @@ XactLogAbortRecord(TimestampTz abort_time,
 /*
  * Before 9.0 this was a fairly short function, but now it performs many
  * actions for which the order of execution is critical.
+ */
+/*
+ * 中文注释：
+ * 恢复阶段重放事务提交记录：更新 pg_xact 中的提交状态、提交时间戳、子事务状态，并处理 2PC 与文件删
+ * 除等。执行顺序非常关键。
  */
 static void
 xact_redo_commit(xl_xact_parsed_commit *parsed,
@@ -6339,6 +6959,11 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
  * topxid != xid, whereas in commit we would find topxid == xid always
  * because subtransaction commit is never WAL logged.
  */
+/*
+ * 中文注释：
+ * 恢复阶段重放事务中止记录：更新 pg_xact 中的中止状态、子事务状态，并处理 2PC 与文件删除等。执行顺
+ * 序与 xact_redo_commit 类似但有关键差异；中止可能针对子事务，因此 topxid 可能与 xid 不同。
+ */
 static void
 xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
 				XLogRecPtr lsn, ReplOriginId origin_id)
@@ -6418,6 +7043,11 @@ xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
 	}
 }
 
+/*
+ * 中文注释：
+ * WAL 恢复入口：解析 XLOG_XACT_* 记录并分派给 xact_redo_commit、xact_redo_abort 或两阶段提交恢复逻
+ * 辑。
+ */
 void
 xact_redo(XLogReaderState *record)
 {
