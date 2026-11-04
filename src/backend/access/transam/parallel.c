@@ -11,6 +11,62 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * 中文注释：
+ * 本文件实现 PostgreSQL 并行查询（parallel query）的公共基础设施，负责在 leader
+ * 后端与若干 parallel worker 之间建立、运行和销毁一次并行操作。虽然文件位于
+ * access/transam 目录（因为需要序列化和恢复事务状态），它本身不实现执行器逻辑，
+ * 而是提供被 executor、索引构建、VACUUM 等共同复用的框架。
+ *
+ * 主要职责：
+ *   1. ParallelContext 生命周期：CreateParallelContext() 建立后端本地上下文，
+ *      InitializeParallelDSM() 估算并创建 DSM 段、在 shm_toc 中登记各类状态，
+ *      LaunchParallelWorkers() 注册并启动 background worker，最后
+ *      DestroyParallelContext() 强制终止并回收资源；
+ *   2. 状态同步：把 leader 的 GUC、已加载库、事务状态（XID、command ID、隔离级别）、
+ *      snapshot、combo CID、reindex/relmapper 状态、未提交 enum、会话级 DSM 等
+ *      序列化进 DSM，worker 在 ParallelWorkerMain() 中按严格顺序恢复；worker 不
+ *      自行标记 XID 提交，最终由 leader 统一提交；
+ *   3. 错误传播（error propagation）：每个 worker 有一条 shm_mq 错误队列，worker 的
+ *      ErrorResponse/NoticeResponse/NotificationResponse/Progress/Terminate
+ *      协议消息经队列送到 leader；leader 在 CHECK_FOR_INTERRUPTS() 中调用
+ *      ProcessParallelMessages() 解析，并用 ThrowErrorData() 重新抛出错误；
+ *   4. 生命周期同步：WaitForParallelWorkersToAttach() 等待 worker 完成初始化，
+ *      WaitForParallelWorkersToFinish() 等待其结束并收集 WAL 末尾位置，
+ *      AtEOXact_Parallel()/AtEOSubXact_Parallel() 在事务/子事务边界兜底清理。
+ *
+ * 核心数据结构：
+ *   - ParallelContext（见 include/access/parallel.h）：leader 侧的句柄，保存 DSM
+ *     段、TOC、worker 数组、已启动 worker 数、入口函数名等；
+ *   - FixedParallelState：放在 DSM 固定位置的共享状态，包含数据库/用户/角色 OID、
+ *     leader 的 PGPROC/PID/ProcNumber、事务与语句时间戳、可序列化事务句柄，以及
+ *     由 spinlock 保护的 last_xlog_end；
+ *   - ParallelWorkerInfo：每个 worker 的 BackgroundWorkerHandle 与 error_mqh；
+ *   - PARALLEL_KEY_*：本模块在 shm_toc 中占用的 TOC key，对应各个序列化 chunk。
+ *
+ * 与其他模块的关系：
+ *   - postmaster/bgworker.c 负责真正 fork worker；worker 入口固定为
+ *     ParallelWorkerMain，通过 bgw_extra 传入 worker 编号；
+ *   - storage/ipc/dsm.c、shm_toc.c 提供 DSM 与表结构；storage/ipc/shm_mq.c 提供
+ *     单读单写消息队列；libpq/pqmq.c 把 libpq 协议输出重定向到该队列；
+ *   - access/transam/xact.c 提供 EnterParallelMode/ExitParallelMode、
+ *     StartParallelWorkerTransaction/EndParallelWorkerTransaction 及
+ *     XactLastRecEnd；worker 不自行提交 XID，由 leader 统一提交；
+ *   - executor/execParallel.c 负责计划、元组队列等执行器私有状态，本文件只提供
+ *     通用框架；nbtree/BRIN/GIN 的并行构建与 vacuumparallel.c 也复用本框架。
+ *
+ * 设计思想：
+ *   - 所有跨进程状态都必须显式序列化，不能传递指针（EXEC_BACKEND 下地址可能不同），
+ *     因此入口点以“库名 + 函数名”字符串传递，内建函数再查表还原为地址；
+ *   - leader 必须在进入 parallel mode 后创建 context，并保证在退出当前子事务前
+ *     销毁；否则 AtEOSubXact_Parallel 会发出 WARNING 并强制清理；
+ *   - worker 的失败尽量转化为 leader 中的普通 ERROR，而不是让 leader 直接崩溃：
+ *     错误级别被压到不超过 ERROR，且可以通过错误上下文看出错误来自 parallel worker；
+ *   - worker 启动阶段在错误队列建立之前发生的错误无法回传，因此初始化顺序必须
+ *     谨慎；错误队列建立后，所有 elog/ereport 输出都会被 pqmq 重定向；
+ *   - DSM 创建失败（达到 max_dsm_segments）时降级为后端私有内存并放弃启动 worker，
+ *     让查询以非并行方式继续，而不是直接报错。
+ */
 
 #include "postgres.h"
 
@@ -54,15 +110,52 @@
  * without blocking.  That way, a worker that errors out can write the whole
  * message into the queue and terminate without waiting for the user backend.
  */
+/*
+ * 中文注释：
+ * 每个 parallel worker 专用错误队列（shm_mq）的字节数。队列只承载
+ * ErrorResponse/NoticeResponse/NotificationResponse/Progress/Terminate 等小型协议
+ * 消息，不承载元组数据（元组走执行器另行建立的元组队列）。取 16KB 是在“不浪费
+ * 共享内存”与“典型 ErrorResponse 能一次性写入、worker 不必等待 leader 消费即可
+ * 退出”之间折中；InitializeParallelDSM() 中的 StaticAssertDecl 保证该大小满足
+ * BUFFERALIGN 对齐要求，因为 shm_mq_create() 要求队列起始地址按缓冲区边界对齐。
+ */
 #define PARALLEL_ERROR_QUEUE_SIZE			16384
 
 /* Magic number for parallel context TOC. */
+/*
+ * 中文注释：
+ * ParallelContext 的 shm_toc magic number。worker 在 ParallelWorkerMain() 中调用
+ * shm_toc_attach() 时用它校验 DSM 头部；magic 不匹配说明 attach 到了错误的 DSM
+ * 段或段内容已损坏，直接报 ERROR，避免按错误的 TOC 布局解释共享内存。
+ */
 #define PARALLEL_MAGIC						0x50477c7c
 
 /*
  * Magic numbers for per-context parallel state sharing.  Higher-level code
  * should use smaller values, leaving these very large ones for use by this
  * module.
+ */
+/*
+ * 中文注释：
+ * 本模块在 ParallelContext 的 shm_toc 中使用的 TOC key。key 的高位几乎全为 1，
+ * 把低位数值空间留给上层模块（executor、索引构建、VACUUM 等）使用，避免 key
+ * 冲突；扩展代码应使用更小的值。各 key 对应的 chunk 内容如下：
+ *   PARALLEL_KEY_FIXED                FixedParallelState
+ *   PARALLEL_KEY_ERROR_QUEUE          nworkers 个 PARALLEL_ERROR_QUEUE_SIZE 的 shm_mq
+ *   PARALLEL_KEY_LIBRARY              SerializeLibraryState() 的输出
+ *   PARALLEL_KEY_GUC                  SerializeGUCState() 的输出
+ *   PARALLEL_KEY_COMBO_CID            SerializeComboCIDState() 的输出
+ *   PARALLEL_KEY_TRANSACTION_SNAPSHOT 事务级 snapshot（仅 REPEATABLE READ/SERIALIZABLE）
+ *   PARALLEL_KEY_ACTIVE_SNAPSHOT      当前 active snapshot
+ *   PARALLEL_KEY_TRANSACTION_STATE    SerializeTransactionState() 的输出
+ *   PARALLEL_KEY_ENTRYPOINT           "库名\0函数名" 字符串
+ *   PARALLEL_KEY_SESSION_DSM          dsm_handle（会话级 DSM，用于共享 record typmod）
+ *   PARALLEL_KEY_PENDING_SYNCS        SerializePendingSyncs() 的输出
+ *   PARALLEL_KEY_REINDEX_STATE        SerializeReindexState() 的输出
+ *   PARALLEL_KEY_RELMAPPER_STATE      SerializeRelationMap() 的输出
+ *   PARALLEL_KEY_UNCOMMITTEDENUMS     SerializeUncommittedEnums() 的输出
+ *   PARALLEL_KEY_CLIENTCONNINFO       SerializeClientConnectionInfo() 的输出
+ * key 的数值顺序本身没有语义，worker 一律通过 shm_toc_lookup() 按 key 查找。
  */
 #define PARALLEL_KEY_FIXED					UINT64CONST(0xFFFFFFFFFFFF0001)
 #define PARALLEL_KEY_ERROR_QUEUE			UINT64CONST(0xFFFFFFFFFFFF0002)
@@ -81,6 +174,35 @@
 #define PARALLEL_KEY_CLIENTCONNINFO			UINT64CONST(0xFFFFFFFFFFFF000F)
 
 /* Fixed-size parallel state. */
+/*
+ * 中文注释：
+ * 放在 DSM 固定 chunk 中的“每上下文一份”共享状态，leader 在
+ * InitializeParallelDSM() 中填写，所有 worker 只读（last_xlog_end 除外）。
+ * 这些字段集中存放，是为了让 worker attach DSM 后能用一次
+ * shm_toc_lookup(PARALLEL_KEY_FIXED) 取到启动所需的全部身份和会话信息。
+ *
+ * 字段说明：
+ *   database_id/authenticated_user_id/session_user_id/outer_user_id/
+ *   current_user_id：恢复数据库连接与权限身份；worker 不再做认证，直接沿用
+ *     leader 的值；
+ *   temp_namespace_id/temp_toast_namespace_id：临时命名空间，保证 worker 的
+ *     search_path 与 leader 一致；
+ *   sec_context：GetUserIdAndSecContext() 保存的安全上下文标志；
+ *   session_user_is_superuser/role_is_superuser：恢复角色时使用的超级用户标志；
+ *   parallel_leader_pgproc/parallel_leader_pid/parallel_leader_proc_number：
+ *     leader 的 PGPROC 与进程标识，worker 用它加入锁组（lock group）并向 leader
+ *     发送信号；
+ *   xact_ts/stmt_ts：事务与语句开始时间戳，worker 必须继承而不是重新取当前时间；
+ *   serializable_xact_handle：SERIALIZABLE 事务的共享句柄，用于
+ *     AttachSerializableXact()；
+ *   mutex：保护 last_xlog_end 的自旋锁；本结构其余字段初始化完成后只读；
+ *   last_xlog_end：所有 worker 已写入 WAL 的最大结束位置，由
+ *     ParallelWorkerReportLastRecEnd() 在自旋锁内取最大值，leader 在
+ *     WaitForParallelWorkersToFinish() 中读取并合并到 XactLastRecEnd。
+ *
+ * 注意：本结构位于 DSM 中，不能包含指向后端私有内存的指针；PGPROC 指针指向共享
+ * 内存，因而可以跨进程使用。
+ */
 typedef struct FixedParallelState
 {
 	/* Fixed-size state that workers must restore. */
@@ -114,26 +236,79 @@ typedef struct FixedParallelState
  * and < the number of workers before any user code is invoked; each parallel
  * worker will get a different parallel worker number.
  */
+/*
+ * 中文注释：
+ * 当前进程的 parallel worker 编号：非 worker 后端为 -1；worker 在
+ * ParallelWorkerMain() 中从 MyBgworkerEntry->bgw_extra 取出 0..nworkers-1 的值。
+ * 执行器用它索引共享的 instrumentation、buffer usage 等数组，因此必须在调用任何
+ * 用户代码之前设置好，且同一并行操作内每个 worker 的编号互不相同。
+ * include/access/parallel.h 中的 IsParallelWorker() 即以此判断（>= 0）。
+ */
 int			ParallelWorkerNumber = -1;
 
 /* Is there a parallel message pending which we need to receive? */
+/*
+ * 中文注释：
+ * “有 parallel worker 消息待接收”的标志。worker 通过
+ * SendProcSignal(PROCSIG_PARALLEL_MESSAGE) 通知 leader，信号处理器
+ * HandleParallelMessageInterrupt() 只能设置该 volatile sig_atomic_t 标志；
+ * 真正的读取与解析推迟到下一次 CHECK_FOR_INTERRUPTS() -> ProcessInterrupts() ->
+ * ProcessParallelMessages() 中完成。这样保证信号处理函数是 async-signal-safe 的。
+ */
 volatile sig_atomic_t ParallelMessagePending = false;
 
 /* Are we initializing a parallel worker? */
+/*
+ * 中文注释：
+ * 当前进程是否正处于 parallel worker 的初始化阶段（从 ParallelWorkerMain 开始到
+ * 所有状态恢复完毕）。GUC/角色相关代码借此放宽或跳过某些检查：例如恢复
+ * session_authorization/role 时不做权限校验，因为 worker 必须盲目继承 leader 的
+ * 状态。调用入口函数之前会把它清为 false。
+ */
 bool		InitializingParallelWorker = false;
 
 /* Pointer to our fixed parallel state. */
+/*
+ * 中文注释：
+ * worker 本地指向 DSM 中 FixedParallelState 的指针；leader 中为 NULL。
+ * ParallelWorkerReportLastRecEnd() 依赖它写入 last_xlog_end。
+ */
 static FixedParallelState *MyFixedParallelState;
 
 /* List of active parallel contexts. */
+/*
+ * 中文注释：
+ * 当前后端所有活跃 ParallelContext 的双向链表，按创建顺序头插（LIFO）。
+ * AtEOXact_Parallel()/AtEOSubXact_Parallel() 依赖 LIFO 顺序从表头开始清理当前
+ * （子）事务创建的 context；ProcessParallelMessages() 遍历它处理所有 worker 消息。
+ * 链表节点嵌入 ParallelContext，context 在 DestroyParallelContext() 中先摘除节点，
+ * 避免清理过程中再次被引用。该链表只属于 leader，worker 不使用。
+ */
 static dlist_head pcxt_list = DLIST_STATIC_INIT(pcxt_list);
 
 /* Backend-local copy of data from FixedParallelState. */
+/*
+ * 中文注释：
+ * worker 在 ParallelWorkerMain() 中保存的 leader PID 本地副本，仅供
+ * ParallelWorkerShutdown() 在 before_shmem_exit 阶段发送
+ * PROCSIG_PARALLEL_MESSAGE 使用。此时 DSM 可能即将被拆除，不能再去读取共享状态，
+ * 因此必须提前缓存。leader 的 ProcNumber 保存在全局 ParallelLeaderProcNumber
+ * （storage/procnumber.h）中，SendProcSignal() 需要两者共同定位目标进程。
+ */
 static pid_t ParallelLeaderPid;
 
 /*
  * List of internal parallel worker entry points.  We need this for
  * reasons explained in LookupParallelWorkerFunction(), below.
+ */
+/*
+ * 中文注释：
+ * 内建 parallel worker 入口函数名到函数地址的映射表。库名为 "postgres" 时，
+ * LookupParallelWorkerFunction() 在此表中查找，找不到即视为编程错误。
+ * 之所以不直接传递函数指针：EXEC_BACKEND 构建（如 Windows）中不同进程的函数
+ * 地址可能不同，跨进程传地址不安全；传递名字后由每个 worker 自行解析。
+ * 新增核心入口点时必须同步登记到此表，否则 worker 启动会失败。表用 lengthof
+ * 遍历，不需要哨兵项。
  */
 static const struct
 {
@@ -160,6 +335,14 @@ static const struct
 };
 
 /* Private functions. */
+/*
+ * 中文注释：
+ * 本文件内部辅助函数的前置声明，具体语义见各自定义处：
+ *   ProcessParallelMessage     解析单条 worker 协议消息；
+ *   WaitForParallelWorkersToExit 等待 worker 真正退出（销毁路径使用）；
+ *   LookupParallelWorkerFunction 把入口点名字解析为当前进程内的函数地址；
+ *   ParallelWorkerShutdown     worker 的 before_shmem_exit 回调。
+ */
 static void ProcessParallelMessage(ParallelContext *pcxt, int i, StringInfo msg);
 static void WaitForParallelWorkersToExit(ParallelContext *pcxt);
 static parallel_worker_main_type LookupParallelWorkerFunction(const char *libraryname, const char *funcname);
@@ -170,6 +353,30 @@ static void ParallelWorkerShutdown(int code, Datum arg);
  * Establish a new parallel context.  This should be done after entering
  * parallel mode, and (unless there is an error) the context should be
  * destroyed before exiting the current subtransaction.
+ */
+/*
+ * 中文注释：
+ * 创建一个 ParallelContext（仅后端本地簿记，不分配 DSM、不启动 worker）。
+ *
+ * 调用场景：调用方先 EnterParallelMode()，再调用本函数；executor 的
+ * ExecInitParallelPlan()、nbtree/BRIN/GIN 并行构建、parallel VACUUM 等均如此。
+ * library_name/function_name 指定 worker 入口（核心函数传 "postgres" 加函数名），
+ * nworkers 是期望的最大 worker 数（>= 0）。
+ *
+ * 关键行为：
+ *   - 断言当前处于 parallel mode，否则并行模式的状态约束会被破坏；
+ *   - 上下文及字符串分配在 TopTransactionContext，保证在整个事务（而非短命的
+ *     语句/表达式上下文）中存活；pcxt->subid 记录当前子事务 ID，供
+ *     AtEOSubXact_Parallel() 精确清理本子事务创建的 context；
+ *   - 保存创建时的 error_context_stack，worker 错误回传时用它补充上下文，
+ *     而不是使用收到消息时的调用栈；
+ *   - 初始化 shm_toc 估算器，并把 context 头插到 pcxt_list；
+ *   - nworkers_to_launch 先设为 nworkers，后续 InitializeParallelDSM() 可能因
+ *     资源限制把它降为 0，ReinitializeParallelWorkers() 也可再调整。
+ *
+ * 返回值：新分配的 ParallelContext 指针。调用方必须在退出当前子事务前
+ * DestroyParallelContext()；若提交时仍有泄漏，会收到 WARNING 并被强制清理。
+ * 副作用：修改 pcxt_list；不涉及共享内存和并发。
  */
 ParallelContext *
 CreateParallelContext(const char *library_name, const char *function_name,
@@ -208,6 +415,48 @@ CreateParallelContext(const char *library_name, const char *function_name,
  * Establish the dynamic shared memory segment for a parallel context and
  * copy state and other bookkeeping information that will be needed by
  * parallel workers into it.
+ */
+/*
+ * 中文注释：
+ * 为 ParallelContext 创建 DSM 段，并把 worker 启动所需的状态序列化进 shm_toc。
+ * 这是 leader 侧最关键的初始化步骤：调用前，上层模块已经通过 pcxt->estimator
+ * 估算并登记了自己的 chunk/key；本函数在此基础上再追加公共状态。
+ *
+ * 调用场景：CreateParallelContext() 之后、LaunchParallelWorkers() 之前，由
+ * execParallel.c、nbtsort.c、gininsert.c、brin.c、vacuumparallel.c 等调用。
+ *
+ * 主要流程：
+ *   1. 固定状态：先为 FixedParallelState 估算一个 chunk 和一个 key；
+ *   2. 并行能力检查：若当前处于不可处理中断的状态
+ *      （!INTERRUPTS_CAN_BE_PROCESSED()），则把 nworkers 降为 0——否则 worker
+ *      发来的信号无法及时处理，错误传播和等待都可能失效；
+ *   3. 会话级 DSM：调用 GetSessionDsmHandle() 取得（或创建）跨并行操作复用的
+ *      per-session DSM，其中保存共享 record typmod registry；若创建失败
+ *      （DSM_HANDLE_INVALID），同样放弃 worker，因为 worker 间无法交换 row type，
+ *      元组传输会不兼容；
+ *   4. 估算并登记 library、GUC、combo CID、事务/活跃 snapshot、事务状态、
+ *      pending syncs、reindex、relmapper、未提交 enum、ClientConnectionInfo、
+ *      错误队列、入口点信息等 chunk；
+ *   5. 调用 shm_toc_estimate() 得到总大小后 dsm_create()。若达到动态共享内存段
+ *      上限，DSM_CREATE_NULL_IF_MAXSEGMENTS 会返回 NULL，此时降级为
+ *      TopMemoryContext 中的后端私有内存，并把 nworkers 设为 0，让查询以非并行
+ *      方式继续；这种降级只影响性能，不影响正确性；
+ *   6. 填写 FixedParallelState：数据库/认证/会话/当前用户、安全上下文、临时
+ *      namespace、leader 的 PGPROC/PID/ProcNumber、事务与语句时间戳、
+ *      ShareSerializableXact() 的句柄，初始化自旋锁并把 last_xlog_end 置为
+ *      InvalidXLogRecPtr；
+ *   7. 仅当 nworkers > 0 时，逐项 Serialize*() 并 shm_toc_insert()；错误队列为
+ *      每个 worker 建一个 shm_mq，receiver 设为 leader 的 MyProc，attach 时
+ *      resource owner 传 NULL；入口点保存“库名\0函数名”而不是函数指针。
+ *
+ * 参数：pcxt 为已创建的上下文；函数直接修改其 seg/toc/worker/nworkers 等字段。
+ * 返回值：无。
+ * 副作用/错误处理：会创建 DSM 段和后端内存；若中途 ERROR，事务/子事务回滚路径
+ * 中的 AtEOXact_Parallel()/AtEOSubXact_Parallel() 会通过 pcxt_list 找到并销毁
+ * 尚未完成的 context，DSM 也会由 ResourceOwner 清理机制释放。函数结束时把
+ * nworkers_to_launch 同步为最终可启动的 worker 数。
+ * 并发：只在 leader 中执行，无并发调用问题；但 DSM 内容会被随后启动的 worker
+ * 并发读取，因此所有写入必须在 LaunchParallelWorkers() 之前完成。
  */
 void
 InitializeParallelDSM(ParallelContext *pcxt)
@@ -507,6 +756,31 @@ InitializeParallelDSM(ParallelContext *pcxt)
  * Reinitialize the dynamic shared memory segment for a parallel context such
  * that we could launch workers for it again.
  */
+/*
+ * 中文注释：
+ * 复用已有 ParallelContext 的 DSM 段与 TOC，把共享状态恢复为可以再次启动 worker
+ * 的初始状态。用于需要以相同并行计划反复执行的情形，例如并行查询的 rescan
+ * （ExecParallelReinitialize）以及 parallel VACUUM 的多轮清理。
+ *
+ * 前提：调用方必须已经对上一轮 worker 调用过 WaitForParallelWorkersToFinish()；
+ * 本函数自身也会先 WaitForParallelWorkersToFinish() 和
+ * WaitForParallelWorkersToExit()，确保旧 worker 完全退出后再重用 TOC，避免新旧
+ * worker 同时读写同一段共享内存。
+ *
+ * 具体工作：
+ *   - 把 nworkers_launched 清零；
+ *   - 释放并清空 known_attached_workers 数组（worker 集合会重新建立）；
+ *   - 把 FixedParallelState.last_xlog_end 重置为 InvalidXLogRecPtr，防止上一轮
+ *     的 WAL 位置影响本轮 XactLastRecEnd 的统计；
+ *   - 如果 nworkers > 0，就地为每个 worker 重新 shm_mq_create() 错误队列，并重新
+ *     set_receiver/attach；其他序列化状态（GUC、snapshot、transaction state 等）
+ *     保持不变，因为同一并行操作中它们仍然有效。
+ *
+ * 参数：pcxt 为已初始化（InitializeParallelDSM 过）的上下文。
+ * 返回值：无。副作用：修改共享内存和 pcxt 字段；不重新注册 worker。
+ * 注意：本函数不会重新序列化事务状态/snapshot；如果调用方需要反映新状态，必须
+ * 自行保证 TOC 中的内容仍然正确，或重新创建 context。
+ */
 void
 ReinitializeParallelDSM(ParallelContext *pcxt)
 {
@@ -564,6 +838,18 @@ ReinitializeParallelDSM(ParallelContext *pcxt)
  * we need to reuse the same DSM segment, but the number of workers can
  * vary from run-to-run.
  */
+/*
+ * 中文注释：
+ * 调整下次 LaunchParallelWorkers() 实际启动的 worker 数，而不重建 DSM。
+ * 典型场景：parallel VACUUM 或需要复用同一 DSM、但每轮可用 worker 数不同的
+ * 调用方。
+ *
+ * 参数 nworkers_to_launch 为期望值；函数取 Min(pcxt->nworkers, ...)，因为
+ * InitializeParallelDSM() 可能已因资源限制把 pcxt->nworkers 降为 0，而调用方
+ * 未必知道；静默截断比报错更符合“尽力并行”的语义。
+ * 返回值：无。必须在 LaunchParallelWorkers() 之前调用；否则本次修改不会生效。
+ * 并发：仅修改 leader 本地字段，无共享内存副作用。
+ */
 void
 ReinitializeParallelWorkers(ParallelContext *pcxt, int nworkers_to_launch)
 {
@@ -578,6 +864,40 @@ ReinitializeParallelWorkers(ParallelContext *pcxt, int nworkers_to_launch)
 
 /*
  * Launch parallel workers.
+ */
+/*
+ * 中文注释：
+ * 按 pcxt->nworkers_to_launch 注册并启动 parallel worker。
+ *
+ * 前置条件：pcxt 已由 InitializeParallelDSM() 建立 DSM（seg 非 NULL），且调用方
+ * 已处于 parallel mode。函数首先 BecomeLockGroupLeader()：leader 成为锁组组长，
+ * 之后启动的 worker 通过 BecomeLockGroupMember() 加入同一锁组，使重量级锁、
+ * 死锁检测和并行 worker 的退出能够作为一个整体处理。
+ *
+ * 每个 worker 通过 BackgroundWorker 描述符注册：
+ *   - bgw_name/bgw_type 用于日志和 pg_stat_activity 展示；
+ *   - BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION |
+ *     BGWORKER_CLASS_PARALLEL 表明需要共享内存、数据库连接和并行 worker 槽位；
+ *   - BgWorkerStart_ConsistentState 保证数据库已恢复到一致状态；
+ *   - BGW_NEVER_RESTART：worker 异常退出后不自动重启，由 leader 感知并报错；
+ *   - bgw_main_arg 传 DSM handle，bgw_extra 传 worker 编号 i；
+ *   - bgw_notify_pid 设为 leader PID，使 postmaster 在 worker 状态变化时唤醒
+ *     leader。
+ *
+ * 注册失败（通常达到 max_worker_processes）不会抛错，而是把
+ * any_registrations_failed 置真并跳过后续注册；对失败槽位 detach 并清空
+ * error_mqh，防止 WaitForParallelWorkersTo* 永远等待一个从未启动的 worker。
+ * 因此调用方必须能接受“实际 worker 数少于请求数”。
+ *
+ * 成功注册后调用 shm_mq_set_handle() 把 BackgroundWorkerHandle 关联到错误队列
+ * 句柄，后续 shm_mq 等待可以借它检测对端死亡；nworkers_launched 只在成功后
+ * 递增。最后按最终数量分配 known_attached_workers 数组。
+ *
+ * 参数：pcxt 为已初始化的上下文。返回值：无。
+ * 副作用：向 postmaster 注册后台进程并修改 pcxt 字段；worker 会立即开始执行
+ * ParallelWorkerMain()，因此本函数返回时 worker 可能已经运行甚至结束。
+ * 并发/错误处理：注册本身是异步的，无法保证 worker 成功初始化；初始化失败会在
+ * WaitForParallelWorkersToAttach()/Finish() 中通过错误队列或 bgworker 状态发现。
  */
 void
 LaunchParallelWorkers(ParallelContext *pcxt)
@@ -698,6 +1018,33 @@ LaunchParallelWorkers(ParallelContext *pcxt)
  * at least never does so prior to WaitForParallelWorkersToFinish(), need not
  * call this function at all.
  */
+/*
+ * 中文注释：
+ * 等待所有已启动 worker 完成初始化并 attach 到各自的 error queue；若有 worker
+ * 在 attach 之前就退出，则抛出 ERROR（"parallel worker failed to initialize"）。
+ *
+ * 调用场景：leader 在需要确保 worker 已就绪后才能安全等待其输出/结束时调用，
+ * 例如并行索引构建在开始收集结果前调用；普通 Gather 通常直接依赖
+ * WaitForParallelWorkersToFinish()，因为 fork 失败很少见，leader 可以先干活。
+ *
+ * 实现要点：
+ *   - 每次循环先 CHECK_FOR_INTERRUPTS()，借 ProcessInterrupts() ->
+ *     ProcessParallelMessages() 读取 worker 消息；worker 回传的 ERROR 会在这里
+ *     直接抛出；
+ *   - known_attached_workers[i] 为真表示已确认该 worker 上线；error_mqh 为 NULL
+ *     表示 worker 已经干净退出（收到 Terminate），也视为“已 attach”；
+ *   - GetBackgroundWorkerPid() 返回 BGWH_STARTED 时，通过
+ *     shm_mq_get_sender(mq) 判断 worker 是否已经把自己登记为发送方；
+ *   - BGWH_STOPPED 且 sender 仍为 NULL，说明 worker 在初始化完成前死亡，必须
+ *     报错，否则调用方可能永远等待；
+ *   - 其他状态表示 worker 尚未启动，leader 在 MyLatch 上等待 postmaster 通知；
+ *     被其他原因唤醒时会重试同一个 worker。
+ *
+ * 参数：pcxt。返回值：无；成功返回时 nknown_attached_workers ==
+ * nworkers_launched，且这些 worker 至少曾经成功初始化。函数不保证它们仍然存活，
+ * 也不保证它们没有正常退出——只保证退出是干净的。
+ * 并发：leader 与 worker 通过 shm_mq/latch 同步；会处理中断和错误。
+ */
 void
 WaitForParallelWorkersToAttach(ParallelContext *pcxt)
 {
@@ -800,6 +1147,35 @@ WaitForParallelWorkersToAttach(ParallelContext *pcxt)
  *
  * Also, we want to update our notion of XactLastRecEnd based on worker
  * feedback.
+ */
+/*
+ * 中文注释：
+ * 等待所有已启动 worker 完成计算并退出（更准确地说：等到每个 worker 的 error
+ * queue 都被 detach，即收到 Terminate 或检测到异常断开），并把 worker 报告的
+ * WAL 末尾位置合并进 leader 的 XactLastRecEnd。
+ *
+ * 为什么即使并行操作“看起来成功”也必须调用：worker 可能在最后阶段才抛出错误，
+ * 这些 ErrorResponse 只能通过 error queue 回传；不调用本函数就会漏掉错误。
+ * 另外，leader 提交事务前必须知道所有 worker 写过的 WAL 的最大结束位置，否则
+ * commit record 的 LSN 可能早于 worker 的 WAL，破坏 WAL 顺序和恢复语义。
+ *
+ * 循环逻辑：
+ *   - 先 CHECK_FOR_INTERRUPTS() 处理待决消息（可能抛出 worker 错误）；
+ *   - 统计 error_mqh == NULL 的 worker（已干净结束）；若某个 worker 的
+ *     error_mqh 仍非 NULL 且 known_attached_workers[i] 为真，则说明它可能还活着，
+ *     继续等待；
+ *   - 若没有发现活着的 worker 但并非所有 worker 都干净结束，则检查 bgworker
+ *     状态：对 BGWH_STOPPED 且从未 attach 的 worker 抛出初始化失败错误；对已经
+ *     attach 的 worker，可能只是消息尚未被处理，下一轮循环会读取；
+ *   - 在 MyLatch 上等待（WAIT_EVENT_PARALLEL_FINISH），醒来后 ResetLatch。
+ *
+ * 结束后从共享 FixedParallelState 读取 last_xlog_end（由各 worker 在提交时通过
+ * ParallelWorkerReportLastRecEnd() 在自旋锁内取最大值），若大于 leader 的
+ * XactLastRecEnd 则更新之。
+ *
+ * 参数：pcxt。返回值：无。错误处理：worker 的错误会以 ERROR 形式传播；若 worker
+ * 异常断开，ProcessParallelMessages() 会报 "lost connection to parallel worker"。
+ * 调用后仍应调用 DestroyParallelContext() 回收资源。
  */
 void
 WaitForParallelWorkersToFinish(ParallelContext *pcxt)

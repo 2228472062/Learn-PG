@@ -16,6 +16,80 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * 中文注释：
+ * 本文件负责 PostgreSQL WAL（Write-Ahead Log）记录的构造与插入，是 rmgr
+ * （resource manager）与 xlog.c 之间的核心粘合层。WAL 记录从逻辑上分为三部分：
+ * 固定大小的 record header、若干 block reference（可带 full page image，FPI）、
+ * 以及不带 block 归属的 main data；本文件把调用方注册的片段组装成这种物理布局。
+ *
+ * 典型流程（详见 access/transam/README 的 "Constructing a WAL record"）：
+ *   1. XLogBeginInsert()：开始一次记录构造，确认当前不在恢复模式且没有嵌套使用；
+ *   2. XLogRegisterBuffer()/XLogRegisterBlock()：登记被修改的页（relfilenode、fork、
+ *      block number 以及页指针），供判断是否需要 FPI；
+ *      XLogRegisterData()/XLogRegisterBufData()：登记 rmgr 私有的 redo 数据；
+ *      必要时先调用 XLogEnsureRecordSpace() 扩容工作区；
+ *   3. XLogInsert(rmid, info)：调用 XLogRecordAssemble() 组装 XLogRecData 链，
+ *      再由 xlog.c 的 XLogInsertRecord() 预留 WAL 空间、填写 xl_prev、补算 header
+ *      的 CRC、把记录复制进 WAL buffer，并返回记录末尾位置（即数据页应写入的 LSN）；
+ *   4. XLogResetInsertion()：清理本次构造的后端私有工作区。
+ *
+ * 关键机制：
+ *   - FPI（full page image）：若页的 LSN <= RedoRecPtr，或 full_page_writes 打开、
+ *     有 online backup 正在运行，又或调用方使用 REGBUF_FORCE_IMAGE，则记录中携带
+ *     整页镜像，用于抵御 torn page；页内 pd_lower..pd_upper 之间的 "hole" 可省略，
+ *     并可按 wal_compression 选用 PGLZ/LZ4/ZSTD 压缩。若压缩节省的字节数不超过
+ *     额外 header 开销，则放弃压缩、仍写原始镜像。
+ *   - record header：xl_tot_len、xl_xid、xl_info、xl_rmid、xl_crc 在组装阶段填写；
+ *     xl_prev 只有等到 XLogInsertRecord() 预留了 WAL 位置后才能确定，因此 CRC 先
+ *     覆盖 header 之后的所有字节（block header、block data、main data），再由
+ *     xlog.c 追加 header 自身的 CRC。这样避免了为 xl_prev 预留字段而破坏 CRC。
+ *   - contrecord：一条 record 可能跨越 WAL page 边界。本文件不直接处理续接，而是
+ *     由 xlog.c 的 CopyXLogRecordToWAL() 在后续页的 page header 上设置
+ *     XLP_FIRST_IS_CONTRECORD / xlp_rem_len；xlogreader.c 读取时据此把跨页片段
+ *     重新拼成完整记录。也正因 XLogReader 需要一次性分配整条记录，本文件用
+ *     XLogRecordMaxSize 限制单条记录大小。
+ *   - CRC：使用 CRC32C，覆盖顺序为 "header 之后的部分 -> 各 block image/data ->
+ *     main data"，最后才是 header；任何字段在组装后改变都必须重新计算。
+ *   - critical section：调用方通常在修改共享 buffer 的 critical section 内完成
+ *     XLogBeginInsert/Register*/XLogInsert 并更新页 LSN。critical section 内报错会
+ *     升级为 PANIC，因此可能失败的扩容（XLogEnsureRecordSpace）必须在进入临界区
+ *     之前完成；本文件内部只做后端私有内存操作，XLogInsertRecord() 自己再开一个
+ *     短临界区完成共享 WAL buffer 的写入。
+ *
+ * 核心数据结构：
+ *   - registered_buffer：每个 block_id 一个槽位，保存 buffer 标识、REGBUF_* flags、
+ *     页指针、该 block 的 XLogRecData 链，以及 FPI 压缩输出缓冲区；
+ *   - XLogRecData：零拷贝链表的节点，只记录 (data, len, next)，指向调用方内存、
+ *     页内容或 hdr_scratch，组装和写 WAL 时按链顺序读取；
+ *   - mainrdata_*：main data 链的头、尾和总长度；
+ *   - hdr_rdt/hdr_scratch：记录 header 以及所有 block header 的临时 MAXALIGN 缓冲区，
+ *     它同时是 XLogRecData 链的第一个节点；
+ *   - rdatas：预分配的 XLogRecData 节点数组，避免每次注册都 palloc；
+ *   - xloginsert_cxt：保存上述工作区的 backend 生命周期内存上下文。
+ *
+ * 与其他模块的关系：
+ *   - xlog.c：XLogInsertRecord() 是真正的插入者，负责 WAL 空间预留、xl_prev/CRC、
+ *     并发 insertion lock、RedoRecPtr/fullPageWrites 的最终校验与重试、WAL 统计；
+ *   - xlogreader.c：解析记录布局（XLogRecordBlockHeader、XLogRecordDataHeader 等），
+ *     恢复时由 rmgr 的 redo 回调消费本文件写入的数据；
+ *   - xlogutils.c：提供 redo 时定位/加锁 buffer、恢复 FPI 的辅助函数；
+ *   - rmgr：每个资源管理器定义 info 编号与 redo 函数，本文件只负责通用的物理格式；
+ *   - generic_xlog.c 等调用方通过本文件的 API 构造记录，不直接拼装字节流。
+ *
+ * 设计思想：
+ *   - 零拷贝：注册阶段只保存指针，直到 XLogInsert() 才读取页和数据，减少大记录的
+ *     内存复制；代价是调用方必须保证这些内存在 XLogInsert() 返回前保持有效、页在
+ *     锁保护下不被并发修改；
+ *   - 后端私有工作区复用：避免每条记录都分配/释放内存，同时天然无锁；
+ *   - 延迟决策 FPI：注册时不复制页，组装时才根据最新 RedoRecPtr 判断是否需要镜像；
+ *     若 XLogInsertRecord() 发现判断过期则返回 InvalidXLogRecPtr，由 XLogInsert()
+ *     重新组装并重试，因此 XLogRecordAssemble() 必须可重复执行；
+ *   - 紧凑编码：SAME_REL 省略重复的 RelFileLocator、short/long main data header、
+ *     省略页内 hole、按需选择压缩算法，均以减小 WAL 体积为目标；
+ *   - 安全优先：所有可能越界/超限的情况都在写入 WAL 前检查并报错，恢复端依赖 CRC
+ *     与记录长度做完整性校验。
+ */
 
 #include "postgres.h"
 
@@ -46,6 +120,17 @@
 /*
  * Guess the maximum buffer size required to store a compressed version of
  * backup block image.
+ */
+/*
+ * 中文注释：
+ * 备份块镜像压缩相关的上界常量：
+ *   - LZ4_MAX_BLCKSZ / ZSTD_MAX_BLCKSZ：由各自库的 COMPRESSBOUND() 给出压缩后
+ *     最坏情况大小；未编译相应库时定义为 0，使 COMPRESS_BUFSIZE 不受影响；
+ *   - PGLZ_MAX_BLCKSZ：PGLZ_MAX_OUTPUT(BLCKSZ)，即 pglz 的最坏情况输出；
+ *   - COMPRESS_BUFSIZE：三者最大值，作为 registered_buffer.compressed_page 的
+ *     大小，保证任何一种算法都能安全写入。
+ * 压缩只用于 full page image，且压缩结果必须严格小于原始镜像（含额外 header
+ * 开销）才会被采用；因此这些上界只是为缓冲区预留空间，不代表实际写入大小。
  */
 #ifdef USE_LZ4
 #define	LZ4_MAX_BLCKSZ		LZ4_COMPRESSBOUND(BLCKSZ)

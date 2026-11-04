@@ -56,6 +56,87 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * 中文注释：
+ * 本文件实现 PostgreSQL 的 SLRU（Simple LRU）通用缓存机制：一组按页号随机
+ * 访问的定长磁盘页面，通过共享内存中的有限缓冲池和 LRU 淘汰策略，为多种
+ * “按 32 位事务标识/序号索引的元数据”提供低延迟、可并发、可截断的持久化
+ * 存储。SLRU 本身不解释页面内容，页面内条目的布局、页号与键值的换算完全由
+ * 各使用者定义。
+ *
+ * 一、使用者与典型布局
+ *   - pg_xact（CLOG）：每个事务 2 bit，一页可容纳 BLCKSZ*4 个事务；使用
+ *     group_lsn[] 记录异步提交 LSN，写页前必须 flush 对应 WAL；
+ *   - pg_subtrans：每个子事务 4 字节父 XID，一页 BLCKSZ/4 个条目；
+ *   - pg_multixact/offsets 与 pg_multixact/members：分别保存 MultiXact 成员
+ *     偏移和成员数组，条目大小不同，因此各自有独立的页号换算和 PagePrecedes；
+ *   - pg_commit_ts：每个已提交事务保存 8 字节时间戳 + 2 字节复制源；
+ *   - pg_serial（可串行化谓词锁）、pg_notify（LISTEN/NOTIFY 队列）以及扩展
+ *     通过 SimpleLruRequest() 注册的自定义 SLRU，也复用本文件。
+ *
+ * 二、页面与 segment 布局
+ *   - 一页固定为 BLCKSZ（通常 8KB），一个 segment 固定包含
+ *     SLRU_PAGES_PER_SEGMENT（默认 32）页；文件按 segment 组织，文件名是
+ *     segment 号的十六进制表示（短名 4~6 位，或 long_segment_names 为 15 位）。
+ *   - 全局页号 pageno 与物理位置的关系：
+ *         segno   = pageno / SLRU_PAGES_PER_SEGMENT
+ *         rpageno = pageno % SLRU_PAGES_PER_SEGMENT
+ *         offset  = rpageno * BLCKSZ
+ *     segment 内不保存页头，整页都是调用方的数据；页号可以随 32 位键空间回卷。
+ *
+ * 三、bank 与锁
+ *   - 缓冲槽按槽号每 SLRU_BANK_SIZE（16）个分为一个 bank。访问页 pageno 时，
+ *     先按 bankno = pageno % nbanks 找到该页所属 bank，再取该 bank 的
+ *     LWLock：普通访问用排他锁，SimpleLruReadPage_ReadOnly() 的快路径用共享锁。
+ *   - bank 控制锁保护该 bank 内的 page_status/page_dirty/page_number/
+ *     page_lru_count/bank_cur_lru_count 等共享数组；latest_page_number 单独
+ *     用原子操作读写，因为它只用于“不要淘汰最新页”的启发式判断。
+ *   - 每个 buffer 另有一把 LWLock，用于串行化该槽上的物理 I/O。发起 I/O 时
+ *     先持有 buffer 锁再释放 bank 锁；等待 I/O 时释放 bank 锁，以共享模式
+ *     获取并立即释放 buffer 锁，然后重新获取 bank 锁并复查状态（见文件头英文
+ *     注释与 SimpleLruWaitIO()）。
+ *
+ * 四、buffer 状态机
+ *   - EMPTY：槽未使用；READ_IN_PROGRESS：正在从磁盘读入；
+ *     VALID：页内容有效且当前没有写 I/O；WRITE_IN_PROGRESS：正在写盘。
+ *   - page_dirty 只在 VALID/WRITE_IN_PROGRESS 有意义。开始写时先清 dirty、
+ *     置 WRITE_IN_PROGRESS；写盘期间其他进程可以再次弄脏该页，写完后若失败
+ *     或已被重新弄脏，dirty 会保持/恢复为 true，因此一次写不保证页变干净。
+ *   - 读入失败的槽回到 EMPTY；写入失败的槽回到 VALID 并重新标脏；I/O 失败
+ *     不能立即 ereport，因为调用方已在共享内存中改了状态，必须先恢复状态，
+ *     再由 SlruReportIOError() 统一报错。
+ *
+ * 五、优先级、回卷与截断
+ *   - LRU 计数按 bank 维护：page_lru_count[slot] 越大表示越新；淘汰时选择
+ *     “当前计数 - 页计数”最大者，并永不淘汰 latest_page_number 指向的页。
+ *   - 页号来自 32 位键空间时会回卷，因此新旧比较不能用普通大小关系，而由
+ *     使用者的 PagePrecedes 回调按模运算语义判断；LRU 平局时也用它选择更老的
+ *     页，截断时用它判断 segment 是否整体早于 cutoffPage。
+ *   - 只有 segment 的首页和末页都严格早于 cutoffPage 才能删除；若 cutoff 或
+ *     回卷点落在 segment 内部，则整个 segment 保留。SimpleLruTruncate() 还会
+ *     检查 latest_page_number，防止因回卷 bug 删除当前端点。
+ *
+ * 六、checkpoint、WAL 与崩溃恢复
+ *   - 普通页写入不产生 WAL；新页清零、截断等语义由各使用者负责记录 WAL。
+ *     slru.c 只在写页前检查 group_lsn[]（目前仅 pg_xact 使用），把该页所有
+ *     LSN 组的上界 XLogFlush，满足“先写 WAL、后写数据”规则。
+ *   - SimpleLruWriteAll() 在 checkpoint/关闭时扫描所有 bank 写出脏页，并通过
+ *     sync_handler 把 fsync 请求交给 checkpointer 批量处理；它自身只 fsync
+ *     目录，确保新建 segment 的目录项落盘。
+ *   - 恢复期间允许读取不存在的 segment 并当作全零页（崩溃后可能重放已截断
+ *     段上的旧事务状态更新）；写页时也允许按需创建 segment 文件，且不能用
+ *     O_EXCL/O_TRUNC，因为多个后端可能同时创建同一个文件。
+ *
+ * 七、设计思想
+ *   - 用“小 bank + 线性扫描”代替哈希表：每 bank 仅 16 个槽，查找和淘汰都在
+ *     一个 cache line 友好的小数组内完成，锁竞争也被分散到多个 bank。
+ *   - 页大小与普通 buffer 一致，便于复用 I/O、校验和与统计基础设施；不在页内
+ *     放头部，避免浪费空间并让调用方自由定义条目格式。
+ *   - 延迟 fsync：写入只把脏页交给 OS 并登记 sync request，由 checkpointer
+ *     统一 fsync，减少提交/检查点路径上的同步 I/O。
+ *   - 通过“最新页常驻 + 近似 LRU + PagePrecedes 回卷语义”在极简实现下同时
+ *     满足性能、正确性和可截断性。
+ */
 #include "postgres.h"
 
 #include <fcntl.h>
@@ -90,6 +171,20 @@
  *  dir/12345  for [2^16, 2^20-1]
  *  dir/123456 for [2^20, 2^24-1]
  */
+/*
+ * 中文注释：
+ * 把 segment 号转换为相对于数据目录的完整文件名，写入调用方提供的
+ * MAXPGPATH 缓冲区。长名模式使用 15 位大写十六进制（如 dir/123456789ABCDEF），
+ * 短名模式使用 "%04X"（至少 4 位，最多 6 位，如 dir/1234、dir/12345、
+ * dir/123456）；短名模式通过 Assert 把 segno 限制在 24 位内，保证不会超过
+ * SlruCorrectSegmentFilenameLength() 认可的 4~6 位长度。
+ *
+ * 返回值是 snprintf() 的返回值（不含结尾 NUL 的应有长度），调用方通常忽略；
+ * 本函数不会 ereport，也不做目录存在性检查。它只做纯字符串格式化，不访问
+ * 共享内存，因此无需加锁。文件名格式必须与 SlruScanDirectory() 的解析逻辑
+ * 以及 SlruCorrectSegmentFilenameLength() 保持一致，否则旧的 segment 文件
+ * 将无法被识别、截断或 fsync。
+ */
 static inline int
 SlruFileName(SlruDesc *ctl, char *path, int64 segno)
 {
@@ -123,6 +218,16 @@ SlruFileName(SlruDesc *ctl, char *path, int64 segno)
  * can consolidate the I/O requests by leaving files open until control returns
  * to SimpleLruWriteAll().  This data structure remembers which files are open.
  */
+/*
+ * 中文注释：
+ * SimpleLruWriteAll() 在一次 flush 中通常只涉及一两个 segment 文件，但每个
+ * 文件可能有很多脏页。为避免每页都 open/close，本结构最多缓存
+ * MAX_WRITEALL_BUFFERS（16）个已打开文件的 fd 和 segment 号，把同一文件的
+ * 多次写入合并为一组 pwrite。fdata 是 SimpleLruWriteAll() 栈上的临时对象，
+ * 只在该次 flush 中有效；超过 16 个文件时退化为逐页独立打开/关闭。
+ * num_files 是当前已缓存的文件数，fd[]/segno[] 一一对应。该结构不跨进程
+ * 共享，也不需要在 bank 锁之外额外保护。
+ */
 #define MAX_WRITEALL_BUFFERS	16
 
 typedef struct SlruWriteAllData
@@ -142,6 +247,15 @@ typedef struct SlruWriteAllData *SlruWriteAll;
  * want to keep the bank size small so that LRU victim search is fast.  16
  * buffers per bank seems a good number.
  */
+/*
+ * 中文注释：
+ * SLRU 缓冲池按 bank 划分，每个 bank 固定 SLRU_BANK_SIZE = 16 个槽。
+ * 取 2 的幂是为了用右移快速由槽号得到 bank 号（SlotGetBankNumber），同时让
+ * 单个 bank 的线性 LRU 扫描足够便宜；bank 数 = nslots / 16，nslots 必须是
+ * 16 的倍数（由 check_slru_buffers() 和 shmem 初始化断言保证）。
+ * 注意：页到 bank 的映射使用的是 pageno % nbanks（见 SimpleLruGetBankLock），
+ * 而不是这里的槽号右移；SlotGetBankNumber 只用于已知槽号时反查其所属 bank。
+ */
 #define SLRU_BANK_BITSHIFT		4
 #define SLRU_BANK_SIZE			(1 << SLRU_BANK_BITSHIFT)
 
@@ -156,6 +270,14 @@ typedef struct SlruWriteAllData *SlruWriteAll;
  * number, since we can derive everything else we need by having separate
  * sync handler functions for clog, multixact etc.
  */
+/*
+ * 中文注释：
+ * 构造用于 sync request 的 FileTag：先把整个结构清零，再填入该 SLRU 的
+ * sync_handler 和 segment 号。SLRU 文件没有普通关系表的 relfilenode/fork
+ * 概念，checkpointer 只需根据 handler 找到对应 SLRU 的同步回调，再由回调
+ * 借助 segno 和该 SLRU 的目录拼出路径；因此其余字段必须保持为零。
+ * 该宏只做内存填充，可在任意上下文调用；调用方需保证 a 是 FileTag 左值。
+ */
 #define INIT_SLRUFILETAG(a,xx_handler,xx_segno) \
 ( \
 	memset(&(a), 0, sizeof(FileTag)), \
@@ -164,6 +286,17 @@ typedef struct SlruWriteAllData *SlruWriteAll;
 )
 
 /* Saved info for SlruReportIOError */
+/*
+ * 中文注释：
+ * SlruPhysicalReadPage()/SlruPhysicalWritePage() 在失败时不能直接
+ * ereport(ERROR)，因为此时调用方已经修改了共享内存中的槽状态，必须先把
+ * 状态恢复一致再报错。这两个 backend-private 静态变量暂存失败原因和 errno，
+ * 由调用方在恢复共享状态后调用 SlruReportIOError() 统一生成错误消息。
+ * 取值分别对应 open/lseek/read/write/fsync/close 失败；slru_errno 保存
+ * 发生失败时的 errno（短读/短写时为 0），供报告区分“系统调用失败”和
+ * “字节数不足”。每个后端单线程执行，因此不需要锁；但一次失败信息只在下一次
+ * I/O 失败前有效，不能被跨错误边界复用。
+ */
 typedef enum
 {
 	SLRU_OPEN_FAILED,
@@ -178,6 +311,12 @@ static SlruErrorCause slru_errcause;
 static int	slru_errno;
 
 
+/*
+ * 中文注释：
+ * 本文件内部 static 辅助函数的前置声明，按“LSN 维护、I/O 等待、物理读写、
+ * 错误报告、LRU 淘汰、目录扫描与删除”分层。它们都假定调用方已按约定持有
+ * 相应的 bank/buffer 锁；具体锁要求见各函数定义处的中文注释。
+ */
 static void SimpleLruZeroLSNs(SlruDesc *ctl, int slotno);
 static void SimpleLruWaitIO(SlruDesc *ctl, int slotno);
 static void SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata);
@@ -198,6 +337,21 @@ static inline void SlruRecentlyUsed(SlruShared shared, int slotno);
  * Initialization of shared memory
  */
 
+/*
+ * 中文注释：
+ * 计算一个 SLRU 在共享内存中需要的总字节数，供 SimpleLruRequestWithOpts()
+ * 在 shmem 请求阶段登记大小。布局依次为：SlruSharedData 本体、每槽的
+ * page_buffer 指针数组、page_status/page_dirty/page_number/page_lru_count
+ * 数组、每槽 buffer 锁、每 bank 的 bank 锁与 bank_cur_lru_count；若 nlsns>0，
+ * 再加上每槽 nlsns 个 XLogRecPtr 的 group_lsn[]。所有数组按 MAXALIGN 对齐，
+ * 页数据区按 BUFFERALIGN 对齐，最后附加 nslots * BLCKSZ 的页缓冲区。
+ *
+ * 参数 nslots 必须是 SLRU_BANK_SIZE 的整数倍且不超过
+ * SLRU_MAX_ALLOWED_BUFFERS；nlsns 为每页 LSN 组数，0 表示不需要 WAL 顺序
+ * 保护。函数无副作用，不初始化内存；其计算结果必须与 shmem_slru_init() 的
+ * 指针切分逻辑严格一致，否则会越界或浪费空间。注释中假设 nslots 不会大到
+ * 使乘法溢出 Size。
+ */
 static Size
 SimpleLruShmemSize(int nslots, int nlsns)
 {
@@ -231,6 +385,16 @@ SimpleLruShmemSize(int nslots, int nlsns)
  * that at the maximum given; but always at least SLRU_BANK_SIZE.
  * Round down to the nearest multiple of SLRU_BANK_SIZE.
  */
+/*
+ * 中文注释：
+ * 根据 shared_buffers（NBuffers）自动推算某个 SLRU 的缓冲槽数，供各模块在
+ * 对应 GUC（如 transaction_buffers、subtransaction_buffers）为 0 时使用。
+ * 规则是 NBuffers/divisor 向下取整到 SLRU_BANK_SIZE 的倍数，再限制在
+ * [SLRU_BANK_SIZE, max 向下取整后的值] 区间内；整数除法先减余数保证不会
+ * 超过 max，同时保证结果为 bank 大小的整数倍。divisor/max 由调用方按 SLRU
+ * 的访问特征选择（常见为 512/1024）。纯函数，无副作用；NBuffers 在
+ * postmaster 启动时已确定。
+ */
 int
 SimpleLruAutotuneBuffers(int divisor, int max)
 {
@@ -241,6 +405,20 @@ SimpleLruAutotuneBuffers(int divisor, int max)
 
 /*
  * Register a simple LRU cache in shared memory.
+ */
+/*
+ * 中文注释：
+ * 在 postmaster 启动、共享内存尚未分配时登记一个 SLRU：把调用方传入的
+ * SlruOpts 复制到 TopMemoryContext（调用方常常传入复合字面量或栈上结构，
+ * 不能长期引用），计算共享内存大小，然后通过 ShmemRequestInternal() 以
+ * SHMEM_KIND_SLRU 加入 shmem 请求队列。真正的共享内存初始化由
+ * shmem_slru_init() 完成，每个后端的挂接由 shmem_slru_attach() 完成。
+ *
+ * 必须满足：name 非空、nslots>0、PagePrecedes 和 errdetail_for_io_error
+ * 回调非空。options 是浅拷贝：name 字符串和 desc 指针仍指向调用方的对象，
+ * 调用方必须保证它们在进程生命周期内有效（通常是静态全局变量/字符串常量）。
+ * 本函数只能在 shmem 请求阶段调用，不能在后端运行期动态注册；它不加锁，
+ * 也不访问共享内存。
  */
 void
 SimpleLruRequestWithOpts(const SlruOpts *options)
@@ -263,6 +441,24 @@ SimpleLruRequestWithOpts(const SlruOpts *options)
 }
 
 /* Initialize locks and shared memory area */
+/*
+ * 中文注释：
+ * shmem 框架的初始化回调：在 postmaster 完成共享内存分配后，把
+ * location 处的原始内存切分为 SlruSharedData 及其后随数组，并初始化锁、
+ * 槽状态和统计索引。它同时把 desc->shared 指向共享区、desc->nbanks 设为
+ * nslots/SLRU_BANK_SIZE、复制一份 options 到 desc，使后端可以通过
+ * SlruDesc 访问共享状态。
+ *
+ * 具体工作：若未指定 tranche id，则为 buffer 锁和 bank 锁各申请一个命名
+ * tranche；清零整个共享结构；设置 num_slots/lsn_groups_per_page、原子变量
+ * latest_page_number、统计索引；按与 SimpleLruShmemSize() 完全一致的顺序
+ * 摆放各数组；初始化每槽 buffer 锁、页指针和 EMPTY/clean/LRU=0 状态；初始化
+ * 每个 bank 的锁和 bank_cur_lru_count；最后用 Assert 检查切分未超出预算。
+ *
+ * 该函数只在启动时由单一进程执行，之后共享内存对所有后端可见，因此不需要
+ * 额外加锁；但布局/对齐必须与 SimpleLruShmemSize() 同步修改。页缓冲区按
+ * BUFFERALIGN 对齐，可满足直接 I/O 或页级校验和等对对齐的要求。
+ */
 void
 shmem_slru_init(void *location, ShmemStructOpts *base_options)
 {
@@ -355,6 +551,14 @@ shmem_slru_init(void *location, ShmemStructOpts *base_options)
 	Assert(ptr - (char *) shared <= SimpleLruShmemSize(nslots, nlsns));
 }
 
+/*
+ * 中文注释：
+ * shmem 挂接回调：后端（或 EXEC_BACKEND 下的新进程）映射共享内存后，用它
+ * 把本进程的 SlruDesc 重新指向映射地址，并恢复 nbanks 与 options 副本。
+ * 共享内存内容已由 shmem_slru_init() 初始化，这里绝不能再次 memset 或重置
+ * 锁/槽状态，否则会破坏其他后端的数据。函数只写进程私有的 desc，不加锁，
+ * 也不做 I/O；nslots 必须与初始化时一致。
+ */
 void
 shmem_slru_attach(void *location, ShmemStructOpts *base_options)
 {
@@ -372,6 +576,14 @@ shmem_slru_attach(void *location, ShmemStructOpts *base_options)
 /*
  * Helper function for GUC check_hook to check whether slru buffers are in
  * multiples of SLRU_BANK_SIZE.
+ */
+/*
+ * 中文注释：
+ * SLRU 缓冲数 GUC 的 check_hook：要求新值必须是 SLRU_BANK_SIZE（16）的
+ * 整数倍，否则通过 GUC_check_errdetail() 给出详细原因并返回 false，让 GUC
+ * 机制拒绝该值。这样可保证每个 bank 恰好 16 个槽、nbanks 为整数，避免
+ * shmem 布局和 bank 映射出现余数。该函数在配置解析/启动阶段调用，无副作用，
+ * 不访问共享内存；name 仅用于错误消息。
  */
 bool
 check_slru_buffers(const char *name, int *newval)
@@ -392,6 +604,24 @@ check_slru_buffers(const char *name, int *newval)
  * The slot number of the new page is returned.
  *
  * Bank lock must be held at entry, and will be held at exit.
+ */
+/*
+ * 中文注释：
+ * 在共享缓冲池中创建（或重新初始化）一个页，把 BLCKSZ 字节清零并标记为
+ * VALID + dirty，返回占用该页的槽号；真正的落盘由后续写页或 checkpoint
+ * 完成。调用方必须已持有该页所属 bank 的排他锁，函数返回时仍持有该锁。
+ *
+ * 步骤：用 SlruSelectLRUPage() 找到目标页已存在的槽，或一个可回收的槽
+ * （EMPTY 或干净的 VALID；若选中的脏页会先被写出）；断言槽状态符合预期；
+ * 设置 page_number/page_status/dirty；调用 SlruRecentlyUsed() 标记 MRU；
+ * 清零页缓冲；清零该槽的 group_lsn[]；原子地更新 latest_page_number 为本页；
+ * 增加“清零页”统计。
+ *
+ * 并发/恢复：整个操作在 bank 锁内完成，且 SlruSelectLRUPage() 同样在 bank
+ * 锁内，所以不会与“选中同一槽进行淘汰”并发，latest_page_number 的更新
+ * 无需额外内存屏障。调用方通常还要写一条“新页清零”的 WAL 记录（如
+ * CLOG_ZEROPAGE），以保证崩溃恢复后页内容可重建；本函数本身不写 WAL，
+ * 也不 fsync。
  */
 int
 SimpleLruZeroPage(SlruDesc *ctl, int64 pageno)
@@ -446,6 +676,19 @@ SimpleLruZeroPage(SlruDesc *ctl, int64 pageno)
  *
  * This assumes that InvalidXLogRecPtr is bitwise-all-0.
  */
+/*
+ * 中文注释：
+ * 把某个槽对应的所有 group_lsn[] 条目清零，表示该页当前没有任何“必须先
+ * flush 的 WAL”约束。新建页时必须调用；从磁盘读入一个被淘汰过的旧页时也
+ * 必须调用，因为该页原先的 LSN 组在写盘前已经 flush 并失去意义。函数假设
+ * InvalidXLogRecPtr 的位模式全为 0，因此直接用 MemSet；nlsns==0 时什么也
+ * 不做。
+ *
+ * 调用者必须确保自己独占该槽：SimpleLruZeroPage() 在 bank 锁内调用；
+ * SlruPhysicalReadPage() 之后由 SimpleLruReadPage() 在槽处于
+ * READ_IN_PROGRESS 且持有 buffer 锁时调用。不要在其他进程可能读写
+ * group_lsn[] 时调用。
+ */
 static void
 SimpleLruZeroLSNs(SlruDesc *ctl, int slotno)
 {
@@ -461,6 +704,19 @@ SimpleLruZeroLSNs(SlruDesc *ctl, int slotno)
  * immediately flushing it to disk.
  *
  * SLRU bank lock is acquired and released here.
+ */
+/*
+ * 中文注释：
+ * “清零一个页并立即写盘”的便捷封装，供需要确保页在磁盘上存在且内容为零的
+ * 场景使用（例如 CLOG/commit_ts 的 zeropage WAL 重放和启动初始化）。它自行
+ * 获取目标页所属 bank 的排他锁，调用 SimpleLruZeroPage() 建页，再调用
+ * SimpleLruWritePage() 立即写出，最后断言页已不再 dirty 并释放锁。
+ *
+ * 与 SimpleLruZeroPage() 不同，调用方无需预先持锁；但本函数会做同步 I/O，
+ * 只适合启动/恢复/低频路径。写失败时 SimpleLruWritePage() 会恢复共享状态并
+ * 通过 SlruReportIOError() 抛错；若发生错误长跳转，已持有的 LWLock 会按
+ * PostgreSQL 的错误清理规则释放。本函数不写 WAL，也不等待 checkpointer 的
+ * 延迟 fsync。
  */
 void
 SimpleLruZeroAndWritePage(SlruDesc *ctl, int64 pageno)
@@ -487,6 +743,23 @@ SimpleLruZeroAndWritePage(SlruDesc *ctl, int64 pageno)
  * In fact the slot might not even contain the same page anymore.)
  *
  * Bank lock must be held at entry, and will be held at exit.
+ */
+/*
+ * 中文注释：
+ * 等待某个槽上正在进行的读/写 I/O 完成。调用时 bank 锁必须已持有，返回时
+ * 仍持有（重新获取为排他模式）。实现遵循文件头的锁协议：先释放 bank 锁，
+ * 再以共享模式获取并立即释放该槽的 buffer 锁（若写者/读者持有排他锁，这里
+ * 会阻塞到 I/O 结束），最后重新获取 bank 锁。
+ *
+ * 返回时并不保证槽仍包含原来的页，甚至不保证 I/O 已成功：其他进程可能在
+ * 间隙中完成了旧 I/O 并发起新 I/O，或者失败路径没有恢复状态。因此函数在
+ * 重新持锁后检查：若状态仍是 READ_IN_PROGRESS/WRITE_IN_PROGRESS，说明要么
+ * 有新 I/O，要么之前的 I/O 失败且未复位；此时尝试条件获取 buffer 锁，
+ * 成功则判定为失败残留：读失败把槽置 EMPTY，写失败置 VALID 并重新标脏，
+ * 然后释放 buffer 锁。调用者必须重新检查槽状态/页号后再使用。
+ *
+ * 该函数不报错、不写 WAL；它只修复共享状态，真正的 I/O 错误由原发起者
+ * 通过 SlruReportIOError() 报告。参数 slotno 必须属于当前 bank。
  */
 static void
 SimpleLruWaitIO(SlruDesc *ctl, int slotno)
@@ -545,6 +818,28 @@ SimpleLruWaitIO(SlruDesc *ctl, int slotno)
  * The buffer's LRU access info is updated.
  *
  * The correct bank lock must be held at entry, and will be held at exit.
+ */
+/*
+ * 中文注释：
+ * 从共享缓冲池读取指定页，必要时从磁盘读入；返回持有该页的槽号。调用方
+ * 必须已持有该页所属 bank 的排他锁，返回时仍持有；在释放 bank 锁前，调用方
+ * 可以安全地读写该槽的页内容。页号必须对应已经初始化（存在或允许按需创建）
+ * 的页；本函数不会创建全零页，创建请用 SimpleLruZeroPage()。
+ *
+ * 流程：循环调用 SlruSelectLRUPage() 查找/选择槽。若槽中已经是目标页：遇到
+ * READ_IN_PROGRESS 必须等待；遇到 WRITE_IN_PROGRESS 且 write_ok=false 也要
+ * 等待（调用方要修改页时必须等写完成）；否则标记 MRU、统计 hit 并返回。
+ * 若未命中，选中的必须是 EMPTY 或干净 VALID 槽；设置 page_number、
+ * READ_IN_PROGRESS、dirty=false，获取 buffer 排他锁，释放 bank 锁后调用
+ * SlruPhysicalReadPage()，清零 group_lsn[]，再重新获取 bank 锁；根据结果把
+ * 状态置 VALID 或 EMPTY，释放 buffer 锁；失败时在状态恢复后调用
+ * SlruReportIOError() 抛错；成功则标记 MRU、统计 read 并返回。
+ *
+ * write_ok 为 true 表示允许返回正在写出的页（读旧内容对只读访问安全）；
+ * 为 false 时会等待写完成。opaque_data 只用于 I/O 错误时向
+ * errdetail_for_io_error 回调提供上下文，不参与缓存逻辑。I/O 期间释放 bank
+ * 锁是为了不让慢磁盘阻塞同一 bank 的其他页访问；buffer 锁保证同一槽不会
+ * 同时被两个 I/O 操作使用。
  */
 int
 SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
@@ -650,6 +945,21 @@ SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
  * Bank control lock must NOT be held at entry, but will be held at exit.
  * It is unspecified whether the lock will be shared or exclusive.
  */
+/*
+ * 中文注释：
+ * 只读访问的优化入口：先只持 bank 共享锁，在该 bank 的 16 个槽中线性查找
+ * 目标页；若页已在内存且不处于 READ_IN_PROGRESS，则标记 MRU、统计 hit 并
+ * 直接返回槽号。返回时 bank 锁仍被持有，但可能是共享锁也可能是排他锁，
+ * 调用方必须用 SimpleLruGetBankLock() 取得同一把锁并释放，不能假设锁模式。
+ *
+ * 若快路径未命中，释放共享锁、改取排他锁，再调用 SimpleLruReadPage() 走
+ * 常规的磁盘读入/淘汰路径；因此慢路径返回时持有排他锁。快路径允许返回
+ * WRITE_IN_PROGRESS 的页：写 I/O 不会修改页缓冲区内容，只读访问看到的仍是
+ * 一致旧内容。多个进程可同时在共享锁下执行 SlruRecentlyUsed()，其近似计数
+ * 更新是刻意允许的（见该函数注释）。
+ *
+ * opaque_data 仅用于 I/O 错误详情；本函数不修改页内容，也不写 WAL。
+ */
 int
 SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 {
@@ -696,6 +1006,26 @@ SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno, const void *opaque_data)
  * is already being written; this is for checkpoints.
  *
  * Bank lock must be held at entry, and will be held at exit.
+ */
+/*
+ * 中文注释：
+ * 把一个脏的共享缓冲槽写出到磁盘。调用方必须已持有该页所属 bank 的排他锁，
+ * 返回时仍持有。fdata 为 NULL 表示独立写；非 NULL 时表示这是
+ * SimpleLruWriteAll() 的批量写，可复用 fdata 中已打开的文件描述符，并在
+ * 写失败时关闭这些缓存 fd。
+ *
+ * 步骤：若该槽正在 WRITE_IN_PROGRESS 且页号未变，先调用 SimpleLruWaitIO()
+ * 等待（等待会暂时释放 bank 锁）；随后重新检查：页不脏、不是 VALID 或页号
+ * 已变则直接返回（可能已被别人写干净或淘汰）。否则置 WRITE_IN_PROGRESS、
+ * 清 dirty，获取 buffer 排他锁，释放 bank 锁，调用 SlruPhysicalWritePage()；
+ * 失败且处于批量模式时关闭 fdata 中所有 fd；重新获取 bank 锁，断言页号与
+ * 状态未变；失败则重新置 dirty，最后置回 VALID，释放 buffer 锁；失败时在
+ * 状态恢复后调用 SlruReportIOError() 抛错。
+ *
+ * 注意：本函数只尝试写一次，且写前清 dirty，因此写盘期间其他后端可以再次
+ * 弄脏该页；函数返回时页可能仍是脏的（若失败或被重新弄脏），调用者不能
+ * 假设一次写就持久化。fdata 非 NULL 时还会累加 checkpoint 的 SLRU 写统计。
+ * 写 I/O 期间不持 bank 锁，避免阻塞同 bank 其他页。
  */
 static void
 SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
@@ -777,6 +1107,15 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
  * Wrapper of SlruInternalWritePage, for external callers.
  * fdata is always passed a NULL here.
  */
+/*
+ * 中文注释：
+ * 对外暴露的“写出单个槽”封装：调用方必须已持有该槽所属 bank 的排他锁
+ * （内部 SlruInternalWritePage() 会断言），且槽不能是 EMPTY。它总是以
+ * fdata=NULL 调用内部实现，即独立打开/关闭文件、不参与 SimpleLruWriteAll()
+ * 的批量 fd 缓存。若槽不脏则什么也不做；若正被写出则先等待再复查。常用于
+ * 刚修改完页后立即持久化（例如 zeropage 重放、NOTIFY 队列推进）以及
+ * truncate/delete 前清空缓冲。
+ */
 void
 SimpleLruWritePage(SlruDesc *ctl, int slotno)
 {
@@ -790,6 +1129,20 @@ SimpleLruWritePage(SlruDesc *ctl, int slotno)
  *
  * A false return means that either the file does not exist, or that it's not
  * large enough to contain the given page.
+ */
+/*
+ * 中文注释：
+ * 判断某个页在磁盘上是否真实存在且文件足够大以覆盖该页。它只检查物理
+ * 文件，不读共享缓冲、不加 bank 锁、不修改任何状态；结果是一个可能过期的
+ * 快照（其他进程可能同时创建/截断文件），调用方只能把它当作优化/决策
+ * 提示，不能用于需要强一致性的判断。
+ *
+ * 计算 segno/rpageno/offset 后拼接路径，用 OpenTransientFile(O_RDONLY) 打开；
+ * ENOENT 直接返回 false（这是正常情况），其他打开错误通过 SlruReportIOError()
+ * 报错。用 lseek(SEEK_END) 取文件长度，只有 endpos >= offset+BLCKSZ 才算
+ * 存在；lseek 失败同样报错。最后关闭文件，关闭失败时记录错误原因并返回
+ * false（此路径不会调用 SlruReportIOError()）。函数会增加“检查页存在”的
+ * 统计计数。pg_commit_ts 用它在写入前决定是否需要先清零创建页。
  */
 bool
 SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno)
@@ -848,6 +1201,24 @@ SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno)
  *
  * For now, assume it's not worth keeping a file pointer open across
  * read/write operations.  We could cache one virtual file pointer ...
+ */
+/*
+ * 中文注释：
+ * 物理读：把指定页从 segment 文件的 offset 处读入 shared->page_buffer[slotno]。
+ * 调用方必须已持有该槽的 buffer 锁（通常还已释放 bank 锁），这样同一槽不会
+ * 有并发 I/O；函数不接触 bank 共享状态，也不加其他锁。成功返回 true；
+ * 失败返回 false，并把原因/errno 存入 slru_errcause/slru_errno，由调用方
+ * 在恢复共享状态后调用 SlruReportIOError()。
+ *
+ * 特殊恢复语义：若文件不存在且当前处于 InRecovery，则记录 LOG 并把缓冲区
+ * 清零后返回 true。原因是崩溃后可能从较早的 checkpoint 重放，REDO 会要求
+ * 更新已经被 truncate 掉的 segment 中的事务状态；把缺失页当作全零
+ * （IN_PROGRESS）是安全且幂等的。非恢复期文件缺失则是真实错误。
+ *
+ * 使用 pg_pread() 从固定偏移读取，避免共享文件偏移；读取不足 BLCKSZ 视为
+ * 失败（errno 可能为 0，报告时会说明 read too few bytes）。读取前后设置
+ * WAIT_EVENT_SLRU_READ 等待事件，便于 pg_stat_activity 观察。关闭失败也会
+ * 返回 false。函数不报告 ERROR、不写 WAL，失败时页缓冲区内容未定义。
  */
 static bool
 SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
@@ -920,6 +1291,30 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
  *
  * fdata is NULL for a standalone write, pointer to open-file info during
  * SimpleLruWriteAll.
+ */
+/*
+ * 中文注释：
+ * 物理写：把 shared->page_buffer[slotno] 写到指定页对应的文件偏移。调用方
+ * 必须已持有该槽的 buffer 锁且已释放 bank 锁；成功返回 true，失败返回
+ * false 并在 slru_errcause/slru_errno 中留下原因，由上层恢复共享状态后
+ * 统一报错。
+ *
+ * WAL 规则：若 shared->group_lsn 非空（目前只有 pg_xact），先扫描该页所有
+ * LSN 组取最大值；若有效，则在临界区内调用 XLogFlush(max_lsn)。这里不能用
+ * elog(ERROR)，因为调用方已在共享内存中把页标为 WRITE_IN_PROGRESS 并清了
+ * dirty，若 XLogFlush 失败只能 PANIC，避免留下不一致状态。
+ *
+ * 文件管理：fdata 非空时先在其中查找已打开的同一 segment fd；否则按需
+ * O_RDWR|O_CREAT 打开/创建文件（不能用 O_EXCL/O_TRUNC：多个后端可能同时为
+ * 同一文件的不同页创建它，而且恢复时可能写入非首页）。打开后若 fdata 还有
+ * 空位就缓存 fd，超过 MAX_WRITEALL_BUFFERS 则退回独立写。用 pg_pwrite()
+ * 写入固定偏移；短写且 errno==0 时按 ENOSPC 处理。写成功后通过
+ * sync_handler 向 checkpointer 登记 fsync 请求（SYNC_REQUEST）；若队列已满，
+ * 则退化为本进程同步 pg_fsync()。独立写最后关闭文件；批量写把 fd 留给
+ * SimpleLruWriteAll() 统一关闭。
+ *
+ * 本函数会增加“写页”统计；不直接 ereport，不删除旧 segment；写失败时
+ * 批量模式由调用方关闭所有缓存 fd。
  */
 static bool
 SlruPhysicalWritePage(SlruDesc *ctl, int64 pageno, int slotno, SlruWriteAll fdata)
