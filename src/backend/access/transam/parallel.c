@@ -1291,6 +1291,16 @@ WaitForParallelWorkersToFinish(ParallelContext *pcxt)
  * that the former just ensures that last message sent by a worker backend is
  * received by the leader backend whereas this ensures the complete shutdown.
  */
+/*
+ * 中文注释：
+ * 等待所有已启动的并行 worker 完全退出。
+ *
+ * 与 WaitForParallelWorkersToFinish 的区别：后者只保证收到 worker 发来的最后一条
+ * 消息，此时 worker 可能仍在做清理；本函数通过 WaitForBackgroundWorkerShutdown
+ * 等到进程真正结束，确保后续事务提交/中止不会与 worker 的资源释放竞争。
+ * 每个 bgwhandle 等待后立即释放并把指针置空，避免重复等待。若 postmaster 已退出，
+ * 无法确认 worker 状态，只能 FATAL 终止当前会话。
+ */
 static void
 WaitForParallelWorkersToExit(ParallelContext *pcxt)
 {
@@ -1330,6 +1340,17 @@ WaitForParallelWorkersToExit(ParallelContext *pcxt)
  * first, before calling this function.  When this function is invoked, any
  * remaining workers are forcibly killed; the dynamic shared memory segment
  * is unmapped; and we then wait (uninterruptibly) for the workers to exit.
+ */
+/*
+ * 中文注释：
+ * 销毁一个并行上下文，终止残留 worker、解除 DSM 映射并释放内存。
+ *
+ * 正常退出路径应先调用 WaitForParallelWorkersToFinish，再调用本函数；如果仍有
+ * worker 活着，这里会强制 TerminateBackgroundWorker 并 detach 其错误队列。
+ * 操作顺序很重要：先从全局 pcxt_list 摘除节点，防止后续步骤报错时 AtEOXact_Parallel
+ * 再次销毁同一上下文；然后 detach DSM（会隐式 detach 其中的 shm_mq），释放私有
+ * 内存，最后在 HOLD_INTERRUPTS 保护下等待 worker 退出——因为事务提交/中止前必须
+ * 确保所有 worker 已消失，此阶段不能响应中断。
  */
 void
 DestroyParallelContext(ParallelContext *pcxt)
@@ -1405,6 +1426,14 @@ DestroyParallelContext(ParallelContext *pcxt)
 /*
  * Are there any parallel contexts currently active?
  */
+/*
+ * 中文注释：
+ * 判断当前后端是否还有任何活跃的并行上下文。
+ *
+ * 直接检查全局 pcxt_list 是否为空。该列表保存本后端发起的、尚未销毁的
+ * ParallelContext，用于事务/子事务结束时统一清理，也用于 ProcessParallelMessages
+ * 遍历各 worker 的错误队列。
+ */
 bool
 ParallelContextActive(void)
 {
@@ -1418,6 +1447,15 @@ ParallelContextActive(void)
  * a flag that will cause the next CHECK_FOR_INTERRUPTS() to invoke
  * ProcessParallelMessages().
  */
+/*
+ * 中文注释：
+ * 并行 worker 消息到达时的信号处理入口。
+ *
+ * 该函数在信号处理函数中被调用，因此只能做最低限度的工作：设置 InterruptPending
+ * 和 ParallelMessagePending 两个标志，然后返回。下一次 CHECK_FOR_INTERRUPTS()
+ * 会调用 ProcessParallelMessages() 真正读取消息。latch 由 procsignal_sigusr1_handler
+ * 负责唤醒，不能在这里做内存分配、加锁或 ereport 等不安全操作。
+ */
 void
 HandleParallelMessageInterrupt(void)
 {
@@ -1428,6 +1466,16 @@ HandleParallelMessageInterrupt(void)
 
 /*
  * Process any queued protocol messages received from parallel workers.
+ */
+/*
+ * 中文注释：
+ * 处理所有并行 worker 已排队的协议消息。
+ *
+ * 由 ProcessInterrupts() 在 ParallelMessagePending 置位时调用。函数先 HOLD_INTERRUPTS，
+ * 防止处理过程中又收到信号导致递归进入；然后切换到一个私有、每次复用的内存上下文，
+ * 避免把临时数据泄漏到长生命周期上下文中。随后遍历 pcxt_list 中的每个上下文和每个
+ * worker，用非阻塞方式从 shm_mq 错误队列读取消息，交给 ProcessParallelMessage()
+ * 解析。队列被 detach 或暂时无数据时停止读取。最后恢复内存上下文和中断状态。
  */
 void
 ProcessParallelMessages(void)
@@ -1517,6 +1565,21 @@ ProcessParallelMessages(void)
 
 /*
  * Process a single protocol message received from a single parallel worker.
+ */
+/*
+ * 中文注释：
+ * 解析并处理来自第 i 个并行 worker 的一条协议消息。
+ *
+ * 消息类型包括：
+ *   - ErrorResponse/NoticeResponse：解析为 ErrorData，把错误级别限制在 ERROR 以内
+ *     （worker 死亡不应让 leader 直接 PANIC），必要时加上 "parallel worker" 上下文，
+ *     并使用创建 ParallelContext 时的 error_context_stack 重新抛出，保证错误位置和
+ *     上下文与 leader 一致；
+ *   - NotificationResponse：把 NOTIFY 的 pid/channel/payload 转发给前端；
+ *   - Progress：把增量进度值累加到 pgstat 的进度参数；
+ *   - Terminate：worker 正常结束，detach 并清空其错误队列。
+ * 未知消息类型视为协议错误。函数还会维护 known_attached_workers 计数，供等待逻辑
+ * 判断哪些 worker 已经建立过连接。
  */
 static void
 ProcessParallelMessage(ParallelContext *pcxt, int i, StringInfo msg)
@@ -1635,6 +1698,15 @@ ProcessParallelMessage(ParallelContext *pcxt, int i, StringInfo msg)
  * Here we remove only parallel contexts initiated within the current
  * subtransaction.
  */
+/*
+ * 中文注释：
+ * 子事务结束时的并行上下文清理。
+ *
+ * 只销毁 subid 等于当前子事务 ID 的上下文：这些上下文是在本子事务中创建的，不能
+ * 跨子事务边界存活。pcxt_list 按创建顺序排列，因此从头部开始遇到第一个不属于本
+ * 子事务的节点即可停止。提交时若仍存在上下文，说明调用者泄漏了 ParallelContext，
+ * 发出 WARNING 后仍然强制销毁，避免资源泄漏；中止时则静默清理。
+ */
 void
 AtEOSubXact_Parallel(bool isCommit, SubTransactionId mySubId)
 {
@@ -1656,6 +1728,14 @@ AtEOSubXact_Parallel(bool isCommit, SubTransactionId mySubId)
  *
  * We nuke all remaining parallel contexts.
  */
+/*
+ * 中文注释：
+ * 顶层事务结束时的并行上下文清理。
+ *
+ * 销毁 pcxt_list 中所有剩余的并行上下文。正常情况下调用者应在事务结束前显式
+ * 调用 DestroyParallelContext；若提交时仍有残留，说明存在泄漏，发出 WARNING 并
+ * 强制清理。中止路径同样全部销毁，确保 worker、DSM 和错误队列不会跨事务存活。
+ */
 void
 AtEOXact_Parallel(bool isCommit)
 {
@@ -1672,6 +1752,26 @@ AtEOXact_Parallel(bool isCommit)
 
 /*
  * Main entrypoint for parallel workers.
+ */
+/*
+ * 中文注释：
+ * 并行 worker 的主入口，负责把 worker 初始化成与 leader 尽可能一致的后端环境。
+ *
+ * 初始化顺序经过精心设计，依赖关系如下：
+ *   1. 设置信号处理、worker 编号和私有内存上下文；
+ *   2. attach leader 创建的 DSM 段并取得 TOC，找到 FixedParallelState；
+ *   3. 建立错误队列并重定向 libpq 消息，使 worker 的错误能回传 leader；
+ *   4. 加入 leader 的 lock group（必须早于任何可能获取重量级锁的操作，否则可能
+ *      产生 leader 无法检测的死锁）；
+ *   5. 恢复事务/语句时间戳、入口函数、用户/角色、数据库连接、客户端编码；
+ *   6. 加载 leader 已加载的库，启动 parallel worker 事务，恢复 pending syncs、
+ *      relmap、reindex、combo CID、session DSM、快照、GUC、临时命名空间、
+ *      未提交 enum、客户端连接信息等状态；
+ *   7. 进入并行模式，调用入口函数执行真正工作；
+ *   8. 退出并行模式、弹出快照、结束事务、detach session DSM，最后发送 Terminate。
+ * 该函数体现了并行查询的核心设计：worker 不是独立事务，而是 leader 事务的延伸，
+ * 必须继承足够的状态才能看到相同的 catalog、快照和 GUC，同时通过 lock group 与
+ * leader 共享锁所有权。
  */
 void
 ParallelWorkerMain(Datum main_arg)
@@ -1966,6 +2066,16 @@ ParallelWorkerMain(Datum main_arg)
  * Update shared memory with the ending location of the last WAL record we
  * wrote, if it's greater than the value already stored there.
  */
+/*
+ * 中文注释：
+ * 把 worker 写过的最后一条 WAL 记录的结束位置报告给 leader。
+ *
+ * worker 在并行操作中也可能写 WAL（例如并行建索引），leader 事务结束时需要知道
+ * 所有 worker 的最大 WAL 位置，以便正确设置 XactLastRecEnd、处理同步提交和复制。
+ * FixedParallelState 位于共享内存，用 spinlock 保护 last_xlog_end，并只允许增大，
+ * 因此多个 worker 可以安全地并发报告。leader 在 WaitForParallelWorkersToFinish
+ * 中读取该值并合并到自己的 XactLastRecEnd。
+ */
 void
 ParallelWorkerReportLastRecEnd(XLogRecPtr last_xlog_end)
 {
@@ -1994,6 +2104,18 @@ ParallelWorkerReportLastRecEnd(XLogRecPtr last_xlog_end)
  * stats hash might need to grow which can cause new segments to be allocated,
  * which then will be detached from earlier.
  */
+/*
+ * 中文注释：
+ * worker 退出前的 before_shmem_exit 回调。
+ *
+ * 两个目的：
+ *   1. 向 leader 发送 PROCSIG_PARALLEL_MESSAGE，确保 leader 再读一次错误队列；
+ *      这样即使 worker 没有发送 ErrorResponse 就 proc_exit，leader 也能察觉并
+ *      清理，而不是永久等待；
+ *   2. 显式 detach 并行查询的 DSM 段，让注册了 on_dsm_detach 的子系统（尤其是
+ *      pgstats）有机会在统计系统关闭前发送数据。不能依赖退出钩子的注册顺序来
+ *      解决这个问题，因为统计哈希扩容可能动态创建新的 DSM 段。
+ */
 static void
 ParallelWorkerShutdown(int code, Datum arg)
 {
@@ -2021,6 +2143,16 @@ ParallelWorkerShutdown(int code, Datum arg)
  * At some point it might be worthwhile to get rid of InternalParallelWorkers[]
  * in favor of applying load_external_function() for core functions too;
  * but that raises portability issues that are not worth addressing now.
+ */
+/*
+ * 中文注释：
+ * 根据库名和函数名查找并行 worker 的入口函数地址。
+ *
+ * 进程之间不能传递函数指针（ASLR、EXEC_BACKEND 等都可能导致同一函数在不同进程中
+ * 地址不同），因此 leader 只把字符串形式的库名/函数名放进 DSM。若库名为
+ * "postgres"，先在 InternalParallelWorkers 静态表中查找核心内置入口；否则用
+ * load_external_function 动态加载扩展库并解析符号。找不到内置函数属于编程错误，
+ * 直接 ERROR。
  */
 static parallel_worker_main_type
 LookupParallelWorkerFunction(const char *libraryname, const char *funcname)

@@ -1488,6 +1488,17 @@ SlruPhysicalWritePage(SlruDesc *ctl, int64 pageno, int slotno, SlruWriteAll fdat
  * Issue the error message after failure of SlruPhysicalReadPage or
  * SlruPhysicalWritePage.  Call this after cleaning up shared-memory state.
  */
+/*
+ * 中文注释：
+ * 把 SLRU 物理读/写失败的底层错误转换成用户可读的 ERROR 报告。
+ *
+ * SlruPhysicalReadPage/SlruPhysicalWritePage 在失败时只记录全局的 slru_errcause
+ * 和 slru_errno，并清理共享内存状态；本函数根据错误原因（open/seek/read/write/
+ * fsync/close）生成对应的错误消息，包含段文件路径、段内偏移和可选的对象信息。
+ * opaque_data 由具体 SLRU 的 errdetail_for_io_error 回调解释（例如 XID、MultiXact
+ * 成员等），从而在不污染通用 SLRU 层的前提下给出业务语义。必须在释放相关锁之后
+ * 调用，因为 ereport(ERROR) 会进行长跳转。
+ */
 static void
 SlruReportIOError(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 {
@@ -1564,6 +1575,16 @@ SlruReportIOError(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 /*
  * Mark a buffer slot "most recently used".
  */
+/*
+ * 中文注释：
+ * 把一个 buffer 槽标记为“最近使用”，用于 SLRU 的近似 LRU 淘汰。
+ *
+ * 每个 bank 维护一个单调递增的 bank_cur_lru_count，页槽保存自己最后一次被访问时
+ * 的计数；计数越大表示越新。这里不是简单地每次加一，而是仅当页槽计数与当前计数
+ * 不同时才更新，避免对同一热页的连续访问快速耗尽计数空间、造成回绕后“旧页变新页”。
+ * SimpleLruReadPage_ReadOnly 允许多个进程并发调用本函数，因此读改写不是原子的；
+ * 最坏情况只是计数暂时偏小或淘汰选择不够优，不会破坏正确性。
+ */
 static inline void
 SlruRecentlyUsed(SlruShared shared, int slotno)
 {
@@ -1609,6 +1630,18 @@ SlruRecentlyUsed(SlruShared shared, int slotno)
  * EMPTY), *or* a freeable slot (state EMPTY or CLEAN).
  *
  * The correct bank lock must be held at entry, and will be held at exit.
+ */
+/*
+ * 中文注释：
+ * 为指定页号选择一个可用的 buffer 槽，是 SLRU 缓存淘汰策略的核心。
+ *
+ * 调用者必须持有该页所属 bank 的锁。函数先检查目标页是否已经在某个槽中（可能被
+ * 其他进程刚刚读入），有则直接返回；否则寻找 EMPTY 槽。若没有空槽，则在
+ * SLRU_PAGE_VALID（干净或脏）的页中选择 LRU 受害者，但永不淘汰
+ * latest_page_number（最近分配的页，通常是正在增长的最新页）。若所有候选都在
+ * I/O 中，则等待最久未使用的 I/O 槽完成，然后重新扫描；若选中的受害者是脏页，
+ * 先写回再重试。并发下多个页可能有相同 lru_count，此时用 PagePrecedes 选择更靠后
+ * 的页作为平局裁决。返回值要么是已持有目标页的槽，要么是可回收的 EMPTY/CLEAN 槽。
  */
 static int
 SlruSelectLRUPage(SlruDesc *ctl, int64 pageno)
@@ -1763,6 +1796,16 @@ SlruSelectLRUPage(SlruDesc *ctl, int64 pageno)
  * the containing directory here to make sure that newly created directory
  * entries are on disk.
  */
+/*
+ * 中文注释：
+ * 在 checkpoint 或数据库关闭时把某个 SLRU 的所有脏页写回磁盘。
+ *
+ * 函数按 bank 逐个加排他锁，遍历所有槽并调用 SlruInternalWritePage；为了减少
+ * fsync 次数，写文件句柄会收集到 SlruWriteAllData 中，最后统一关闭并交给
+ * checkpointer 的同步请求机制处理。allow_redirtied 允许在写回过程中其他进程再次
+ * 弄脏页面（checkpoint 场景常见），因此不能断言所有槽最终都是干净的。最后对目录
+ * 执行 fsync，确保新建段文件的目录项也持久化。该函数不负责删除旧段。
+ */
 void
 SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied)
 {
@@ -1848,6 +1891,21 @@ SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied)
  * segment immediately preceding the one containing cutoffPage.  Otherwise,
  * when the SLRU is quite full, SimpleLruTruncate() might delete that segment
  * after it has accrued freshly-written data.
+ */
+/*
+ * 中文注释：
+ * 删除 cutoffPage 之前的所有 SLRU 段文件，并清理共享内存中对应的页。
+ *
+ * 调用者必须保证同一 SLRU 的截断互斥（通常用 LWLock 或在 checkpoint 中串行调用），
+ * 且互斥范围要覆盖“计算 cutoffPage -> 清理缓存 -> 删除文件 -> 更新限制”的全过程，
+ * 否则可能删掉刚被其他后端写入新数据的段。
+ *
+ * 流程：
+ *   1. 安全检查 latest_page_number 不能先于 cutoffPage，防止回绕错误导致误删；
+ *   2. 逐 bank 扫描槽：cutoff 之前的干净页直接置 EMPTY；脏页先写回；正在 I/O 的
+ *      页等待完成；由于 I/O 会释放锁，处理后需要 restart 重新扫描；
+ *   3. 缓存清理完后，用 SlruScanDirectory 删除满足条件的旧段。
+ * 这里的“之前”由具体 SLRU 的 PagePrecedes 回调定义，必须正确处理 32 位回绕。
  */
 void
 SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage)
@@ -1944,6 +2002,15 @@ restart:
  * NB: This does not touch the SLRU buffers themselves, callers have to ensure
  * they either can't yet contain anything, or have already been cleaned out.
  */
+/*
+ * 中文注释：
+ * 删除单个 SLRU 段文件（按段号），不触碰共享内存中的 buffer。
+ *
+ * 调用者必须确保该段对应的页已经不可能再被访问，或已经被清理/写回；本函数只做两件
+ * 事：向 sync 机制注销该段的待同步请求（避免 checkpointer 之后又去 fsync 一个已删除
+ * 的文件），然后 unlink 段文件。路径由 SlruFileName 按具体 SLRU 的目录和命名规则
+ * 生成。删除失败只记 DEBUG2，因为文件可能已被其他路径删除。
+ */
 static void
 SlruInternalDeleteSegment(SlruDesc *ctl, int64 segno)
 {
@@ -1966,6 +2033,16 @@ SlruInternalDeleteSegment(SlruDesc *ctl, int64 segno)
 
 /*
  * Delete an individual SLRU segment, identified by the segment number.
+ */
+/*
+ * 中文注释：
+ * 安全删除一个指定段号的 SLRU 段：先清理共享内存中的相关页，再删除文件。
+ *
+ * 与 SlruInternalDeleteSegment 不同，本函数可以被外部调用（例如两阶段提交清理）。
+ * 它逐 bank 加排他锁扫描所有槽，找出属于目标段的页：干净页直接置 EMPTY；脏页写回；
+ * 正在 I/O 的页等待完成。由于 I/O 函数会临时释放 bank 锁，期间可能有新页被读入，
+ * 因此只要本轮处理过任何页（did_write）就 restart 再扫描一遍，直到确认没有残留。
+ * 最后调用 SlruInternalDeleteSegment 删除文件并释放锁。
  */
 void
 SlruDeleteSegment(SlruDesc *ctl, int64 segno)
@@ -2044,6 +2121,16 @@ restart:
  * first>=cutoff && last<cutoff:  no; wrap point falls inside this segment
  * first>=cutoff && last>=cutoff: no; every page of this segment is too young
  */
+/*
+ * 中文注释：
+ * 判断一个 SLRU 段是否可以安全删除。
+ *
+ * segpage 是段的第一页，cutoffPage 是仍含有有用数据的最老页（按 PagePrecedes 顺序）。
+ * 由于核心 SLRU 的 PagePrecedes 都实现了 32 位回绕，不能只比较段首：必须同时满足
+ * 段首页和段末页都先于 cutoffPage，才能保证整个段都在 cutoff 之前。否则要么 cutoff
+ * 落在段内部，要么回绕点落在段内部，删除都会丢失仍需要的数据。该函数是
+ * SlruScanDirCbDeleteCutoff 和 SlruScanDirCbReportPresence 的共同判据。
+ */
 static bool
 SlruMayDeleteSegment(SlruDesc *ctl, int64 segpage, int64 cutoffPage)
 {
@@ -2056,6 +2143,16 @@ SlruMayDeleteSegment(SlruDesc *ctl, int64 segpage, int64 cutoffPage)
 }
 
 #ifdef USE_ASSERT_CHECKING
+/*
+ * 中文注释：
+ * PagePrecedes 回调的单元测试辅助函数，针对页内某个偏移量验证回绕比较逻辑。
+ *
+ * 测试构造一对在 32 位 XID 空间中“互为前后”的值（相差 2^31），验证具体 SLRU 的
+ * PagePrecedes 在回绕点附近仍能给出正确顺序；然后构造“最新 XID 位于某段最后一页/
+ * 第一页”的边界场景，确认 SlruMayDeleteSegment 不会误删仍含有效数据的段。per_page
+ * 表示每页容纳多少个键，offset 是该页内的偏移。仅在 USE_ASSERT_CHECKING 构建中
+ * 编译，用于启动时自检各 SLRU 的页优先级实现。
+ */
 static void
 SlruPagePrecedesTestOffset(SlruDesc *ctl, int per_page, uint32 offset)
 {
@@ -2141,6 +2238,15 @@ SlruPagePrecedesTestOffset(SlruDesc *ctl, int per_page, uint32 offset)
  * variable-length entries, no keys, and no random access.  These unit tests
  * do not apply to them.)
  */
+/*
+ * 中文注释：
+ * 对某个 SLRU 的 PagePrecedes 回调运行一组单元测试。
+ *
+ * 分别取每页的第一个、中间和最后一个键作为偏移，调用
+ * SlruPagePrecedesTestOffset 验证回绕边界。适用于“每个 uint32 键占固定大小、可随机
+ * 访问”的 SLRU（如 CLOG、SUBTRANS、COMMIT_TS、MULTIXACT）；不适用于 MultiXact
+ * 成员（flags 与 XID 分离）和 Notify（变长、无键）等特殊 SLRU。
+ */
 void
 SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page)
 {
@@ -2155,6 +2261,13 @@ SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page)
  * SlruScanDirectory callback
  *		This callback reports true if there's any segment wholly prior to the
  *		one containing the page passed as "data".
+ */
+/*
+ * 中文注释：
+ * SlruScanDirectory 的回调：只要发现一个完全位于 cutoffPage 之前的段，就返回 true。
+ *
+ * data 指向调用者传入的 cutoffPage。返回 true 会让目录扫描提前停止，因此该回调
+ * 适合用于“是否存在可删除的旧段”的快速判断，而不会实际删除任何文件。
  */
 bool
 SlruScanDirCbReportPresence(SlruDesc *ctl, char *filename, int64 segpage,
@@ -2172,6 +2285,14 @@ SlruScanDirCbReportPresence(SlruDesc *ctl, char *filename, int64 segpage,
  * SlruScanDirectory callback.
  *		This callback deletes segments prior to the one passed in as "data".
  */
+/*
+ * 中文注释：
+ * SlruScanDirectory 的回调：删除所有完全位于 cutoffPage 之前的段。
+ *
+ * 对每个段用 SlruMayDeleteSegment 做回绕安全判断，满足条件就调用
+ * SlruInternalDeleteSegment 删除；始终返回 false 以继续扫描。data 指向 cutoffPage。
+ * 调用者需保证共享内存中这些段的页已经被清理（SimpleLruTruncate 会先做这一步）。
+ */
 static bool
 SlruScanDirCbDeleteCutoff(SlruDesc *ctl, char *filename, int64 segpage,
 						  void *data)
@@ -2188,6 +2309,13 @@ SlruScanDirCbDeleteCutoff(SlruDesc *ctl, char *filename, int64 segpage,
  * SlruScanDirectory callback.
  *		This callback deletes all segments.
  */
+/*
+ * 中文注释：
+ * SlruScanDirectory 的回调：删除目录中所有合法的 SLRU 段文件。
+ *
+ * 不做 cutoff 判断，直接按段号删除；始终返回 false 以继续扫描。通常用于重建或
+ * 彻底清理某个 SLRU 的场景。调用者仍需自行保证没有其他进程正在访问这些段。
+ */
 bool
 SlruScanDirCbDeleteAll(SlruDesc *ctl, char *filename, int64 segpage, void *data)
 {
@@ -2201,6 +2329,15 @@ SlruScanDirCbDeleteAll(SlruDesc *ctl, char *filename, int64 segpage, void *data)
  *
  * Returns true if a file with a name of a given length may be a correct
  * SLRU segment.
+ */
+/*
+ * 中文注释：
+ * 判断目录项文件名长度是否符合当前 SLRU 的段文件命名规则。
+ *
+ * 新式 64 位段号使用 15 个十六进制字符；旧式 32 位段号历史上允许 4、5、6 个字符
+ * （分别对应不同阶段的文件名格式），代码仍兼容读取。长度不符的文件（如临时文件、
+ * 备份文件、无关文件）会被 SlruScanDirectory 忽略，避免误删。最终所有 SLRU 计划
+ * 迁移到 64 位页号和 15 字符文件名。
  */
 static inline bool
 SlruCorrectSegmentFilenameLength(SlruDesc *ctl, size_t len)
@@ -2234,6 +2371,15 @@ SlruCorrectSegmentFilenameLength(SlruDesc *ctl, size_t len)
  * Note that the ordering in which the directory is scanned is not guaranteed.
  *
  * Note that no locking is applied.
+ */
+/*
+ * 中文注释：
+ * 扫描某个 SLRU 的目录，对每个合法的段文件调用回调。
+ *
+ * 只处理“长度符合命名规则且全部由十六进制字符组成”的文件，解析段号并换算成该段
+ * 第一页的页号，然后调用 callback(ctl, filename, segpage, data)。回调返回 true 时
+ * 提前停止，函数返回该 true；否则扫描完返回 false。目录扫描顺序不做保证，且本函数
+ * 不获取任何 SLRU 锁，因此调用者必须根据用途自行保证互斥（例如截断时持有相应锁）。
  */
 bool
 SlruScanDirectory(SlruDesc *ctl, SlruScanCallback callback, void *data)
@@ -2274,6 +2420,15 @@ SlruScanDirectory(SlruDesc *ctl, SlruScanCallback callback, void *data)
  * that they can provide the correct "SlruCtl" (otherwise we don't know how to
  * build the path), but they just forward to this common implementation that
  * performs the fsync.
+ */
+/*
+ * 中文注释：
+ * 各 SLRU 通用的 sync.c 文件同步处理器。
+ *
+ * 每个具体 SLRU 都需要向 sync 机制注册一个 handler，但真正 fsync 的逻辑相同，
+ * 于是统一转发到这里。函数根据 FileTag 中的段号构造完整路径，以 O_RDWR 打开，
+ * 调用 pg_fsync，然后关闭文件；返回 fsync 的结果，并保留 errno 供上层报告。
+ * 打开失败返回 -1。等待事件标记为 WAIT_EVENT_SLRU_FLUSH_SYNC，便于统计同步 I/O。
  */
 int
 SlruSyncFileTag(SlruDesc *ctl, const FileTag *ftag, char *path)

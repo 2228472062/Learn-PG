@@ -234,6 +234,17 @@ static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
  * Begin constructing a WAL record. This must be called before the
  * XLogRegister* functions and XLogInsert().
  */
+/*
+ * 中文注释：
+ * 开始构造一条 WAL 记录，初始化后端私有的记录构造工作区。
+ *
+ * 调用者必须在本函数之后、XLogInsert() 之前调用 XLogRegisterBuffer/Block/Data 等
+ * 注册函数。函数会检查：
+ *   - 当前是否允许写 WAL（恢复期间禁止产生新记录）；
+ *   - 是否重复调用（一次构造只能有一个起点）；
+ *   - 上一次构造的链和计数器已经由 XLogResetInsertion() 清空。
+ * 它本身不写共享内存、不加锁，只把 begininsert_called 置位，因此非常轻量。
+ */
 void
 XLogBeginInsert(void)
 {
@@ -259,6 +270,20 @@ XLogBeginInsert(void)
  * There is always space for a small number of buffers and data chunks, enough
  * for most record types. This function is for the exceptional cases that need
  * more.
+ */
+/*
+ * 中文注释：
+ * 扩容 WAL 记录构造工作区，保证后续可以注册指定数量的 block 和 data 片段。
+ *
+ * 默认工作区只容纳 XLR_NORMAL_MAX_BLOCK_ID 个块和 XLR_NORMAL_RDATAS 个数据片段，
+ * 足以覆盖绝大多数记录类型；只有需要更多 block_id 或更多 XLogRecData 节点的特殊
+ * 记录才调用本函数。max_block_id 是最大块编号（不是块数量），因此实际数组长度是
+ * max_block_id + 1；传入较小的值不会缩小已有数组。
+ *
+ * 关键约束：必须在进入 critical section 之前调用。repalloc 可能失败并报错，而在
+ * critical section 中报错会升级为 PANIC；这里用 Assert(CritSectionCount == 0)
+ * 把这一约定变成调试期检查。扩展出的 registered_buffer 需要清零，因为结构体中的
+ * padding 字节也会被原样写入 WAL，必须保证其内容确定。
  */
 void
 XLogEnsureRecordSpace(int max_block_id, int ndatas)
@@ -307,6 +332,15 @@ XLogEnsureRecordSpace(int max_block_id, int ndatas)
 /*
  * Reset WAL record construction buffers.
  */
+/*
+ * 中文注释：
+ * 复位 WAL 记录构造状态，准备下一次 XLogBeginInsert()。
+ *
+ * 清除所有已注册 block 的 in_use 标记、数据片段计数、当前最大 block_id、main data
+ * 链的长度和尾指针、记录级 flags，以及 begininsert_called。XLogInsert() 在成功或
+ * bootstrap 模式下返回前会自动调用它；出错路径则由事务/资源清理逻辑负责，避免把
+ * 半成品状态带到下一条记录。
+ */
 void
 XLogResetInsertion(void)
 {
@@ -326,6 +360,21 @@ XLogResetInsertion(void)
 /*
  * Register a reference to a buffer with the WAL record being constructed.
  * This must be called for every page that the WAL-logged operation modifies.
+ */
+/*
+ * 中文注释：
+ * 把共享缓冲区中的一个页注册到正在构造的 WAL 记录。
+ *
+ * block_id 是记录内块的逻辑编号（0..XLR_MAX_BLOCK_ID），恢复端按这个编号把 WAL
+ * 中的 block reference 与 redo 操作对应起来。函数保存 buffer 的 RelFileLocator、
+ * fork、block number 和页指针，并初始化该块的私有数据链；它不复制页内容，也不
+ * 增加 buffer 的 pin/锁，调用者必须保证 buffer 在 XLogInsert() 返回前一直有效。
+ *
+ * flags 控制后续组装行为，例如 REGBUF_STANDARD（允许省略页内空洞）、
+ * REGBUF_FORCE_IMAGE（强制整页镜像）、REGBUF_NO_IMAGE（禁止镜像）、
+ * REGBUF_WILL_INIT（页将被重新初始化）、REGBUF_NO_CHANGE（只登记引用而不修改页）
+ * 等。断言要求：除非 REGBUF_NO_CHANGE，buffer 必须已脏并且持有排他锁或
+ * share-exclusive 锁；同一物理页不能以不同 block_id 重复注册。
  */
 void
 XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
@@ -398,6 +447,15 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
  * Like XLogRegisterBuffer, but for registering a block that's not in the
  * shared buffer pool (i.e. when you don't have a Buffer for it).
  */
+/*
+ * 中文注释：
+ * 与 XLogRegisterBuffer 类似，但用于登记“不在共享缓冲池中”的页。
+ *
+ * 典型场景是批量创建关系、写入 FSM/VM 或扩展在私有内存中构造页面：调用者直接
+ * 提供 RelFileLocator、fork、block number 和页指针，不需要 Buffer。函数同样只保存
+ * 指针和标识，不复制页；page 必须在 XLogInsert() 前保持有效。flags 语义与
+ * XLogRegisterBuffer 相同，但由于没有 buffer 锁可检查，调用者需自行保证页内容稳定。
+ */
 void
 XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 				  BlockNumber blknum, const PageData *page, uint8 flags)
@@ -453,6 +511,15 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
  * The data is appended to the "main chunk", available at replay with
  * XLogRecGetData().
  */
+/*
+ * 中文注释：
+ * 向当前 WAL 记录追加一段“main data”（不归属于任何 block 的数据）。
+ *
+ * 数据以零拷贝方式挂到 mainrdata 链尾，恢复时可用 XLogRecGetData() 取得这段连续
+ * 逻辑数据。data 指向的内存必须在 XLogInsert() 返回前保持有效且内容不变；函数只
+ * 记录指针和长度，不复制。每个 XLogRecData 节点都从预分配的 rdatas 数组取得，
+ * 因此片段数量受 max_rdatas 限制，超出会报错，必要时先调用 XLogEnsureRecordSpace。
+ */
 void
 XLogRegisterData(const void *data, uint32 len)
 {
@@ -493,6 +560,16 @@ XLogRegisterData(const void *data, uint32 len)
  * reconstruct the changes to the page, you might as well just log a full
  * copy of it. (the "main data" that's not associated with a block is not
  * limited)
+ */
+/*
+ * 中文注释：
+ * 向某个已注册 block 追加块私有数据（block data）。
+ *
+ * 这些数据在 WAL 物理格式中紧跟在对应 block reference 之后，redo 时通过
+ * XLogRecGetBlockData() 取得。block_id 必须已经用 XLogRegisterBuffer/Block 注册；
+ * 同一 block 多次调用会按顺序追加。单块数据总长度受 XLogRecordBlockHeader 的
+ * uint16 字段限制（65535 字节），超过就应改用 main data 或整页镜像。和
+ * XLogRegisterData 一样，函数不复制数据，调用者需保证内存在插入前有效。
  */
 void
 XLogRegisterBufData(uint8 block_id, const void *data, uint32 len)
@@ -545,6 +622,15 @@ XLogRegisterBufData(uint8 block_id, const void *data, uint32 len)
  *	 durability, which allows to avoid triggering WAL archiving and other
  *	 background activity.
  */
+/*
+ * 中文注释：
+ * 为即将插入的 WAL 记录设置记录级标志。
+ *
+ * 目前主要支持 XLOG_INCLUDE_ORIGIN（把当前复制源 origin 写入记录，供逻辑解码使用）
+ * 和 XLOG_MARK_UNIMPORTANT（声明该记录对持久性不重要，可减少归档/后台唤醒等
+ * 开销）。标志用按位或累积到 curinsert_flags，由 XLogRecordAssemble() 在组装时
+ * 读取。必须在 XLogBeginInsert() 之后、XLogInsert() 之前调用。
+ */
 void
 XLogSetRecordFlags(uint8 flags)
 {
@@ -562,6 +648,23 @@ XLogSetRecordFlags(uint8 flags)
  * (LSN is the XLOG point up to which the XLOG must be flushed to disk
  * before the data page can be written out.  This implements the basic
  * WAL rule "write the log before the data".)
+ */
+/*
+ * 中文注释：
+ * 插入一条 WAL 记录，是 WAL 构造 API 的最终提交点。
+ *
+ * 参数 rmid 指定资源管理器，info 的低位是该 rmgr 自己的记录类型，高位可带
+ * XLR_SPECIAL_REL_UPDATE、XLR_CHECK_CONSISTENCY 等通用标志。函数先校验 info
+ * 没有设置保留位；bootstrap 模式下除 RM_XLOG_ID 外只返回假 LSN、不真正写 WAL。
+ *
+ * 正常路径是一个 do-while 循环：
+ *   1. 读取当前 RedoRecPtr 和 full_page_writes 状态；
+ *   2. XLogRecordAssemble() 根据注册信息组装记录（可能生成 FPI）；
+ *   3. XLogInsertRecord() 在持有插入锁后重新校验这些状态；若发现组装时依据的
+ *      状态已过期，返回 InvalidXLogRecPtr，循环重新组装；
+ *   4. 成功后返回记录末尾 LSN，即“下一条记录开始位置”，调用者用它设置数据页 LSN。
+ * 返回前会调用 XLogResetInsertion() 清理后端私有工作区。该 LSN 也体现了 WAL 的
+ * 基本规则：数据页落盘前，必须先把覆盖它的 WAL 刷到磁盘。
  */
 XLogRecPtr
 XLogInsert(RmgrId rmid, uint8 info)
@@ -628,6 +731,14 @@ XLogInsert(RmgrId rmid, uint8 info)
  * Simple wrapper to XLogInsert to insert a WAL record with elementary
  * contents (only an int64 is supported as value currently).
  */
+/*
+ * 中文注释：
+ * 插入只包含一个 int64 值的简单 WAL 记录的便捷包装。
+ *
+ * 依次完成 XLogBeginInsert、XLogRegisterData、XLogInsert，主要供只需要记录一个
+ * 计数器/时间戳/序列值的 rmgr 使用，避免每个调用点重复样板代码。value 在函数
+ * 返回前一直位于栈上，XLogInsert 会同步把它复制进 WAL。
+ */
 XLogRecPtr
 XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value)
 {
@@ -642,6 +753,20 @@ XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value)
  * Some index AMs use LSNs to detect concurrent page modifications, but not
  * all index pages are WAL-logged.  This function provides a sequence of fake
  * LSNs for that purpose.
+ */
+/*
+ * 中文注释：
+ * 为“不写 WAL 的索引页”生成一个伪 LSN，用于并发修改检测。
+ *
+ * 某些索引访问方法用页 LSN 判断页面是否被其他进程修改过，但临时表、unlogged 表
+ * 或某些特殊页并不产生真实 WAL 记录。这里按关系持久化级别分别处理：
+ *   - TEMP：只在本会话可见，使用后端本地递增计数器即可；
+ *   - UNLOGGED：需要跨后端可见且在干净重启后保持，交给
+ *     GetFakeLSNForUnloggedRel() 维护；
+ *   - 永久关系但当前不写 WAL（例如建索引期间）：必须保证伪 LSN 小于下一次提交
+ *     产生的真实 LSN，且彼此不同；如果插入 LSN 没有前进，就调用 XLogAssignLSN()
+ *     生成一个占位 WAL 位置。
+ * 返回值只用于页内比较，不能当作真实 WAL 位置去 flush 或读取。
  */
 XLogRecPtr
 XLogGetFakeLSN(Relation rel)
@@ -701,6 +826,28 @@ XLogGetFakeLSN(Relation rel)
  *
  * *topxid_included is set if the topmost transaction ID is logged with the
  * current subtransaction.
+ */
+/*
+ * 中文注释：
+ * 把已注册的 buffer/data 组装成一条完整的 WAL 记录（XLogRecData 链）。
+ *
+ * 这是 WAL 物理格式的核心函数。它按 block_id 升序遍历注册表，为每个块决定：
+ *   - 是否需要 full page image：REGBUF_FORCE_IMAGE、页 LSN <= RedoRecPtr 或
+ *     full_page_writes 生效时需要；若不需要，则把该页最小 LSN 记录到 *fpw_lsn，
+ *     供 XLogInsertRecord() 判断组装依据是否过期；
+ *   - 是否需要 block data：有数据且没有用整页镜像替代时才写入；
+ *   - 是否省略页内空洞：REGBUF_STANDARD 且 pd_lower/pd_upper 合法时，跳过
+ *     pd_lower..pd_upper 之间的空闲区；
+ *   - 是否压缩镜像：按 wal_compression 选择 PGLZ/LZ4/ZSTD，只有净收益为正才采用；
+ *   - 是否使用 SAME_REL 省略重复的 RelFileLocator。
+ * 随后依次追加 origin、顶层 XID（首次遇到子事务时）和 main data，并在临时
+ * hdr_scratch 中构造 record header、block header、image header 等。CRC 先覆盖
+ * header 之后的全部内容，xl_prev 留到 XLogInsertRecord() 确定插入位置后再补，
+ * 因此本函数可以针对同一记录重复执行（FPI 决策过期时重试）。
+ *
+ * 输出参数：*fpw_lsn 是未做镜像页中的最小 LSN；*num_fpi/*fpi_bytes 统计镜像数量
+ * 和字节数；*topxid_included 表示是否已把顶层 XID 写入本记录。记录总长超过
+ * XLogRecordMaxSize 时直接报错，保证 xlogreader 能处理。
  */
 static XLogRecData *
 XLogRecordAssemble(RmgrId rmid, uint8 info,
@@ -1102,6 +1249,16 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
  * bigger than original). Otherwise, returns true and sets 'dlen' to
  * the length of compressed block image.
  */
+/*
+ * 中文注释：
+ * 尝试压缩一个 full page image，并判断压缩是否“值得”。
+ *
+ * 若页面有空洞，先把空洞两侧的数据拼到临时对齐缓冲区，得到连续的可压缩内容；
+ * 然后按 wal_compression 选择 PGLZ、LZ4 或 ZSTD。压缩结果除了数据本身，还可能需要
+ * 额外的压缩头（记录空洞长度），因此仅当“压缩后长度 + 额外头开销 < 原始长度”时
+ * 才返回 true 并写出 *dlen；否则返回 false，让调用者回退到未压缩镜像。
+ * 这样避免出现“压缩后反而更大”的 WAL 记录。
+ */
 static bool
 XLogCompressBackupBlock(const PageData *page, uint16 hole_offset, uint16 hole_length,
 						void *dest, uint16 *dlen)
@@ -1185,6 +1342,15 @@ XLogCompressBackupBlock(const PageData *page, uint16 hole_offset, uint16 hole_le
  * (which forces full-page writes) could change later, so the result should
  * be used for optimization purposes only.
  */
+/*
+ * 中文注释：
+ * 快速判断一个 buffer 在当前检查点周期内是否可能需要 full page image。
+ *
+ * 读取 RedoRecPtr 与 full_page_writes：只有开启页写且页 LSN <= RedoRecPtr 时才
+ * 返回 true。由于此时尚未持有 WAL 插入锁，RedoRecPtr 和 runningBackups 之后可能
+ * 变化，所以结果只能用于优化/预判，不能作为最终正确性依据；真正的决定在
+ * XLogRecordAssemble() 和 XLogInsertRecord() 中做出。
+ */
 bool
 XLogCheckBufferNeedsBackup(Buffer buffer)
 {
@@ -1214,6 +1380,17 @@ XLogCheckBufferNeedsBackup(Buffer buffer)
  * We only need to do something if page has not yet been full page written in
  * this checkpoint round. The LSN of the inserted wal record is returned if we
  * had to write, InvalidXLogRecPtr otherwise.
+ */
+/*
+ * 中文注释：
+ * 在设置 hint bit 时，必要时为页写一条 full-page-image WAL 记录。
+ *
+ * 调用者通常只持有 share-exclusive buffer 锁（足以阻止并发修改），并且已经通过
+ * MarkBufferDirtyHint() 把 buffer 标脏。函数读取当前 RedoRecPtr，若页 LSN 仍小于
+ * 等于它，说明本检查点周期内该页还没有被完整写过，需要插入
+ * XLOG_FPI_FOR_HINT 记录以保护 hint bit 修改；否则返回 InvalidXLogRecPtr。
+ * 返回有效 LSN 时，调用者应把页 LSN 推进到该值。该函数可用于多种页类型，
+ * buffer_std 决定是否允许省略标准页布局中的空洞。
  */
 XLogRecPtr
 XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
@@ -1272,6 +1449,15 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
  * space between pd_lower and pd_upper, set 'page_std' to true. That allows
  * the unused space to be left out from the WAL record, making it smaller.
  */
+/*
+ * 中文注释：
+ * 为私有内存中的单个页写一条包含完整页镜像的 WAL 记录（XLOG_FPI）。
+ *
+ * 调用者通常正在直接构造页面并准备通过 smgr 写出，因此没有共享 Buffer 可注册；
+ * 函数使用 XLogRegisterBlock 登记页，强制 REGBUF_FORCE_IMAGE；page_std 为 true 时
+ * 允许省略标准页布局中的空洞。插入后若页不是全零的新页，就把页 LSN 设置为记录
+ * 末尾 LSN；全零页保持原样，避免无意义地改变其内容。调用者负责随后把页写到磁盘。
+ */
 XLogRecPtr
 log_newpage(RelFileLocator *rlocator, ForkNumber forknum, BlockNumber blkno,
 			Page page, bool page_std)
@@ -1303,6 +1489,15 @@ log_newpage(RelFileLocator *rlocator, ForkNumber forknum, BlockNumber blkno,
  * Like log_newpage(), but allows logging multiple pages in one operation.
  * It is more efficient than calling log_newpage() for each page separately,
  * because we can write multiple pages in a single WAL record.
+ */
+/*
+ * 中文注释：
+ * 批量为一组私有内存页写 full-page-image WAL，减少记录数量和函数调用开销。
+ *
+ * 页按 XLR_MAX_BLOCK_ID 个一批分组，每批用一条 XLOG_FPI 记录登记；同一批内所有页
+ * 共享同一个记录末尾 LSN。page_std 控制是否省略标准页空洞。和 log_newpage 一样，
+ * 只对非全零页设置 LSN，调用者负责把页写出。批量写入适合关系创建、批量初始化等
+ * 场景，能显著降低 WAL 记录头和提交开销。
  */
 void
 log_newpages(RelFileLocator *rlocator, ForkNumber forknum, int num_pages,
@@ -1366,6 +1561,15 @@ log_newpages(RelFileLocator *rlocator, ForkNumber forknum, int num_pages,
  * space between pd_lower and pd_upper, set 'page_std' to true. That allows
  * the unused space to be left out from the WAL record, making it smaller.
  */
+/*
+ * 中文注释：
+ * 为共享缓冲池中的页写 full-page-image WAL 的包装函数。
+ *
+ * 要求调用者已经初始化并标脏 buffer，并且处于 critical section 中（共享缓冲区
+ * 修改必须在临界区内完成）。函数从 buffer 取得 RelFileLocator、fork、block number，
+ * 然后复用 log_newpage() 完成注册、插入和 LSN 设置。适用于需要强制整页镜像但
+ * 又不想直接操作 XLogRegister* API 的调用点。
+ */
 XLogRecPtr
 log_newpage_buffer(Buffer buffer, bool page_std)
 {
@@ -1398,6 +1602,16 @@ log_newpage_buffer(Buffer buffer, bool page_std)
  * AccessExclusiveLock on it, so no other backend can be accessing it at the
  * same time. If that's not the case, you must ensure that this does not
  * cause a deadlock through some other means.
+ */
+/*
+ * 中文注释：
+ * 为一个块区间内的所有页写 full-page-image WAL。
+ *
+ * 函数逐批读取 [startblk, endblk) 的页，取得排他锁，跳过完全为空的新页（避免给
+ * 空页设置 LSN 而破坏“空页”语义），然后把一批页注册到同一条 XLOG_FPI 记录。
+ * 每批最多 XLR_MAX_BLOCK_ID 个页；插入记录后在同一 critical section 内为所有页
+ * 设置 LSN，再统一解锁释放。由于会同时持有多个 buffer 锁，调用者通常应持有关系的
+ * AccessExclusiveLock（例如刚建好关系、尚无并发访问），否则需要自行保证不会死锁。
  */
 void
 log_newpage_range(Relation rel, ForkNumber forknum,
@@ -1477,6 +1691,19 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 
 /*
  * Allocate working buffers needed for WAL record construction.
+ */
+/*
+ * 中文注释：
+ * 初始化后端私有的 WAL 记录构造工作区。
+ *
+ * 每个后端在首次需要写 WAL 前调用一次（通常由 InitPostgres 路径触发）。函数创建
+ * 生命周期为整个后端的 xloginsert_cxt 内存上下文，并在其中分配：
+ *   - registered_buffers：按 block_id 索引的块注册数组；
+ *   - rdatas：XLogRecData 节点数组；
+ *   - hdr_scratch：存放记录头和块头的临时缓冲区。
+ * 这些工作区只属于当前后端，因此不需要加锁，也能在事务之间复用。断言构建下还会
+ * 验证 XLogReader 解码最大记录所需空间没有超过 AllocSize 限制，防止写出读取端
+ * 无法处理的大记录。
  */
 void
 InitXLogInsert(void)

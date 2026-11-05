@@ -398,6 +398,15 @@ static RecoveryTargetType DetermineRecoveryTargetType(void);
 /*
  * Register shared memory for WAL recovery
  */
+/*
+ * 中文注释：
+ * 向共享内存框架登记 WAL 恢复控制结构 XLogRecoveryCtlData。
+ *
+ * 该结构保存 startup 进程与普通后端共享的恢复进度（lastReplayedEndRecPtr、
+ * replayEndRecPtr、replayEndTLI）、暂停状态、热备是否激活、提升是否触发以及
+ * recoveryWakeupLatch 等。所有字段由 info_lck 自旋锁保护，读者包括 walsender、
+ * 检查点进程和 SQL 函数。
+ */
 static void
 XLogRecoveryShmemRequest(void *arg)
 {
@@ -407,6 +416,14 @@ XLogRecoveryShmemRequest(void *arg)
 		);
 }
 
+/*
+ * 中文注释：
+ * 初始化共享的 WAL 恢复控制结构。
+ *
+ * 先整体清零，再初始化 info_lck 自旋锁、recoveryWakeupLatch 共享闩锁和
+ * recoveryNotPausedCV 条件变量。latch 由 startup 进程在进入归档恢复时
+ * OwnLatch，其他进程通过 WakeupRecovery 触发；条件变量用于恢复暂停/继续。
+ */
 static void
 XLogRecoveryShmemInit(void *arg)
 {
@@ -420,6 +437,14 @@ XLogRecoveryShmemInit(void *arg)
 /*
  * A thin wrapper to enable StandbyMode and do other preparatory work as
  * needed.
+ */
+/*
+ * 中文注释：
+ * 启用备库模式并做相应准备。
+ *
+ * 设置全局 StandbyMode=true，使 WAL 读取状态机在本地 WAL 用尽后尝试从主库流式
+ * 接收；同时关闭 startup progress timeout，因为备库会长期处于恢复状态，周期性
+ * 输出进度只会造成日志膨胀。
  */
 static void
 EnableStandbyMode(void)
@@ -454,6 +479,29 @@ EnableStandbyMode(void)
  *
  * This initializes some global variables like ArchiveRecoveryRequested, and
  * StandbyModeRequested and InRecovery.
+ */
+/*
+ * 中文注释：
+ * 为 WAL 恢复做初始化：分析 pg_control 和 backup_label，决定恢复类型和起点。
+ *
+ * 本函数由 StartupXLOG 调用，是恢复流程的第一阶段，尚不修改磁盘状态（除了根据
+ * tablespace_map 建立符号链接、以及读取定位 checkpoint 所需的 WAL）。主要工作：
+ *   1. 根据 minRecoveryPointTLI/checkpoint TLI 设定 recoveryTargetTLI；
+ *   2. readRecoverySignalFile 判断是否请求归档恢复/备库模式，
+ *      validateRecoveryParameters 校验 recovery_target* 参数；
+ *   3. 若需要归档恢复，取得 recoveryWakeupLatch 的所有权；
+ *   4. 分配 xlogreader、解码缓冲区、prefetcher 和两个用于页一致性校验的
+ *      BLCKSZ 缓冲区；
+ *   5. 有 backup_label 时从标签指定的 checkpoint 开始（而不是 pg_control），
+ *      必要时读 tablespace_map 建符号链接；没有 backup_label 时从 pg_control 的
+ *      checkpoint 开始，并处理孤立的 tablespace_map；
+ *   6. 校验 checkpoint 所在时间线确实位于目标时间线历史中，minRecoveryPoint
+ *      也在同一历史中；
+ *   7. 根据是否干净关闭、是否存在恢复信号、redo 是否小于 checkpoint 等决定
+ *      InRecovery/InArchiveRecovery，并更新内存中的 ControlFile 副本；
+ *   8. 设置 backupStartPoint/backupEndPoint/minRecoveryPoint 等全局变量。
+ * 返回前通过输出参数告知调用者 wasShutdown、是否使用了 backup_label 和
+ * tablespace_map，调用者稍后负责删除这些文件并写回 ControlFile。
  */
 void
 InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
@@ -982,6 +1030,19 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
  * See if there is a recovery command file (recovery.conf), and if so
  * throw an ERROR since as of PG12 we no longer recognize that.
  */
+/*
+ * 中文注释：
+ * 检查数据目录中的恢复信号文件，设置 ArchiveRecoveryRequested/StandbyModeRequested。
+ *
+ * 规则：
+ *   - 存在 recovery.conf 直接 FATAL（PG12 起不再支持该接口）；
+ *   - 删除遗留的 recovery.conf.done；
+ *   - standby.signal 优先于 recovery.signal；前者同时启用归档恢复和备库模式，
+ *     后者只启用归档恢复（PITR）；
+ *   - 信号文件代表服务器状态，找到后尽量 fsync（失败不致命）；
+ *   - 单用户模式不支持备库模式，因为需要 walreceiver 等辅助进程。
+ * 两个信号文件都不存在时不进入归档恢复，后续按崩溃恢复处理。
+ */
 static void
 readRecoverySignalFile(void)
 {
@@ -1066,6 +1127,22 @@ readRecoverySignalFile(void)
 				 errmsg("standby mode is not supported by single-user servers")));
 }
 
+/*
+ * 中文注释：
+ * 校验并补全恢复相关 GUC，确定最终恢复目标和目标时间线。
+ *
+ * 即使没有请求归档恢复，也先调用 DetermineRecoveryTargetType 拒绝同时设置多个
+ * recovery_target*（这是配置错误）。归档恢复时：
+ *   - 备库模式要求至少配置 primary_conninfo 或 restore_command，否则只警告，
+ *     因为还可能直接从 pg_wal 轮询；
+ *   - 非备库的 PITR 必须配置 restore_command；
+ *   - 若 recovery_target_action=pause 但 hot_standby=off，则降级为 shutdown，
+ *     避免暂停后无人能连接执行 resume；
+ *   - 对 recovery_target_time 做最终解析：check hook 阶段只验证语法，此时时区
+ *     等 GUC 已确定，才把字符串转成 TimestampTz；
+ *   - 解析 recovery_target_timeline：numeric 要求时间线存在（1 号除外），latest
+ *     调用 findNewestTimeLine 求最新，current 则沿用 pg_control 的时间线。
+ */
 static void
 validateRecoveryParameters(void)
 {
@@ -1167,6 +1244,21 @@ validateRecoveryParameters(void)
  *
  * Also sets the global variables RedoStartLSN and RedoStartTLI with the LSN
  * and TLI read from the backup file.
+ */
+/*
+ * 中文注释：
+ * 读取并解析备份标签文件 backup_label。
+ *
+ * 存在 backup_label 说明数据目录来自基础备份，恢复必须从标签中记录的 checkpoint
+ * 开始，而不能相信 pg_control（后者可能是备份结束后更新的检查点）。函数解析：
+ *   - START WAL LOCATION：设置 RedoStartLSN/RedoStartTLI（备份开始位置）；
+ *   - CHECKPOINT LOCATION：返回 checkpoint 位置和其 TLI；
+ *   - BACKUP METHOD：streamed 表示需要一直重放到备份结束记录
+ *     （backupEndRequired=true）；
+ *   - BACKUP FROM：standby 表示备份取自备库，后续要校验控制文件状态；
+ *   - START TIME/LABEL/START TIMELINE：仅用于日志和一致性检查；
+ *   - INCREMENTAL FROM LSN：说明这是增量备份，必须先用 pg_combinebackup 合并。
+ * 文件不存在返回 false；格式错误或读取失败直接 FATAL。
  */
 static bool
 read_backup_label(XLogRecPtr *checkPointLoc, TimeLineID *backupLabelTLI,
@@ -1314,6 +1406,16 @@ read_backup_label(XLogRecPtr *checkPointLoc, TimeLineID *backupLabelTLI,
  * with a tablespaceinfo struct for each tablespace listed in the file);
  * returns false if not.
  */
+/*
+ * 中文注释：
+ * 读取 tablespace_map 文件，返回其中每个表空间的 OID 和原始路径。
+ *
+ * 基础备份可能把表空间放在与原始集簇不同的位置，恢复时需要按该文件重建
+ * pg_tblspc/<oid> 符号链接。每行格式为 "<oid> <path>"，路径中的反斜杠用于转义
+ * 换行和反斜杠，函数边读边反转义。路径可以以空格开头，因此只按第一个空格分隔
+ * OID 与路径。格式错误、OID 非法、最后一行未终止或读取失败都 FATAL；文件不存在
+ * 返回 false。
+ */
 static bool
 read_tablespace_map(List **tablespaces)
 {
@@ -1417,6 +1519,25 @@ read_tablespace_map(List **tablespaces)
  * Returns the position of the last valid or applied record, after which new
  * WAL should be appended, information about why recovery was ended, and some
  * other things. See the EndOfWalRecoveryInfo struct for details.
+ */
+/*
+ * 中文注释：
+ * 结束 WAL 恢复，计算新 WAL 的追加位置并返回恢复结果。
+ *
+ * 主要步骤：
+ *   1. 关闭 walreceiver 和 slot sync worker，确保后续写 WAL 不会被流式接收覆盖；
+ *      关闭后才可以退出 StandbyMode；
+ *   2. 重新读取最后一条有效/已重放记录，得到精确的 endOfLog；若之前发现不完整的
+ *      continuation record，abortedRecPtr/missingContrecPtr 会通过返回值交给调用者
+ *      写 XLOG_OVERWRITE_CONTRECORD；
+ *   3. 记录 endOfLog 所在 WAL 段文件名中的 TLI（时间线切换可能使它与记录名义上的
+ *      TLI 不同）；
+ *   4. 退出归档恢复，关闭仍打开的 WAL 文件；
+ *   5. 若 endOfLog 位于页中间，把该页已有效的部分复制出来，供调用者初始化 WAL
+ *      写缓冲；
+ *   6. 生成时间线历史文件中的停止原因，填充 EndOfWalRecoveryInfo。
+ * 本函数不关闭 xlogreader，因为调用者可能还要用 ReadCheckpointRecord 重读最后的
+ * 检查点；真正的清理在 ShutdownWalRecovery。
  */
 EndOfWalRecoveryInfo *
 FinishWalRecovery(void)
@@ -1568,6 +1689,16 @@ FinishWalRecovery(void)
 /*
  * Clean up the WAL reader and leftovers from restoring WAL from archive
  */
+/*
+ * 中文注释：
+ * 释放 WAL 恢复使用的 reader、prefetcher 和归档临时文件。
+ *
+ * 先输出最后一次 pg_stat_recovery_prefetch 统计，关闭可能仍打开的 WAL 段文件，
+ * 释放 xlogreader 的 private_data 并调用 XLogReaderFree/XLogPrefetcherFree。
+ * 归档恢复还会删除 pg_wal/RECOVERYXLOG（未完成的恢复段）和
+ * pg_wal/RECOVERYHISTORY（临时时间线历史），最后 DisownLatch 释放恢复唤醒闩锁。
+ * unlink 失败被忽略，因为这些只是临时文件。
+ */
 void
 ShutdownWalRecovery(void)
 {
@@ -1614,6 +1745,26 @@ ShutdownWalRecovery(void)
  * If the system was shut down cleanly, this is never called.
  */
 void
+/*
+ * 中文注释：
+ * 执行实际的 WAL 重放主循环。
+ *
+ * 调用前 InitWalRecovery 已确定 RedoStartLSN/CheckPointLoc，系统若为干净关闭则
+ * 本函数不会被调用。流程：
+ *   1. 在 info_lck 下初始化共享的 lastReplayed*/replayEnd* 进度变量，使其表示
+ *      “REDO 位置之前”或检查点记录本身；
+ *   2. 通知 postmaster 恢复已开始（以便启动归档进程），并调用
+ *      CheckRecoveryConsistency 判断是否已可接受只读连接；
+ *   3. 定位第一条要重放的记录：redo 指针早于 checkpoint 时先读到
+ *      XLOG_CHECKPOINT_REDO 记录，否则读 checkpoint 之后的记录；
+ *   4. 进入 do-while 主循环：处理中断、响应恢复暂停请求、检查 recovery target、
+ *      执行 recovery_min_apply_delay 延迟、调用 ApplyWalRecord 重放、唤醒等待
+ *      standby replay/write/flush LSN 的进程、检查 inclusive target、读取下一条；
+ *   5. 达到目标后根据 recovery_target_action 选择 shutdown(exit 3)、pause 或
+ *      promote；未达到一致性就停止会 FATAL；
+ *   6. 调用 RmgrCleanup，输出 redo 结束统计和最后事务时间。
+ * 若配置了恢复目标但 WAL 在到达前耗尽，归档恢复会 FATAL，提示恢复未完成。
+ */
 PerformWalRecovery(void)
 {
 	XLogRecord *record;
@@ -1884,6 +2035,26 @@ PerformWalRecovery(void)
 /*
  * Subroutine of PerformWalRecovery, to apply one WAL record.
  */
+/*
+ * 中文注释：
+ * 重放单条 WAL 记录，是主循环的核心步骤。
+ *
+ * 处理顺序：
+ *   1. 压入 rm_redo_error_callback，使重放报错时能打印记录描述和块信息；
+ *   2. 确保 TransamVariables->nextXid 超过记录的 xl_xid；
+ *   3. 若记录是 shutdown checkpoint 或 XLOG_END_OF_RECOVERY，检查并切换 replayTLI：
+ *      新时间线必须在期望历史中、不能倒退，且不能越过尚未到达的 minRecoveryPoint；
+ *   4. 在 info_lck 下更新 replayEndRecPtr/TLI，供 XLogFlush 正确推进
+ *      minRecoveryPoint；
+ *   5. 热备已初始化时，把记录中的 XID 登记为 known-assigned XID；
+ *   6. RM_XLOG_ID 中与恢复直接相关的记录交给 xlogrecovery_redo，其余交给
+ *      GetRmgr(...).rm_redo；
+ *   7. 若记录带 XLR_CHECK_CONSISTENCY，调用 verifyBackupPageConsistency 比较
+ *      重放页与 WAL 中的 FPI；
+ *   8. 更新 lastReplayed* 进度，按需唤醒 walsender、请求 walreceiver 回复、
+ *      检查一致性；发生时间线切换时删除旧时间线的未来 WAL 段并重配 prefetcher。
+ * 错误上下文在函数返回前弹出，保证后续错误不受本条记录影响。
+ */
 static void
 ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *replayTLI)
 {
@@ -2048,6 +2219,19 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
  * Some XLOG RM record types that are directly related to WAL recovery are
  * handled here rather than in the xlog_redo()
  */
+/*
+ * 中文注释：
+ * 处理与恢复流程强相关、因而不放在 xlog_redo() 中的 RM_XLOG_ID 记录。
+ *
+ * 目前包括两类：
+ *   - XLOG_OVERWRITE_CONTRECORD：校验记录中的 overwritten_lsn 与 reader 记录的
+ *     一致，确认之前不完整的 continuation record 已被安全跳过，清除
+ *     abortedRecPtr/missingContrecPtr，并把 overwrittenRecPtr 复位，防止重复校验；
+ *   - XLOG_BACKUP_END：若记录中的备份起点等于当前 backupStartPoint，说明基础备份
+ *     的 WAL 已重放完毕，把 backupEndPoint 设为当前记录末尾；下一次
+ *     CheckRecoveryConsistency 会据此完成 end-of-backup 处理。起点不匹配则只记
+ *     DEBUG 日志（可能属于另一个备份）。
+ */
 static void
 xlogrecovery_redo(XLogReaderState *record, TimeLineID replayTLI)
 {
@@ -2119,6 +2303,15 @@ xlogrecovery_redo(XLogReaderState *record, TimeLineID replayTLI)
  * useful for testing purposes, and also allows for an escape hatch in case
  * things go south.
  */
+/*
+ * 中文注释：
+ * 在达到一致性时检查 pg_tblspc 下没有真实目录。
+ *
+ * 重放“创建后又删除数据库”的记录可能在 pg_tblspc 留下伪造目录；正常情况下到
+ * 一致性点时它们应已被删除。检测到非符号链接的 OID 命名项时，默认 PANIC（数据
+ * 损坏），allow_in_place_tablespaces 开启时降级为 WARNING，便于测试或在紧急情况下
+ * 放行。非纯数字命名的条目直接跳过。
+ */
 static void
 CheckTablespaceDirectory(void)
 {
@@ -2151,6 +2344,22 @@ CheckTablespaceDirectory(void)
  * Checks if recovery has reached a consistent state. When consistency is
  * reached and we have a valid starting standby snapshot, tell postmaster
  * that it can start accepting read-only connections.
+ */
+/*
+ * 中文注释：
+ * 检查恢复是否已经达到一致状态，并在条件满足时允许热备连接。
+ *
+ * 崩溃恢复没有 minRecoveryPoint，函数直接返回，只有重放完全部 WAL 才算一致。
+ * 归档恢复中：
+ *   1. 若已到达 backupEndPoint，调用 ReachedEndOfBackup 更新控制文件，清除
+ *      backupStartPoint/EndPoint 和 backupEndRequired；
+ *   2. 若 !backupEndRequired 且 minRecoveryPoint <= 最后重放位置，执行
+ *      XLogCheckInvalidPages 和 CheckTablespaceDirectory，置 reachedConsistency，
+ *      向 postmaster 发送 PMSIGNAL_RECOVERY_CONSISTENT；
+ *   3. 若 standbyState 已达到 STANDBY_SNAPSHOT_READY，在自旋锁下设置共享
+ *      SharedHotStandbyActive，向 postmaster 发送 PMSIGNAL_BEGIN_HOT_STANDBY，
+ *      开始接受只读查询。
+ * 该函数可能被每条记录调用，但大部分工作在条件不满足时快速返回。
  */
 static void
 CheckRecoveryConsistency(void)
@@ -2253,6 +2462,15 @@ CheckRecoveryConsistency(void)
 /*
  * Error context callback for errors occurring during rm_redo().
  */
+/*
+ * 中文注释：
+ * rm_redo 执行期间的 error context 回调。
+ *
+ * 当重放某条记录时报错，PostgreSQL 的错误报告机制会调用本函数追加上下文，
+ * 输出记录起始 LSN、rmgr 名称、记录类型描述以及所有 block reference 的
+ * relfilenode/fork/block 和是否带 FPI。这样 DBA 能定位是哪条 WAL 记录导致失败。
+ * 使用临时 StringInfo，输出后立即释放。
+ */
 static void
 rm_redo_error_callback(void *arg)
 {
@@ -2275,6 +2493,14 @@ rm_redo_error_callback(void *arg)
  * Returns a string describing an XLogRecord, consisting of its identity
  * optionally followed by a colon, a space, and a further description.
  */
+/*
+ * 中文注释：
+ * 把一条 WAL 记录的类型和描述追加到 StringInfo。
+ *
+ * 先从 GetRmgr 取得 rmgr 名称，再调用 rm_identify 识别具体记录类型；未知类型输出
+ * "UNKNOWN (info)"。然后调用 rm_desc 追加 rmgr 私有的详细描述。输出格式大致为
+ * "<rmgr>/<type>: <details>"，用于日志、错误上下文和 WAL_DEBUG 输出。
+ */
 void
 xlog_outdesc(StringInfo buf, XLogReaderState *record)
 {
@@ -2296,6 +2522,11 @@ xlog_outdesc(StringInfo buf, XLogReaderState *record)
 
 #ifdef WAL_DEBUG
 
+/*
+ * 中文注释：
+ * 在 WAL_DEBUG 构建中输出记录头信息：xl_prev、xl_xid、main data 长度以及所有
+ * block reference。仅用于调试日志，不影响正常运行。
+ */
 static void
 xlog_outrec(StringInfo buf, XLogReaderState *record)
 {
@@ -2313,6 +2544,14 @@ xlog_outrec(StringInfo buf, XLogReaderState *record)
 /*
  * Returns a string giving information about all the blocks in an
  * XLogRecord.
+ */
+/*
+ * 中文注释：
+ * 把所有 block reference 的信息追加到 StringInfo。
+ *
+ * 遍历 block_id 直到 XLogRecMaxBlockId，用 XLogRecGetBlockTagExtended 取得
+ * RelFileLocator/fork/block number；主 fork 省略 fork 字段，其他 fork 显示编号。
+ * 若该块带 full-page image，追加 " FPW"。用于错误上下文和调试输出。
  */
 static void
 xlog_block_info(StringInfo buf, XLogReaderState *record)
@@ -2354,6 +2593,19 @@ xlog_block_info(StringInfo buf, XLogReaderState *record)
  *
  * 'lsn' is the address of the shutdown checkpoint record we're about to
  * replay. (Currently, timeline can only change at a shutdown checkpoint).
+ */
+/*
+ * 中文注释：
+ * 校验恢复中切换到新时间线是否合法。
+ *
+ * 检查三点：
+ *   1. 记录声明的 PrevTimeLineID 必须等于当前 replayTLI，否则记录与恢复上下文
+ *      不一致；
+ *   2. newTLI 不能小于当前 TLI，且必须出现在 expectedTLEs（由时间线历史推导）
+ *      中；
+ *   3. 若尚未到达 minRecoveryPoint，不能切换到比 minRecoveryPointTLI 更新的
+ *      时间线：切换后将永远无法在正确时间线上访问 minRecoveryPoint。
+ * 任一条件不满足都 PANIC，因为继续重放会破坏时间线历史的一致性。
  */
 static void
 checkTimeLineSwitch(XLogRecPtr lsn, TimeLineID newTLI, TimeLineID prevTLI,
@@ -2404,6 +2656,14 @@ checkTimeLineSwitch(XLogRecPtr lsn, TimeLineID newTLI, TimeLineID prevTLI,
  * Currently, only transaction commit/abort records and restore points contain
  * timestamps.
  */
+/*
+ * 中文注释：
+ * 从 WAL 记录中提取时间戳。
+ *
+ * 目前只有 restore point 和事务 commit/abort（含 prepared 变体）记录带时间戳。
+ * 命中时把时间写入 *recordXtime 并返回 true；其他记录返回 false，调用者不应
+ * 使用输出值。用于 PITR 按时间停止和 recovery_min_apply_delay 计算延迟。
+ */
 static bool
 getRecordTimestamp(XLogReaderState *record, TimestampTz *recordXtime)
 {
@@ -2438,6 +2698,20 @@ getRecordTimestamp(XLogReaderState *record, TimestampTz *recordXtime)
  * unused space between pd_lower and pd_upper among other things. This
  * function should be called once WAL replay has been completed for a
  * given record.
+ */
+/*
+ * 中文注释：
+ * 校验重放后的页与 WAL 记录中的 full-page image 是否一致。
+ *
+ * 仅对带 XLR_CHECK_CONSISTENCY 且含 block reference 的记录执行。对每个块：
+ *   - 若 FPI 已经在 redo 中应用，跳过（否则等于拿记录和自己比较）；
+ *   - 以 RBM_NORMAL_NO_LOG 读取当前页并复制到 replay_image_masked，随后立即解锁；
+ *   - 若页 LSN 已超过本记录末尾（恢复被重启过），无法期望内容匹配，跳过；
+ *   - 用 RestoreBlockImage 把 WAL 中的镜像还原到 primary_image_masked；
+ *   - 若 rmgr 定义 rm_mask，对两页应用相同的掩码，忽略 hint bit、页内空洞等
+ *     允许不同的区域；
+ *   - memcmp 不一致则 FATAL，报告 relfilenode/fork/blkno。
+ * 该检查用于开发/测试期间发现 redo 逻辑或 FPI 生成错误，正常生产可关闭。
  */
 static void
 verifyBackupPageConsistency(XLogReaderState *record)
@@ -2550,6 +2824,20 @@ verifyBackupPageConsistency(XLogReaderState *record)
  * Returns true if we are stopping, false otherwise. If stopping, some
  * information is saved in recoveryStopXid et al for use in annotating the
  * new timeline's history file.
+ */
+/*
+ * 中文注释：
+ * 判断是否应在重放当前记录之前停止（exclusive recovery target）。
+ *
+ * 非归档恢复直接返回 false，崩溃恢复不受 recovery_target 影响。依次处理：
+ *   - recovery_target=immediate 且已达到一致性：立即停止；
+ *   - recovery_target_lsn 且非 inclusive：记录起始 LSN >= 目标时停止；
+ *   - 只对 RM_XACT_ID 的 commit/abort（含 prepared）记录继续判断；
+ *   - XID 目标必须用相等比较：事务按开始顺序编号而非结束顺序，不能比较大小；
+ *   - 时间目标：inclusive 时在 recordXtime > target 时停止（即停在最后一条
+ *     等于目标时间的记录之后），exclusive 时在 >= target 时停止。
+ * 停止时填充 recoveryStopXid/Time/LSN/Name 和 recoveryStopAfter，供生成时间线
+ * 历史文件注释使用。
  */
 static bool
 recoveryStopsBefore(XLogReaderState *record)
@@ -2703,6 +2991,19 @@ recoveryStopsBefore(XLogReaderState *record)
  *
  * We also track the timestamp of the latest applied COMMIT/ABORT
  * record in XLogRecoveryCtl->recoveryLastXTime.
+ */
+/*
+ * 中文注释：
+ * 判断是否应在重放当前记录之后停止（inclusive recovery target）。
+ *
+ * 与 recoveryStopsBefore 对称，但在记录应用后调用，并且还负责把最新
+ * commit/abort 的时间记录到 XLogRecoveryCtl->recoveryLastXTime。处理：
+ *   - recovery_target_name：遇到同名 restore point 停在第一条；
+ *   - recovery_target_lsn 且 inclusive：记录起始 LSN >= 目标时停止；
+ *   - XID inclusive：commit/abort 记录的 XID 等于目标时停止；
+ *   - immediate：达到一致性后停止。
+ * 停止时设置 recoveryStopAfter=true 并填充停止位置信息。prepared 事务需要先从
+ * commit/abort 记录中解析出 twophase_xid 再比较。
  */
 static bool
 recoveryStopsAfter(XLogReaderState *record)
@@ -2864,6 +3165,15 @@ recoveryStopsAfter(XLogReaderState *record)
  * Create a comment for the history file to explain why and where
  * timeline changed.
  */
+/*
+ * 中文注释：
+ * 生成时间线历史文件中的恢复停止原因字符串。
+ *
+ * 根据 recovery_target 类型和 recoveryStopAfter 描述是“在某事务/LSN/时间之前
+ * 还是之后”停止，或停在某个 restore point、达到一致性，或未指定目标。返回
+ * pstrdup 的字符串，调用者负责释放。该文本会写入新时间线的 .history 文件，
+ * 帮助后续判断分支原因。
+ */
 static char *
 getRecoveryStopReason(void)
 {
@@ -2902,6 +3212,19 @@ getRecoveryStopReason(void)
  * endOfRecovery is true if the recovery target is reached and
  * the paused state starts at the end of recovery because of
  * recovery_target_action=pause, and false otherwise.
+ */
+/*
+ * 中文注释：
+ * 在恢复暂停请求生效时阻塞 startup 进程，直到状态恢复为 RECOVERY_NOT_PAUSED。
+ *
+ * 只有热备已经激活（用户可以连接并执行 pg_wal_replay_resume）且尚未触发提升时
+ * 才真正暂停。endOfRecovery 为 true 表示因 recovery_target_action=pause 在恢复
+ * 结束时暂停，提示用户 resume 即触发提升。
+ *
+ * 循环中处理 startup 进程中断、检查提升触发、调用 ConfirmRecoveryPaused 把
+ * REQUESTED 状态确认为 PAUSED，然后在 recoveryNotPausedCV 上带 1 秒超时睡眠；
+ * 超时用于周期性重新检查退出条件，而 resume 会 broadcast 条件变量立即唤醒。
+ * 退出时取消条件变量睡眠，避免残留等待状态。
  */
 static void
 recoveryPausesHere(bool endOfRecovery)
@@ -2959,6 +3282,19 @@ recoveryPausesHere(bool endOfRecovery)
  * approach and one not affected by time synchronisation issues, but that
  * is significantly more effort and complexity for little actual gain in
  * usability.
+ */
+/*
+ * 中文注释：
+ * 实现 recovery_min_apply_delay：让备库的提交记录至少落后主库指定时间。
+ *
+ * 仅对归档恢复、已达到一致性且 recovery_min_apply_delay > 0 的场景生效；只延迟
+ * COMMIT/COMMIT_PREPARED，不延迟 ABORT（中止不影响 MVCC 可见性）。延迟基于记录
+ * 中的提交时间戳与本地当前时间之差，而不是备库收到 WAL 的时间；函数头注释解释了
+ * 这一取舍。
+ *
+ * 若尚未到时间，在 recoveryWakeupLatch 上等待差值毫秒；循环中处理中断、检查提升
+ * 触发，并重新读取 recovery_min_apply_delay（GUC 可能在等待期间被修改）。返回
+ * true 表示确实等待过。提升触发会提前结束等待。
  */
 static bool
 recoveryApplyDelay(XLogReaderState *record)
@@ -3048,6 +3384,13 @@ recoveryApplyDelay(XLogReaderState *record)
 /*
  * Get the current state of the recovery pause request.
  */
+/*
+ * 中文注释：
+ * 在 info_lck 下读取共享的 recoveryPauseState 并返回。
+ *
+ * 状态包括 NOT_PAUSED、PAUSE_REQUESTED、PAUSED。请求方设置 REQUESTED，startup
+ * 进程在安全点确认后变为 PAUSED；resume 直接置 NOT_PAUSED 并广播条件变量。
+ */
 RecoveryPauseState
 GetRecoveryPauseState(void)
 {
@@ -3067,6 +3410,16 @@ GetRecoveryPauseState(void)
  * 'pause requested' if it is not already 'paused'.  Otherwise, sets it
  * to 'not paused' to resume the recovery.  The recovery pause will be
  * confirmed by the ConfirmRecoveryPaused.
+ */
+/*
+ * 中文注释：
+ * 请求暂停或恢复 WAL 重放。
+ *
+ * recoveryPause=false 时无条件把状态置为 NOT_PAUSED 并 broadcast
+ * recoveryNotPausedCV，唤醒阻塞在 recoveryPausesHere 的 startup 进程。
+ * recoveryPause=true 时仅在当前为 NOT_PAUSED 的情况下把状态改为
+ * PAUSE_REQUESTED；若已经请求或已暂停则不重复改变。真正的“已暂停”由 startup
+ * 进程调用 ConfirmRecoveryPaused 确认。
  */
 void
 SetRecoveryPause(bool recoveryPause)
@@ -3088,6 +3441,14 @@ SetRecoveryPause(bool recoveryPause)
  * Confirm the recovery pause by setting the recovery pause state to
  * RECOVERY_PAUSED.
  */
+/*
+ * 中文注释：
+ * 由 startup 进程确认暂停请求已经生效。
+ *
+ * 在 info_lck 下把 PAUSE_REQUESTED 改为 RECOVERY_PAUSED。若用户在此期间已经
+ * resume（状态变为 NOT_PAUSED），则保持不变。该函数在 recoveryPausesHere 的
+ * 循环中反复调用，以处理“暂停-恢复-再暂停”的竞态。
+ */
 static void
 ConfirmRecoveryPaused(void)
 {
@@ -3108,6 +3469,23 @@ ConfirmRecoveryPaused(void)
  * If no valid record is available, returns NULL, or fails if emode is PANIC.
  * (emode must be either PANIC, LOG). In standby mode, retries until a valid
  * record is available.
+ */
+/*
+ * 中文注释：
+ * 通过 prefetcher 读取下一条 WAL 记录，是恢复读取路径的入口。
+ *
+ * 调用前 reader 必须已由 XLogPrefetcherBeginRead 定位。函数把 emode、
+ * fetching_ckpt、randAccess、replayTLI 等参数放入 XLogPageReadPrivate，供底层的
+ * XLogPageRead 使用，并清除 lastSourceFailed 表示这是本轮第一次尝试。
+ *
+ * 循环调用 XLogPrefetcherReadRecord：
+ *   - 读到记录后检查其页 TLI 是否在 expectedTLEs 中，不在则按损坏记录处理；
+ *   - 读不到时，若发现 WAL 末尾有不完整记录且不是归档恢复，记录
+ *     abortedRecPtr/missingContrecPtr，供恢复结束后写 OVERWRITE_CONTRECORD；
+ *   - 若尚在崩溃恢复但已请求归档恢复，且不是在取 checkpoint，则切换到归档恢复、
+ *     设置 minRecoveryPoint，并重新尝试（先从 pg_wal 读完再进归档）；
+ *   - 备库模式下循环重试，直到有记录或触发提升；否则返回 NULL。
+ * emode 只能是 PANIC 或 LOG，决定“无有效记录”时是终止还是返回 NULL。
  */
 static XLogRecord *
 ReadRecord(XLogPrefetcher *xlogprefetcher, int emode,
@@ -3277,6 +3655,25 @@ ReadRecord(XLogPrefetcher *xlogprefetcher, int emode,
  * and call XLogPageRead() again with the same arguments. This lets
  * XLogPageRead() to try fetching the record from another source, or to
  * sleep and retry.
+ */
+/*
+ * 中文注释：
+ * XLogReaderRoutine.page_read 的实现：确保目标 WAL 页可读并读入 readBuf。
+ *
+ * 这是恢复期间 I/O 的核心：
+ *   1. 若请求页不在当前打开的段中，关闭旧文件；归档恢复中若重放过久还会请求
+ *      restartpoint，避免 WAL 无限堆积；
+ *   2. 若无打开文件、或流式来源的数据尚未 flush 到目标页，调用
+ *      WaitForWALToBecomeAvailable 选择/等待来源（归档、pg_wal、流复制）；
+ *      非阻塞预取时返回 XLREAD_WOULDBLOCK；
+ *   3. 计算本页已可读的长度（流式来源可能只收到半页），pg_pread 读取整页；
+ *   4. 记录 I/O 统计和等待事件；短读/错误按损坏记录级别报告，然后关闭文件、
+ *      标记 lastSourceFailed；备库模式重试，否则返回 XLREAD_FAIL；
+ *   5. 备库模式下额外校验页头：若页是某段第一页且页头无效，立即重试其他来源，
+ *      避免读到主库已回收、本地残留的垃圾段。其他情况由 ReadPageInternal 统一
+ *      校验。
+ * 函数返回实际可用的字节数或 XLREAD_* 结果，并更新 readFile/readSource/
+ * curFileTLI 等全局状态。
  */
 static int
 XLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
@@ -3536,6 +3933,25 @@ next_record_is_invalid:
  *
  * If nonblocking is true, then give up immediately if we can't satisfy the
  * request, returning XLREAD_WOULDBLOCK instead of waiting.
+ */
+/*
+ * 中文注释：
+ * 等待并打开包含目标 WAL 位置的段文件，是恢复 WAL 来源状态机的实现。
+ *
+ * 状态机在归档（XLOG_FROM_ARCHIVE）、本地 pg_wal（XLOG_FROM_PG_WAL）和流复制
+ * （XLOG_FROM_STREAM）之间切换：
+ *   - 崩溃恢复只读 pg_wal；
+ *   - 归档恢复优先归档，再 pg_wal；
+ *   - 备库模式在两者都失败后启动/连接 walreceiver，流式等待新 WAL；
+ *   - 流失败时关闭 walreceiver，按需重新扫描时间线，然后 sleep
+ *     wal_retrieve_retry_interval 后回到归档重试。
+ * 每次失败先检查提升触发；一旦触发，仍会尽量把已收到的 WAL 重放完再退出。
+ * 非阻塞模式（prefetch readahead）遇到任何需要等待的情况立即返回
+ * XLREAD_WOULDBLOCK，由调用者稍后重试。成功打开文件返回 XLREAD_SUCCESS；
+ * 非备库且所有来源耗尽返回 XLREAD_FAIL。
+ * 函数还负责在 streaming 时设置 XLogReceiptTime、启动 walreceiver 的起始位置
+ * （fetching_ckpt 时用 RedoStartLSN）、处理 pendingWalRcvRestart，以及周期性
+ * 处理恢复暂停和 startup 进程中断。
  */
 static XLogPageReadResult
 WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
@@ -4044,6 +4460,15 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
  * you are about to ereport(), or you might cause a later message to be
  * erroneously suppressed.
  */
+/*
+ * 中文注释：
+ * 决定损坏 WAL 记录应使用的日志级别，避免对同一位置反复刷屏。
+ *
+ * 仅当当前来源是 pg_wal 且 emode 为 LOG 时做抑制：若 RecPtr 与上次抱怨的位置
+ * 相同，降为 DEBUG1；否则记录该位置并返回原级别。归档和流复制来源不应出现无效
+ * 记录，因此不抑制。函数用静态变量保存上次位置，所以只能在即将 ereport 时调用，
+ * 否则可能错误地吞掉后续真正需要报告的消息。
+ */
 static int
 emode_for_corrupt_record(int emode, XLogRecPtr RecPtr)
 {
@@ -4062,6 +4487,17 @@ emode_for_corrupt_record(int emode, XLogRecPtr RecPtr)
 
 /*
  * Subroutine to try to fetch and validate a prior checkpoint record.
+ */
+/*
+ * 中文注释：
+ * 读取并验证一个检查点记录，供启动时定位 redo 起点。
+ *
+ * 先检查 RecPtr 是否落在合法的页内偏移；然后让 prefetcher 从该位置开始读一条
+ * 记录（fetching_ckpt=true）。验证：读取成功、rmid 为 RM_XLOG_ID、info 是
+ * XLOG_CHECKPOINT_SHUTDOWN 或 ONLINE、记录总长恰好等于
+ * XLogRecord + 短数据头 + CheckPoint 结构。任一不满足只记 LOG 并返回 NULL，
+ * 由调用者决定 FATAL；成功返回记录指针，CheckPoint 数据可通过
+ * XLogRecGetData 取得。
  */
 static XLogRecord *
 ReadCheckpointRecord(XLogPrefetcher *xlogprefetcher, XLogRecPtr RecPtr,
@@ -4117,6 +4553,19 @@ ReadCheckpointRecord(XLogPrefetcher *xlogprefetcher, XLogRecPtr RecPtr,
  *
  * If there are any, the function changes recovery target TLI to the latest
  * one and returns 'true'.
+ */
+/*
+ * 中文注释：
+ * 重新扫描归档中是否出现了更新的时间线，用于 recovery_target_timeline=latest。
+ *
+ * 调用 findNewestTimeLine 找最新 TLI；没有更新直接返回 false。读取新 TLI 的
+ * 历史后检查：
+ *   - 当前 recoveryTargetTLI 必须出现在新历史中，否则新时间线不是当前系统的
+ *     后代，不能切换；
+ *   - 分叉点 currentTle->end 不能早于当前重放位置 replayLSN，否则切换后会跳过
+ *     尚未重放的历史。
+ * 校验通过后更新 recoveryTargetTLI、替换 expectedTLEs、补齐旧目标到新目标之间的
+ * 历史文件，并返回 true。replayTLI 用于错误消息，replayLSN 用于分叉点判断。
  */
 static bool
 rescanLatestTimeLine(TimeLineID replayTLI, XLogRecPtr replayLSN)
@@ -4205,6 +4654,19 @@ rescanLatestTimeLine(TimeLineID replayTLI, XLogRecPtr replayLSN)
  * If source == XLOG_FROM_ARCHIVE, the segment is retrieved from archive.
  * Otherwise, it's assumed to be already available in pg_wal.
  */
+/*
+ * 中文注释：
+ * 打开一个指定段号和时间线的 WAL 段文件用于恢复读取。
+ *
+ * source 为 XLOG_FROM_ARCHIVE 时调用 RestoreArchivedFile 执行 restore_command，
+ * 并写 PS 显示“waiting for ...”；取回后用 KeepFileRestoredFromArchive 原子地
+ * 放入 pg_wal，再从新路径打开。source 为 PG_WAL/STREAM 时直接按
+ * XLogFilePath 拼路径。
+ *
+ * 打开成功后更新 curFileTLI、readSource、XLogReceiptSource 和（非流式来源的）
+ * XLogReceiptTime，并把 PS 显示改为“recovering ...”。文件不存在且 notfoundOk
+ * 时返回 -1；其他错误 PANIC，因为恢复无法安全继续。
+ */
 static int
 XLogFileRead(XLogSegNo segno, TimeLineID tli,
 			 XLogSource source, bool notfoundOk)
@@ -4286,6 +4748,16 @@ XLogFileRead(XLogSegNo segno, TimeLineID tli,
  * Open a logfile segment for reading (during recovery).
  *
  * This version searches for the segment with any TLI listed in expectedTLEs.
+ */
+/*
+ * 中文注释：
+ * 在 expectedTLEs 列出的所有时间线中查找并打开指定段号的 WAL 段。
+ *
+ * 时间线历史按从新到旧遍历；curFileTLI 记录前一个文件的时间线，不允许倒退，
+ * 以免父时间线的同名高段号文件覆盖子时间线。若段的起始位置早于某时间线的 begin
+ * 段号，说明该段不属于这个时间线，跳过。对每个候选时间线，先按配置尝试归档，
+ * 再尝试 pg_wal；找到即返回 fd，并在首次读取历史时把临时列表保存为 expectedTLEs。
+ * 全部失败返回 -1，并只对目标时间线路径记 DEBUG2 日志。
  */
 static int
 XLogFileReadAnyTLI(XLogSegNo segno, XLogSource source)
@@ -4387,6 +4859,14 @@ XLogFileReadAnyTLI(XLogSegNo segno, XLogSource source)
  * Set flag to signal the walreceiver to restart.  (The startup process calls
  * this on noticing a relevant configuration change.)
  */
+/*
+ * 中文注释：
+ * 请求重启 walreceiver（例如 primary_conninfo 等配置改变后）。
+ *
+ * 仅当当前正在从流复制读取且 walreceiver 在运行时设置 pendingWalRcvRestart，
+ * 实际关闭/重启由 WaitForWALToBecomeAvailable 在安全点完成；这样不会打断正在
+ * 进行的页读取。非流式来源无需处理。
+ */
 void
 StartupRequestWalReceiverRestart(void)
 {
@@ -4406,6 +4886,14 @@ StartupRequestWalReceiverRestart(void)
  * Unlike CheckForStandbyTrigger(), this works in any process
  * that's connected to shared memory.
  */
+/*
+ * 中文注释：
+ * 判断是否已经触发备库提升，可在任何连接共享内存的进程中调用。
+ *
+ * 先用进程本地 LocalPromoteIsTriggered 快速返回；未置位时在 info_lck 下读取共享
+ * 的 SharedPromoteIsTriggered 并缓存到本地。提升只能触发一次，因此一旦看到 true
+ * 就无需再访问共享内存。
+ */
 bool
 PromoteIsTriggered(void)
 {
@@ -4424,6 +4912,12 @@ PromoteIsTriggered(void)
 	return LocalPromoteIsTriggered;
 }
 
+/*
+ * 中文注释：
+ * 标记提升已触发：在 info_lck 下设置共享标志，调用 SetRecoveryPause(false)
+ * 清除暂停状态（否则 pg_get_wal_replay_pause_state 可能在提升过程中仍报告
+ * paused），并设置本地缓存。该函数由检测到 promote 信号的 startup 进程调用。
+ */
 static void
 SetPromoteIsTriggered(void)
 {
@@ -4444,6 +4938,16 @@ SetPromoteIsTriggered(void)
 
 /*
  * Check whether a promote request has arrived.
+ */
+/*
+ * 中文注释：
+ * 检查是否收到提升请求，是 startup 进程轮询提升信号的核心。
+ *
+ * 先看本地标志；否则检查 IsPromoteSignaled（快速共享标志）和
+ * CheckPromoteSignal（promote 信号文件是否存在）。两者都满足时记录 LOG、删除
+ * 信号文件、清除共享标志、调用 SetPromoteIsTriggered，并返回 true。
+ * 该函数在 WAL 读取失败、等待 streaming 数据、恢复暂停循环等多处被调用，确保
+ * 用户执行 pg_promote 后能尽快退出恢复。
  */
 static bool
 CheckForStandbyTrigger(void)
@@ -4466,6 +4970,11 @@ CheckForStandbyTrigger(void)
 /*
  * Remove the files signaling a standby promotion request.
  */
+/*
+ * 中文注释：
+ * 删除 promote 信号文件，表示提升请求已被消费。unlink 失败不检查：文件可能已被
+ * 其他路径删除，或稍后由 CheckPromoteSignal 的共享标志阻止重复触发。
+ */
 void
 RemovePromoteSignalFiles(void)
 {
@@ -4474,6 +4983,11 @@ RemovePromoteSignalFiles(void)
 
 /*
  * Check to see if a promote request has arrived.
+ */
+/*
+ * 中文注释：
+ * 检查 promote 信号文件是否存在。仅做 stat，不读取内容；存在即返回 true。
+ * 该文件由 pg_promote 创建，是备库提升的外部触发方式之一。
  */
 bool
 CheckPromoteSignal(void)
@@ -4490,6 +5004,11 @@ CheckPromoteSignal(void)
  * Wake up startup process to replay newly arrived WAL, or to notice that
  * failover has been requested.
  */
+/*
+ * 中文注释：
+ * 唤醒 startup 进程的恢复闩锁，使其重新检查是否有新 WAL、提升请求或恢复暂停
+ * 状态变化。walreceiver 收到新数据、postmaster 处理信号等场景会调用。
+ */
 void
 WakeupRecovery(void)
 {
@@ -4498,6 +5017,14 @@ WakeupRecovery(void)
 
 /*
  * Schedule a walreceiver wakeup in the main recovery loop.
+ */
+/*
+ * 中文注释：
+ * 请求在主恢复循环中让 walreceiver 向上游发送一次已重放位置回复。
+ *
+ * 只设置 doRequestWalReceiverReply 标志；ApplyWalRecord 在记录重放完成后检查该
+ * 标志并调用 WalRcvRequestApplyReply。不能在任意上下文直接唤醒 walreceiver，
+ * 因为需要保证 lastReplayedEndRecPtr 已经更新到一致状态。
  */
 void
 XLogRequestWalReceiverReply(void)
@@ -4513,6 +5040,15 @@ XLogRequestWalReceiverReply(void)
  * Unlike testing standbyState, this works in any process that's connected to
  * shared memory.  (And note that standbyState alone doesn't tell the truth
  * anyway.)
+ */
+/*
+ * 中文注释：
+ * 判断热备是否已经激活，可在任何连接共享内存的进程中调用。
+ *
+ * 先用 LocalHotStandbyActive 快速返回；否则在 info_lck 下读取共享
+ * SharedHotStandbyActive 并缓存。热备一旦激活不会撤销，因此本地缓存永远有效。
+ * 普通后端在 postmaster 允许连接前不会运行，但特殊进程（如 walsender）需要此
+ * 查询来判断能否提供只读查询服务。
  */
 bool
 HotStandbyActive(void)
@@ -4539,6 +5075,13 @@ HotStandbyActive(void)
  * Like HotStandbyActive(), but to be used only in WAL replay code,
  * where we don't need to ask any other process what the state is.
  */
+/*
+ * 中文注释：
+ * 供 WAL 重放代码使用的热备状态查询。
+ *
+ * 重放代码运行在 startup 进程（或单用户模式）中，直接读本地
+ * LocalHotStandbyActive 即可，无需访问共享内存。Assert 用于确保调用上下文正确。
+ */
 static bool
 HotStandbyActiveInReplay(void)
 {
@@ -4550,6 +5093,14 @@ HotStandbyActiveInReplay(void)
  * Get latest redo apply position.
  *
  * Exported to allow WALReceiver to read the pointer directly.
+ */
+/*
+ * 中文注释：
+ * 返回最后一条已成功重放记录的结束 LSN，可选返回其 TLI。
+ *
+ * 在 info_lck 下读取 lastReplayedEndRecPtr/lastReplayedTLI，保证两个值一致。
+ * 该值表示“已经应用到数据页的 WAL 位置”，供 walreceiver 汇报、检查点判断和
+ * 等待 standby replay 的进程使用。若 replayTLI 非 NULL，写入时间线。
  */
 XLogRecPtr
 GetXLogReplayRecPtr(TimeLineID *replayTLI)
@@ -4574,6 +5125,14 @@ GetXLogReplayRecPtr(TimeLineID *replayTLI)
  * This is different from GetXLogReplayRecPtr() in that if a WAL
  * record is currently being applied, this includes that record.
  */
+/*
+ * 中文注释：
+ * 返回当前正在重放（或最后已重放）记录的结束 LSN，可选返回 TLI。
+ *
+ * 与 GetXLogReplayRecPtr 的区别：replayEndRecPtr 在记录开始重放前就更新，因此
+ * 包含“正在应用”的记录；lastReplayedEndRecPtr 只在成功完成后更新。用于需要
+ * 知道恢复已推进到哪条记录的场景，例如 minRecoveryPoint 更新和进度显示。
+ */
 XLogRecPtr
 GetCurrentReplayRecPtr(TimeLineID *replayEndTLI)
 {
@@ -4597,6 +5156,12 @@ GetCurrentReplayRecPtr(TimeLineID *replayEndTLI)
  * seen by processes other than the startup process.  Note in particular
  * that CreateRestartPoint is executed in the checkpointer.
  */
+/*
+ * 中文注释：
+ * 在 info_lck 下保存最近处理的 commit/abort 记录时间戳到共享
+ * recoveryLastXTime。该值供检查点进程（CreateRestartPoint）和其他后端读取，
+ * 用于日志中的“最后完成事务时间”以及恢复进度判断。
+ */
 static void
 SetLatestXTime(TimestampTz xtime)
 {
@@ -4607,6 +5172,11 @@ SetLatestXTime(TimestampTz xtime)
 
 /*
  * Fetch timestamp of latest processed commit/abort record.
+ */
+/*
+ * 中文注释：
+ * 在 info_lck 下读取最近 commit/abort 记录的时间戳。若尚未处理任何带时间戳的
+ * 事务记录，返回 0。恢复结束时用它输出“last completed transaction was at ...”。
  */
 TimestampTz
 GetLatestXTime(void)
@@ -4626,6 +5196,13 @@ GetLatestXTime(void)
  * We keep this in XLogRecoveryCtl, not a simple static variable, so that it can be
  * seen by all backends.
  */
+/*
+ * 中文注释：
+ * 保存当前这批流式 WAL 数据开始到达的时间到共享 currentChunkStartTime。
+ *
+ * walreceiver 每收到一批新数据时更新，用于计算备库查询的冲突宽限期：如果备库
+ * 落后，XLogReceiptTime 不前进，冲突查询获得的额外时间会相应减少。
+ */
 static void
 SetCurrentChunkStartTime(TimestampTz xtime)
 {
@@ -4637,6 +5214,11 @@ SetCurrentChunkStartTime(TimestampTz xtime)
 /*
  * Fetch timestamp of latest processed commit/abort record.
  * Startup process maintains an accurate local copy in XLogReceiptTime
+ */
+/*
+ * 中文注释：
+ * 读取当前这批 WAL 数据开始到达的时间。startup 进程本地另有一份更精确的
+ * XLogReceiptTime，此共享值供其他后端使用。
  */
 TimestampTz
 GetCurrentChunkReplayStartTime(void)
@@ -4654,6 +5236,14 @@ GetCurrentChunkReplayStartTime(void)
  * Returns time of receipt of current chunk of XLOG data, as well as
  * whether it was received from streaming replication or from archives.
  */
+/*
+ * 中文注释：
+ * 返回当前 WAL 数据的接收时间以及来源是否为流复制。
+ *
+ * 这两个值只保存在 startup 进程的本地变量中（XLogReceiptTime、
+ * XLogReceiptSource），因此必须在恢复进程中调用（Assert(InRecovery)）。热备查询
+ * 冲突检测用它判断备库落后程度。
+ */
 void
 GetXLogReceiptTime(TimestampTz *rtime, bool *fromStream)
 {
@@ -4670,6 +5260,16 @@ GetXLogReceiptTime(TimestampTz *rtime, bool *fromStream)
 /*
  * Note that text field supplied is a parameter name and does not require
  * translation
+ */
+/*
+ * 中文注释：
+ * 校验备库参数是否不低于主库，避免热备查询因资源不足而出错。
+ *
+ * currValue 是本地设置，minValue 是主库值。若 currValue < minValue：
+ *   - 热备已激活时先 WARNING 并请求暂停，给用户修改配置的机会；暂停循环中若
+ *     用户触发提升，则额外 WARNING 说明无法提升，并继续等待 resume；
+ *   - 用户 resume 后仍不满足，则 FATAL 终止恢复，提示重启并修改参数。
+ * 若热备尚未激活，直接 FATAL。param_name 是 GUC 名，不需要翻译。
  */
 void
 RecoveryRequiresIntParameter(const char *param_name, int currValue, int minValue)
@@ -4752,6 +5352,14 @@ RecoveryRequiresIntParameter(const char *param_name, int currValue, int minValue
 /*
  * GUC check_hook for primary_slot_name
  */
+/*
+ * 中文注释：
+ * primary_slot_name GUC 的 check_hook。
+ *
+ * 空值合法（表示不使用复制槽）。非空时调用
+ * ReplicationSlotValidateNameInternal 校验名称长度和字符集；失败时把返回的
+ * errcode/errdetail/errhint 转成 GUC 错误并返回 false。
+ */
 bool
 check_primary_slot_name(char **newval, void **extra, GucSource source)
 {
@@ -4776,6 +5384,15 @@ check_primary_slot_name(char **newval, void **extra, GucSource source)
 /*
  * Return the recovery target derived from the recovery_target* settings,
  * raising an error if more than one of them is set.
+ */
+/*
+ * 中文注释：
+ * 根据 recovery_target* GUC 推导唯一的恢复目标类型。
+ *
+ * 通过宏依次检查 recovery_target、recovery_target_lsn/name/time/xid；每发现一个
+ * 非空值就计数并记录类型，同时把 GUC 名拼进错误消息。若超过一个目标被设置，
+ * FATAL 并列出冲突的参数；否则返回对应类型或 RECOVERY_TARGET_UNSET。
+ * 该检查即使未请求恢复也会执行，以便尽早发现配置错误。
  */
 static RecoveryTargetType
 DetermineRecoveryTargetType(void)
@@ -4823,6 +5440,13 @@ DetermineRecoveryTargetType(void)
 /*
  * GUC check_hook for recovery_target
  */
+/*
+ * 中文注释：
+ * recovery_target GUC 的 check_hook。
+ *
+ * 只允许空字符串或 "immediate"：前者表示未设置，后者表示恢复到最早一致点。
+ * 其他值返回 false，并通过 GUC_check_errdetail 提示唯一允许值。
+ */
 bool
 check_recovery_target(char **newval, void **extra, GucSource source)
 {
@@ -4836,6 +5460,14 @@ check_recovery_target(char **newval, void **extra, GucSource source)
 
 /*
  * GUC check_hook for recovery_target_lsn
+ */
+/*
+ * 中文注释：
+ * recovery_target_lsn GUC 的 check_hook。
+ *
+ * 空值合法。非空时用 pg_lsn_in_safe 在“不抛错”模式下解析 LSN；解析失败返回
+ * false。成功后用 guc_malloc 分配 XLogRecPtr 作为 extra 数据，供 assign hook
+ * 直接取用，避免二次解析。guc_malloc 失败也返回 false。
  */
 bool
 check_recovery_target_lsn(char **newval, void **extra, GucSource source)
@@ -4862,6 +5494,14 @@ check_recovery_target_lsn(char **newval, void **extra, GucSource source)
 /*
  * GUC assign_hook for recovery_target_lsn
  */
+/*
+ * 中文注释：
+ * recovery_target_lsn GUC 的 assign_hook。
+ *
+ * 非空时把 check hook 解析好的 XLogRecPtr 写入全局 recoveryTargetLSN；空值表示
+ * 未设置，保持原值（实际不会参与目标判断）。extra 一定非 NULL，因为只有 check
+ * 成功才会调用 assign。
+ */
 void
 assign_recovery_target_lsn(const char *newval, void *extra)
 {
@@ -4871,6 +5511,14 @@ assign_recovery_target_lsn(const char *newval, void *extra)
 
 /*
  * GUC check_hook for recovery_target_name
+ */
+/*
+ * 中文注释：
+ * recovery_target_name GUC 的 check_hook。
+ *
+ * 名称直接使用字符串，只检查长度不超过 MAXFNAMELEN（含结尾 '\\0'）。超长时通过
+ * GUC_check_errdetail 报告最大允许字符数并返回 false。restore point 名称最终要
+ * 写入时间线历史文件，因此长度限制与文件名一致。
  */
 bool
 check_recovery_target_name(char **newval, void **extra, GucSource source)
@@ -4893,6 +5541,15 @@ check_recovery_target_name(char **newval, void **extra, GucSource source)
  * done before we can do the final parsing of the string.  This check function
  * only does a parsing pass to catch syntax errors, but we store the string
  * and parse it again when we need to use it.
+ */
+/*
+ * 中文注释：
+ * recovery_target_time GUC 的 check_hook。
+ *
+ * 此处只做语法校验：拒绝 now/today/tomorrow/yesterday 等相对时间（恢复目标必须
+ * 是确定的绝对时间），再用 ParseDateTime/DecodeDateTime/tm2timestamp 解析并检查
+ * 范围。真正的最终解析推迟到 validateRecoveryParameters，因为时间解释依赖
+ * TimeZone 等 GUC，必须等所有 GUC 处理完成。解析失败返回 false。
  */
 bool
 check_recovery_target_time(char **newval, void **extra, GucSource source)
@@ -4949,6 +5606,14 @@ check_recovery_target_time(char **newval, void **extra, GucSource source)
 /*
  * GUC check_hook for recovery_target_timeline
  */
+/*
+ * 中文注释：
+ * recovery_target_timeline GUC 的 check_hook。
+ *
+ * "current" 表示使用 pg_control 中的时间线，"latest" 表示沿历史找到最新时间线，
+ * 其他值按无符号整数解析为具体时间线号，要求 1..PG_UINT32_MAX。解析结果存入
+ * guc_malloc 分配的 extra，供 assign hook 使用。非法数字或越界返回 false。
+ */
 bool
 check_recovery_target_timeline(char **newval, void **extra, GucSource source)
 {
@@ -4996,6 +5661,15 @@ check_recovery_target_timeline(char **newval, void **extra, GucSource source)
 /*
  * GUC assign_hook for recovery_target_timeline
  */
+/*
+ * 中文注释：
+ * recovery_target_timeline GUC 的 assign_hook。
+ *
+ * 把 check hook 计算好的 RecoveryTargetTimeLineGoal 写入全局
+ * recoveryTargetTimeLineGoal；若为 numeric 模式，再解析字符串得到
+ * recoveryTargetTLIRequested，否则置 0。真正的合法性检查（时间线是否存在）在
+ * validateRecoveryParameters 中完成。
+ */
 void
 assign_recovery_target_timeline(const char *newval, void *extra)
 {
@@ -5008,6 +5682,15 @@ assign_recovery_target_timeline(const char *newval, void *extra)
 
 /*
  * GUC check_hook for recovery_target_xid
+ */
+/*
+ * 中文注释：
+ * recovery_target_xid GUC 的 check_hook。
+ *
+ * 空值合法。非空时先把字符串转成 uint64 再截断为 32 位 TransactionId（允许用户
+ * 输入带 epoch 的 FullTransactionId，截断即丢弃 epoch）。校验：没有多余字符、
+ * 非负、不是 ERANGE，且结果 >= FirstNormalTransactionId（特殊 XID 不能作为恢复
+ * 目标）。成功后用 guc_malloc 保存 TransactionId 到 extra。
  */
 bool
 check_recovery_target_xid(char **newval, void **extra, GucSource source)
@@ -5060,6 +5743,13 @@ check_recovery_target_xid(char **newval, void **extra, GucSource source)
 
 /*
  * GUC assign_hook for recovery_target_xid
+ */
+/*
+ * 中文注释：
+ * recovery_target_xid GUC 的 assign_hook。
+ *
+ * 非空时把 check hook 保存的 TransactionId 写入全局 recoveryTargetXid；空值表示
+ * 未设置。逻辑复制/PITR 停止判断会在 recoveryStopsBefore/After 中比较该值。
  */
 void
 assign_recovery_target_xid(const char *newval, void *extra)

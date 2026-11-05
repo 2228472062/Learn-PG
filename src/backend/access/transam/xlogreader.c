@@ -2738,6 +2738,17 @@ XLogRecGetBlockTag(XLogReaderState *record, uint8 block_id,
  * *forknum, *blknum and *prefetch_buffer are filled in (if not NULL), and
  * returns true.  Otherwise returns false.
  */
+/*
+ * 中文注释：
+ * 查询某个 block reference 的完整定位信息，并可选返回“该块可能已经在哪个
+ * prefetch buffer 中”的提示。
+ *
+ * 参数 block_id 是 WAL 记录内的逻辑块号；输出参数 rlocator/forknum/blknum 和
+ * prefetch_buffer 都可以为 NULL，调用者只取自己关心的字段。函数先通过
+ * XLogRecHasBlockRef 判断该 block_id 是否真的在记录中：不存在时返回 false，而不是
+ * 报错；存在时把解码阶段保存的字段复制出来并返回 true。prefetch_buffer 只是恢复
+ * 预取器提供的非 pin 提示，调用者不能把它当作稳定引用，仍需正常读取/校验 buffer。
+ */
 bool
 XLogRecGetBlockTagExtended(XLogReaderState *record, uint8 block_id,
 						   RelFileLocator *rlocator, ForkNumber *forknum,
@@ -2765,6 +2776,16 @@ XLogRecGetBlockTagExtended(XLogReaderState *record, uint8 block_id,
  * Returns the data associated with a block reference, or NULL if there is
  * no data (e.g. because a full-page image was taken instead). The returned
  * pointer points to a MAXALIGNed buffer.
+ */
+/*
+ * 中文注释：
+ * 取得某个 block reference 关联的 block data（rmgr 私有的 redo 数据）。
+ *
+ * 如果 block_id 越界、该块未使用，或者记录中因为采用了 full-page image 而没有
+ * 保存 block data，则返回 NULL；此时若 len 非 NULL，会把它设为 0。成功时返回指向
+ * 解码记录内部 MAXALIGN 缓冲区的指针，并把长度写入 *len。返回的指针只在当前
+ * XLogReaderState/记录生命周期内有效，调用者不应释放或长期保存。该接口是 redo
+ * 例程读取 XLogRegisterBufData 写入内容的标准方式。
  */
 char *
 XLogRecGetBlockData(XLogReaderState *record, uint8 block_id, Size *len)
@@ -2796,6 +2817,21 @@ XLogRecGetBlockData(XLogReaderState *record, uint8 block_id, Size *len)
  *
  * Returns true if a full-page image is restored, and false on failure with
  * an error to be consumed by the caller.
+ */
+/*
+ * 中文注释：
+ * 从 WAL 记录的某个 block reference 中还原 full-page image（FPI）到调用者提供的
+ * page 缓冲区。
+ *
+ * 恢复流程：
+ *   1. 校验 block_id 存在且该块确实带有镜像，否则通过 report_invalid_record 报错
+ *      并返回 false（由调用者决定是否升级为 PANIC/ERROR）；
+ *   2. 若镜像使用 PGLZ/LZ4/ZSTD 压缩，先解压到临时对齐缓冲区；如果当前构建不支持
+ *      该算法或解压失败，同样报告损坏记录；
+ *   3. 根据 hole_offset/hole_length 把镜像复制回页：没有空洞时整页复制；有空洞时
+ *      复制前半段、把空洞清零（恢复端必须得到确定的页内容）、再复制后半段。
+ * 该函数只负责生成页内容，不负责把页写入磁盘或设置页 LSN；redo 代码通常先调用
+ * XLogReadBufferForRedo 取得 buffer，再在需要时调用本函数恢复镜像。
  */
 bool
 RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
@@ -2907,6 +2943,16 @@ RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
 
 /*
  * Extract the FullTransactionId from a WAL record.
+ */
+/*
+ * 中文注释：
+ * 从 WAL 记录头中的 32 位 xl_xid 还原出 64 位 FullTransactionId。
+ *
+ * WAL 只保存 32 位 TransactionId，且可能跨越 XID 回绕。恢复时用当前共享的
+ * nextXid 作为参照，通过 FullTransactionIdFromAllowableAt() 选择与参照值最接近的
+ * epoch，从而得到唯一的 FullTransactionId。该转换依赖恢复状态中的 nextXid，因此
+ * 只能在 startup 进程或单用户模式下调用（函数用 Assert 检查）；普通后端不能用它
+ * 解释任意历史 WAL 记录，否则可能得到错误的 epoch。
  */
 FullTransactionId
 XLogRecGetFullXid(XLogReaderState *record)

@@ -99,12 +99,23 @@
 #define MULTIXACT_MEMBER_LOW_THRESHOLD		UINT64CONST(2000000000)
 #define MULTIXACT_MEMBER_HIGH_THRESHOLD		UINT64CONST(4000000000)
 
+/*
+ * 中文注释：
+ * 返回 MultiXactId 逻辑上的下一个值。MultiXactId 是无符号 32 位计数器，
+ * 到达 MaxMultiXactId 后回绕到 FirstMultiXactId；比较大小必须使用
+ * MultiXactIdPrecedes 系列函数，不能直接用整数比较。该函数只做算术，不加锁。
+ */
 static inline MultiXactId
 NextMultiXactId(MultiXactId multi)
 {
 	return multi == MaxMultiXactId ? FirstMultiXactId : multi + 1;
 }
 
+/*
+ * 中文注释：
+ * 返回 MultiXactId 逻辑上的前一个值。FirstMultiXactId 的前驱回绕为
+ * MaxMultiXactId，与 NextMultiXactId 对称。用于截断时回退一页等边界计算。
+ */
 static inline MultiXactId
 PreviousMultiXactId(MultiXactId multi)
 {
@@ -236,6 +247,15 @@ const ShmemCallbacks MultiXactShmemCallbacks = {
 	.attach_fn = MultiXactShmemAttach,
 };
 
+/*
+ * 中文注释：
+ * 返回当前普通后端在共享 OldestMemberMXactId 数组中的槽位指针。
+ *
+ * 前 MaxBackends 个槽位按 MyProcNumber 分配给普通后端；预备事务的槽位排在其后。
+ * 该值表示“当前事务可能成为其成员的最老 MultiXactId”，在事务第一次可能获取
+ * 共享行锁之前设置，事务结束时清除；它防止相关 MultiXact 在事务仍可能引用时被
+ * vacuum 截断。
+ */
 static inline MultiXactId *
 MyOldestMemberMXactIdSlot(void)
 {
@@ -248,6 +268,15 @@ MyOldestMemberMXactIdSlot(void)
 	return &OldestMemberMXactId[MyProcNumber];
 }
 
+/*
+ * 中文注释：
+ * 返回某个预备事务在 OldestMemberMXactId 数组中的槽位指针。
+ *
+ * 预备事务没有普通 PGPROC，而是使用 FIRST_PREPARED_XACT_PROC_NUMBER 之后的虚拟
+ * ProcNumber。槽位位于普通后端的 MaxBackends 个槽位之后，索引由 dummy ProcNumber
+ * 减去 FIRST_PREPARED_XACT_PROC_NUMBER 得到。这样预备事务也能阻止其可能引用的
+ * MultiXact 被截断。
+ */
 static inline MultiXactId *
 PreparedXactOldestMemberMXactIdSlot(ProcNumber procno)
 {
@@ -264,6 +293,15 @@ PreparedXactOldestMemberMXactIdSlot(ProcNumber procno)
 	return &OldestMemberMXactId[MaxBackends + prepared_xact_idx];
 }
 
+/*
+ * 中文注释：
+ * 返回当前后端在 OldestVisibleMXactId 数组中的槽位指针。
+ *
+ * 该值表示“当前事务认为可能仍然存活的最老 MultiXactId”，在第一次检查
+ * MultiXact 时计算，事务结束时清除。它保证本后端不会去访问已经被截断的 SLRU
+ * 数据。与 OldestMember 不同，预备事务没有 visible 槽位，因为预备后不再检查
+ * MultiXact。
+ */
 static inline MultiXactId *
 MyOldestVisibleMXactIdSlot(void)
 {
@@ -354,6 +392,16 @@ static void WriteMTruncateXlogRec(Oid oldestMultiDB,
  * NB - we don't worry about our local MultiXactId cache here, because that
  * is handled by the lower-level routines.
  */
+/*
+ * 中文注释：
+ * 用两个 TransactionId 及其锁状态创建一个新的 MultiXactId。
+ *
+ * 两个 XID 必须不同，或者虽然相同但请求的状态不同；相同 XID 且相同状态没有意义。
+ * 调用前必须已经调用 MultiXactIdSetOldestMember()，把当前事务可能成为成员的最老
+ * MultiXact 记录到共享槽位。函数把两个成员放入临时数组，交给
+ * MultiXactIdCreateFromMembers 完成去重、分配 ID、写 WAL 和写 SLRU。这里不检查
+ * 两个 XID 是否仍在运行，因为典型调用者刚刚检查过，重复检查代价高。
+ */
 MultiXactId
 MultiXactIdCreate(TransactionId xid1, MultiXactStatus status1,
 				  TransactionId xid2, MultiXactStatus status2)
@@ -406,6 +454,16 @@ MultiXactIdCreate(TransactionId xid1, MultiXactStatus status1,
  * Note: It is critical that MultiXactIds that come from an old cluster (i.e.
  * one upgraded by pg_upgrade from a cluster older than this feature) are not
  * passed in.
+ */
+/*
+ * 中文注释：
+ * 把一个 TransactionId 及状态加入已有的 MultiXactId，并返回新的 MultiXactId。
+ *
+ * 关键设计：绝不原地修改已有 MultiXact 的成员集合，而是读取旧成员、过滤掉已经
+ * 死亡且不再有意义的成员，再加入新成员，最后创建一个全新的 MultiXactId。这是为了
+ * 避免与正在等待旧 MultiXact 结束的代码发生竞态。若旧 MultiXact 已经没有任何成员
+ * （调用者检查后成员全部结束），则退化为创建一个单成员 MultiXact。若新 XID 已经以
+ * 相同状态存在，直接复用旧 ID。缓存由更底层的 CreateFromMembers 处理。
  */
 MultiXactId
 MultiXactIdExpand(MultiXactId multi, TransactionId xid, MultiXactStatus status)
@@ -518,6 +576,16 @@ MultiXactIdExpand(MultiXactId multi, TransactionId xid, MultiXactStatus status)
  * Caller is expected to have verified that the multixact does not come from
  * a pg_upgraded share-locked tuple.
  */
+/*
+ * 中文注释：
+ * 判断一个 MultiXactId 是否仍然“运行中”，即至少有一个成员事务尚未结束。
+ *
+ * 先查本地缓存/SLRU 取出成员；若没有成员（或来自 pg_upgrade 的旧格式）直接返回
+ * false。随后先检查成员中是否有当前事务（含子事务）的 XID，这是廉价的快速路径；
+ * 再逐个调用 TransactionIdIsInProgress 查询 ProcArray。isLockOnly 表示调用者确定
+ * 该 MultiXact 只用于加锁、不包含更新事务，此时可以跳过“太老”的成员检查并快速
+ * 返回 false。返回 false 是稳定的：MultiXact 不允许追加成员，所以不会 later 变 true。
+ */
 bool
 MultiXactIdIsRunning(MultiXactId multi, bool isLockOnly)
 {
@@ -592,6 +660,16 @@ MultiXactIdIsRunning(MultiXactId multi, bool isLockOnly)
  * The value to set is the next-to-be-assigned MultiXactId, so this is meant to
  * be called just before doing any such possibly-MultiXactId-able operation.
  */
+/*
+ * 中文注释：
+ * 在当前事务第一次可能成为 MultiXact 成员之前，记录一个安全下界。
+ *
+ * 把当前共享的 nextMXact 写入本后端的 OldestMemberMXactId 槽位。即使最终只使用
+ * 普通 XID 而不创建 MultiXact，也必须这样做：其他事务可能把我们的 XID 加入某个
+ * MultiXact，而那个 MultiXact 的 ID 一定 >= 当前 nextMXact。使用共享锁即可，因为
+ * 只需阻止别人推进 nextMXact；槽位只有本进程写、其他进程读。若已经设置过则直接
+ * 返回，避免重复加锁。
+ */
 void
 MultiXactIdSetOldestMember(void)
 {
@@ -642,6 +720,16 @@ MultiXactIdSetOldestMember(void)
  * there is no live transaction, now or later, that can be a member of any
  * MultiXactId older than the OldestVisibleMXactId we compute here.
  */
+/*
+ * 中文注释：
+ * 在当前事务第一次检查 MultiXact 时，计算并保存“可能存活的最老 MultiXactId”。
+ *
+ * 取 nextMXact 与所有后端 OldestMemberMXactId 槽位中的最小值，写入本后端的
+ * OldestVisibleMXactId。由于持有 MultiXactGenLock 排他锁，计算之后不可能再有事务
+ * 把更老的 MultiXact 设为成员下界，因此任何比该值更老的 MultiXact 都不可能仍有
+ * 活跃成员。该下界用于阻止 truncate 删除本事务仍可能读取的 SLRU 数据，也用于
+ * GetMultiXactIdMembers 的范围检查。
+ */
 static void
 MultiXactIdSetOldestVisible(void)
 {
@@ -675,6 +763,13 @@ MultiXactIdSetOldestVisible(void)
  * ReadNextMultiXactId
  *		Return the next MultiXactId to be assigned, but don't allocate it
  */
+/*
+ * 中文注释：
+ * 只读取下一个将要分配的 MultiXactId，不实际分配。
+ *
+ * 在 MultiXactGenLock 共享锁下读取共享状态，保证读到一致值。用于需要知道当前
+ * 计数器但不应推进它的场景，例如统计、检查点估算或调试。
+ */
 MultiXactId
 ReadNextMultiXactId(void)
 {
@@ -691,6 +786,13 @@ ReadNextMultiXactId(void)
 /*
  * ReadMultiXactIdRange
  *		Get the range of IDs that may still be referenced by a relation.
+ */
+/*
+ * 中文注释：
+ * 一次读取 MultiXactId 的可用范围：最老仍可能被引用的 ID 和下一个待分配 ID。
+ *
+ * 两个值在同一把共享锁下读取，避免调用者看到彼此不一致的边界。调用者可用它们
+ * 判断某个 MultiXactId 是否在合法范围内，或估算仍存活的 MultiXact 数量。
  */
 void
 ReadMultiXactIdRange(MultiXactId *oldest, MultiXactId *next)
@@ -710,6 +812,21 @@ ReadMultiXactIdRange(MultiXactId *oldest, MultiXactId *next)
  * given TransactionIds as members.  Returns the newly created MultiXactId.
  *
  * NB: the passed members[] array will be sorted in-place.
+ */
+/*
+ * 中文注释：
+ * 从给定的成员集合创建一个新的 MultiXactId，是本模块创建路径的核心。
+ *
+ * 步骤：
+ *   1. 先查本地事务级缓存，若相同成员集合已经存在则直接复用，降低 ID 消耗；
+ *   2. 校验集合中最多只有一个“更新”成员（MultiXactStatusUpdate/NoKeyUpdate），
+ *      因为一个元组不能被多个更新事务同时修改；
+ *   3. 调用 GetNewMultiXactId 分配 ID 和 members 区间，并扩展 offsets/members
+ *      SLRU（可能写零页 WAL）；
+ *   4. 写 XLOG_MULTIXACT_CREATE_ID，记录 mid、起始 offset 和全部成员；
+ *   5. 调用 RecordNewMultiXact 把成员写入 SLRU，最后结束临界区并放入本地缓存。
+ * 注意成员数组会被就地排序；该函数也用于 vacuum 冻结 MultiXact，因此不要求当前
+ * 事务已调用 MultiXactIdSetOldestMember。
  */
 MultiXactId
 MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
@@ -811,6 +928,18 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
  *
  * This is broken out of MultiXactIdCreateFromMembers so that xlog replay can
  * use it.
+ */
+/*
+ * 中文注释：
+ * 把一个新 MultiXact 的成员信息写入 offsets 和 members 两个 SLRU。
+ *
+ * offsets SLRU 为每个 MultiXactId 保存其成员数组的起始偏移；本函数既要写入当前
+ * MultiXact 的起始 offset，也要把“下一个 MultiXact”的起始 offset 设为当前成员
+ * 区间末尾（并跳过 0，因为 0 表示无效）。当两个 ID 落在不同 offset 页时，需要
+ * 切换到下一页并换 bank 锁。随后逐个成员写入 members SLRU：成员 XID 与 2-bit
+ * 状态标志分开存储，可能跨页、跨 bank；代码在页变化时释放旧 bank 锁、获取新锁。
+ * 函数由创建路径和 WAL 重放共用，因此必须幂等：若目标位置已经是期望值则不动，
+ * 否则要求原值为 0 再写入并标脏。
  */
 static void
 RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset,
@@ -974,6 +1103,22 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset,
  *
  * We start a critical section before advancing the shared counters.  The
  * caller must end the critical section after writing SLRU data.
+ */
+/*
+ * 中文注释：
+ * 分配下一个 MultiXactId，并在 members 空间预留 nmembers 个槽位。
+ *
+ * 在 MultiXactGenLock 排他锁下读取 nextMXact，并检查回卷保护阈值：
+ *   - 超过 multiVacLimit 或成员空间阈值：触发 autovacuum；
+ *   - 超过 multiWarnLimit：发出 WARNING；
+ *   - 超过 multiStopLimit：拒绝分配并 ERROR，避免 MultiXact 回卷导致数据丢失。
+ * 为避免在持有锁时做 get_database_name 等可能阻塞的操作，必要时先释放锁、发信号/
+ * 告警，再重新加锁读取最新值。
+ *
+ * 随后调用 ExtendMultiXactOffset/ExtendMultiXactMember 确保 SLRU 有空间（可能写
+ * XLOG_MULTIXACT_ZERO_*_PAGE 记录），预留 offset，然后进入临界区推进 nextMXact 和
+ * nextOffset。临界区要持续到调用者把成员数据真正写入 SLRU，否则崩溃可能留下
+ * “ID 已推进但成员未写”的半成品。
  */
 static MultiXactId
 GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
@@ -1167,6 +1312,20 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
  * is used only to lock tuples; can be false without loss of correctness,
  * but passing a true means we can return quickly without checking for
  * old updates.
+ */
+/*
+ * 中文注释：
+ * 取出一个 MultiXactId 的全部成员（XID + 状态标志）。
+ *
+ * 返回成员数量；若 MultiXact 无效、来自 pg_upgrade 旧格式或已无成员，返回 -1 并
+ * 把 *members 置 NULL。成功时分配新数组，调用者负责 pfree。
+ *
+ * 流程：先查本地缓存；必要时设置 OldestVisible 下界；在 MultiXactGenLock 下读取
+ * oldestMultiXactId/nextMXact 做范围检查（过老说明已被截断，过新说明发生回卷，
+ * 都是严重错误）；然后从 offsets SLRU 读取本 MultiXact 的起始 offset，以及下一个
+ * MultiXact 的起始 offset，两者之差就是成员数量；最后按偏移读取 members SLRU 中的
+ * XID 和状态位，并把结果放入缓存。isLockOnly 允许对“只用于加锁”的过老 MultiXact
+ * 快速返回 -1，因为这种 MultiXact 不可能还有更新成员需要解析。
  */
 int
 GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members,
@@ -1405,6 +1564,14 @@ GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members,
  * We can't use wraparound comparison for XIDs because that does not respect
  * the triangle inequality!  Any old sort order will do.
  */
+/*
+ * 中文注释：
+ * qsort 使用的 MultiXactMember 比较函数：先按 XID 数值升序，再按状态数值升序。
+ *
+ * 这里刻意不使用 TransactionIdPrecedes 的回绕比较，因为回绕比较不满足三角形
+ * 不等式，不能作为全序排序的判据；缓存去重只需要一个稳定、确定的排序即可。状态
+ * 的高位在写入时已清零，因此可以直接比较整个结构。
+ */
 static int
 mxactMemberComparator(const void *arg1, const void *arg2)
 {
@@ -1434,6 +1601,16 @@ mxactMemberComparator(const void *arg1, const void *arg2)
  * both I/O and wraparound issues).
  *
  * NB: the passed members array will be sorted in-place.
+ */
+/*
+ * 中文注释：
+ * 按“成员集合”在事务级缓存中查找已有的 MultiXactId，找不到返回
+ * InvalidMultiXactId。
+ *
+ * 先把传入成员数组排序，使比较不受顺序影响；然后线性扫描缓存，先比较成员数量，
+ * 再用 memcmp 比较整个数组。命中时把该缓存项移到链表头部（近似 LRU），返回其 ID。
+ * 该缓存能显著减少同一组事务反复锁同一批元组时产生的重复 MultiXact，从而降低
+ * SLRU I/O 和回卷压力。
  */
 static MultiXactId
 mXactCacheGetBySet(int nmembers, MultiXactMember *members)
@@ -1477,6 +1654,14 @@ mXactCacheGetBySet(int nmembers, MultiXactMember *members)
  *
  * If successful, *xids is set to the address of a palloc'd copy of the
  * MultiXactMember set.  Return value is number of members, or -1 on failure.
+ */
+/*
+ * 中文注释：
+ * 按 MultiXactId 在事务级缓存中查找成员集合。
+ *
+ * 命中时分配一份成员数组副本交给调用者（调用者负责释放），把缓存项移到链表头，
+ * 返回成员数量；未命中返回 -1。缓存只保存当前事务期间创建的/读取过的 MultiXact，
+ * 事务结束随内存上下文一起销毁。
  */
 static int
 mXactCacheGetById(MultiXactId multi, MultiXactMember **members)
@@ -1525,6 +1710,15 @@ mXactCacheGetById(MultiXactId multi, MultiXactMember **members)
  * mXactCachePut
  *		Add a new MultiXactId and its composing set into the local cache.
  */
+/*
+ * 中文注释：
+ * 把一个 MultiXactId 及其成员集合加入事务级缓存。
+ *
+ * 缓存项分配在 MXactContext（TopTransactionContext 的子上下文）中，事务结束自动
+ * 释放。成员数组会先排序，以满足 mXactCacheGetBySet 的 memcmp 前提。新项插入链表
+ * 头部；当缓存超过 MAX_CACHE_ENTRIES（256）时，从尾部淘汰最久未使用的项并 pfree。
+ * 该上限防止一个长事务缓存无限增长。
+ */
 static void
 mXactCachePut(MultiXactId multi, int nmembers, MultiXactMember *members)
 {
@@ -1570,6 +1764,13 @@ mXactCachePut(MultiXactId multi, int nmembers, MultiXactMember *members)
 	}
 }
 
+/*
+ * 中文注释：
+ * 把 MultiXactStatus 枚举转换成简短的调试字符串（如 keysh、sh、upd）。
+ *
+ * 仅用于 DEBUG 日志和错误信息，不参与持久化格式；未知状态直接 ERROR，帮助尽早
+ * 发现枚举与实现不一致。
+ */
 char *
 mxstatus_to_string(MultiXactStatus status)
 {
@@ -1593,6 +1794,14 @@ mxstatus_to_string(MultiXactStatus status)
 	}
 }
 
+/*
+ * 中文注释：
+ * 把 MultiXactId 及其成员格式化成可读字符串，供 DEBUG 日志使用。
+ *
+ * 使用 TopMemoryContext 中的静态缓冲区保存结果：每次调用先释放上一次的字符串，
+ * 再构建新字符串。因此返回值不能被长期保存，也不能在多次调用之间同时使用；它只
+ * 适合立即传给 elog/ereport。格式为 "mid n[xid (status), ...]"。
+ */
 char *
 mxid_to_string(MultiXactId multi, int nmembers, MultiXactMember *members)
 {
@@ -1624,6 +1833,15 @@ mxid_to_string(MultiXactId multi, int nmembers, MultiXactMember *members)
  *
  * This is called at top transaction commit or abort (we don't care which).
  */
+/*
+ * 中文注释：
+ * 顶层事务提交或中止时的 MultiXact 清理。
+ *
+ * 清除本后端的 OldestMemberMXactId 和 OldestVisibleMXactId 槽位，使 vacuum 不再
+ * 受本事务约束；这两个值只在事务内有效，且写入是原子的，因此无需加
+ * MultiXactGenLock。随后丢弃事务级缓存：MXactContext 是 TopTransactionContext 的
+ * 子上下文，会随事务上下文销毁，这里只需把指针置 NULL 并重新初始化链表。
+ */
 void
 AtEOXact_MultiXact(void)
 {
@@ -1652,6 +1870,14 @@ AtEOXact_MultiXact(void)
  * In this phase, we only store our OldestMemberMXactId value in the two-phase
  * state file.
  */
+/*
+ * 中文注释：
+ * PREPARE TRANSACTION 阶段保存 MultiXact 相关状态。
+ *
+ * 若当前事务有有效的 OldestMemberMXactId，就通过 RegisterTwoPhaseRecord 把它写入
+ * 两阶段状态文件（资源管理器 ID 为 TWOPHASE_RM_MULTIXACT_ID）。恢复/COMMIT
+ * PREPARED 时需要这个下界，防止预备事务仍可能引用的 MultiXact 被截断。
+ */
 void
 AtPrepare_MultiXact(void)
 {
@@ -1665,6 +1891,16 @@ AtPrepare_MultiXact(void)
 /*
  * PostPrepare_MultiXact
  *		Clean up after successful PREPARE TRANSACTION
+ */
+/*
+ * 中文注释：
+ * PREPARE TRANSACTION 成功后的 MultiXact 清理与状态转移。
+ *
+ * 把当前后端的 OldestMemberMXactId 转移到该预备事务专用的槽位（由
+ * TwoPhaseGetDummyProcNumber 得到虚拟 ProcNumber），然后清空普通后端槽位。虽然
+ * 单个 MultiXactId 的存储是原子的，这里仍用排他锁保证其他进程不会只看到“普通槽位
+ * 已清空、预备槽位尚未设置”的中间状态。OldestVisible 不需要转移，因为预备事务
+ * 不会再检查 MultiXact；最后像事务结束一样丢弃本地缓存。
  */
 void
 PostPrepare_MultiXact(FullTransactionId fxid)
@@ -1715,6 +1951,14 @@ PostPrepare_MultiXact(FullTransactionId fxid)
  * multixact_twophase_recover
  *		Recover the state of a prepared transaction at startup
  */
+/*
+ * 中文注释：
+ * 崩溃恢复时重建一个预备事务的 MultiXact 状态。
+ *
+ * 两阶段状态文件中的记录只包含 OldestMemberMXactId。函数根据 FullTransactionId
+ * 找到预备事务的虚拟 ProcNumber，把该值写入对应的 OldestMember 槽位，从而在恢复
+ * 期间继续保护相关 MultiXact 不被截断。记录长度必须正好是一个 MultiXactId。
+ */
 void
 multixact_twophase_recover(FullTransactionId fxid, uint16 info,
 						   void *recdata, uint32 len)
@@ -1736,6 +1980,14 @@ multixact_twophase_recover(FullTransactionId fxid, uint16 info,
  * multixact_twophase_postcommit
  *		Similar to AtEOXact_MultiXact but for COMMIT PREPARED
  */
+/*
+ * 中文注释：
+ * COMMIT PREPARED 完成后清除该预备事务的 OldestMember 槽位。
+ *
+ * 事务已经提交，不再可能成为新的 MultiXact 成员，因此释放这个保护下界。使用
+ * TwoPhaseGetDummyProcNumber(fxid, true) 取得仍存在的虚拟 ProcNumber；记录内容
+ * 只用于长度校验，实际不需要读取。
+ */
 void
 multixact_twophase_postcommit(FullTransactionId fxid, uint16 info,
 							  void *recdata, uint32 len)
@@ -1751,6 +2003,11 @@ multixact_twophase_postcommit(FullTransactionId fxid, uint16 info,
  * multixact_twophase_postabort
  *		This is actually just the same as the COMMIT case.
  */
+/*
+ * 中文注释：
+ * ROLLBACK PREPARED 后的清理，与 COMMIT PREPARED 完全相同：清除预备事务的
+ * OldestMember 槽位。直接复用 multixact_twophase_postcommit 以避免两份逻辑漂移。
+ */
 void
 multixact_twophase_postabort(FullTransactionId fxid, uint16 info,
 							 void *recdata, uint32 len)
@@ -1761,6 +2018,17 @@ multixact_twophase_postabort(FullTransactionId fxid, uint16 info,
 
 /*
  * Register shared memory needs for MultiXact.
+ */
+/*
+ * 中文注释：
+ * 向共享内存框架登记 MultiXact 所需的共享状态和两个 SLRU。
+ *
+ * 共享状态是一块连续内存：MultiXactStateData 固定部分，后面紧跟
+ * OldestMemberMXactId[NumMemberSlots] 和 OldestVisibleMXactId[NumVisibleSlots]
+ * 两个柔性数组。两个 SLRU 分别是：
+ *   - pg_multixact/offsets：每个 MultiXactId 的成员起始偏移，32 位段号命名；
+ *   - pg_multixact/members：成员 XID 与状态位，64 位段号命名。
+ * 这里还登记各自的 buffer 数量、同步处理器、页优先级回调和 I/O 错误详情回调。
  */
 static void
 MultiXactShmemRequest(void *arg)
@@ -1813,6 +2081,15 @@ MultiXactShmemRequest(void *arg)
 		);
 }
 
+/*
+ * 中文注释：
+ * 初始化 MultiXact 的共享内存布局。
+ *
+ * 对 offsets SLRU 运行 PagePrecedes 单元测试，验证其 32 位回绕比较正确；members
+ * SLRU 不使用 SimpleLruTruncate 的通用页优先级测试，因此跳过。随后把
+ * OldestMemberMXactId 指向共享结构尾部，OldestVisibleMXactId 指向其后再偏移
+ * NumMemberSlots 个元素的位置。该函数在 postmaster 初始化共享内存时调用一次。
+ */
 static void
 MultiXactShmemInit(void *arg)
 {
@@ -1828,6 +2105,13 @@ MultiXactShmemInit(void *arg)
 	OldestVisibleMXactId = OldestMemberMXactId + NumMemberSlots;
 }
 
+/*
+ * 中文注释：
+ * 在 EXEC_BACKEND 等“重新挂接共享内存”的场景中恢复两个全局数组指针。
+ *
+ * MultiXactState 由 shmem 框架回填后，其后的柔性数组地址需要重新计算；
+ * 逻辑与 MultiXactShmemInit 中的指针设置相同，但不重复做单元测试或初始化。
+ */
 static void
 MultiXactShmemAttach(void *arg)
 {
@@ -1839,6 +2123,13 @@ MultiXactShmemAttach(void *arg)
 /*
  * GUC check_hook for multixact_offset_buffers
  */
+/*
+ * 中文注释：
+ * multixact_offset_buffers GUC 的 check_hook。
+ *
+ * 直接委托给通用的 check_slru_buffers，校验取值在允许范围内并与页面大小/共享内存
+ * 限制兼容。具体 SLRU 不需要重复实现通用检查逻辑。
+ */
 bool
 check_multixact_offset_buffers(int *newval, void **extra, GucSource source)
 {
@@ -1847,6 +2138,11 @@ check_multixact_offset_buffers(int *newval, void **extra, GucSource source)
 
 /*
  * GUC check_hook for multixact_member_buffers
+ */
+/*
+ * 中文注释：
+ * multixact_member_buffers GUC 的 check_hook，委托给 check_slru_buffers 做通用
+ * SLRU buffer 数量校验。
  */
 bool
 check_multixact_member_buffers(int *newval, void **extra, GucSource source)
@@ -1858,6 +2154,14 @@ check_multixact_member_buffers(int *newval, void **extra, GucSource source)
  * This func must be called ONCE on system install.  It creates the initial
  * MultiXact segments.  (The MultiXacts directories are assumed to have been
  * created by initdb, and MultiXactShmemInit must have been called already.)
+ */
+/*
+ * 中文注释：
+ * initdb 安装集簇时创建 MultiXact 的初始段文件。
+ *
+ * 对 offsets 和 members 两个 SLRU 的第 0 页执行“清零并写盘”，确保后续启动时
+ * 文件存在且内容确定。目录本身由 initdb 预先创建；共享内存已由
+ * MultiXactShmemInit 初始化。
  */
 void
 BootStrapMultiXact(void)
@@ -1874,6 +2178,14 @@ BootStrapMultiXact(void)
  * MultiXactSetNextMXact and/or MultiXactAdvanceNextMXact, and the oldestMulti
  * info from pg_control and/or MultiXactAdvanceOldest, but we haven't yet
  * replayed WAL.
+ */
+/*
+ * 中文注释：
+ * postmaster 或单用户模式启动时初始化 MultiXact SLRU 的“最新页”提示。
+ *
+ * StartupXLOG 已经通过检查点记录或 WAL 重放设置了 nextMXact/nextOffset，本函数
+ * 据此计算 offsets 和 members 各自的最新页号并写入 SLRU 共享状态。latest_page_number
+ * 用于淘汰时保护正在增长的页，避免把最新页当作 LRU 受害者。
  */
 void
 StartupMultiXact(void)
@@ -1899,6 +2211,21 @@ StartupMultiXact(void)
 
 /*
  * This must be called ONCE at the end of startup/recovery.
+ */
+/*
+ * 中文注释：
+ * 启动/恢复结束时对 MultiXact 做一次“修剪”，为正常运行建立一致边界。
+ *
+ * 主要工作：
+ *   1. 读取 nextMXact/nextOffset/oldest 信息；
+ *   2. 重设两个 SLRU 的 latest_page_number；
+ *   3. 在 offsets 页中写入 nextMXact 的起始 offset，并把该位置之后的旧数据清零，
+ *      防止 pg_resetwal 等场景留下过期的非零 offset；
+ *   4. 对 members 当前页从当前 offset 到页尾清零，避免旧成员数据被误读；
+ *   5. 置 finishedStartup = true，表示数据目录已一致；
+ *   6. 调用 SetMultiXactIdLimit 重新计算回卷保护阈值和 oldestOffset。
+ * 之所以要清零，是因为 MultiXact 不像 CLOG 那样严格遵循“先写 WAL 再写数据”，
+ * 某些旧数据可能没有对应的 WAL 证据。
  */
 void
 TrimMultiXact(void)
@@ -2013,6 +2340,14 @@ TrimMultiXact(void)
 /*
  * Get the MultiXact data to save in a checkpoint record
  */
+/*
+ * 中文注释：
+ * 读取写入检查点记录所需的 MultiXact 状态快照。
+ *
+ * 在共享锁下复制 nextMXact、nextOffset、oldestMultiXactId 和 oldestMultiXactDB，
+ * 保证四个值来自同一一致状态。检查点恢复时用这些值重建计数器下界；is_shutdown
+ * 参数目前仅用于区分调用场景，不改变取值。
+ */
 void
 MultiXactGetCheckptMulti(bool is_shutdown,
 						 MultiXactId *nextMulti,
@@ -2034,6 +2369,15 @@ MultiXactGetCheckptMulti(bool is_shutdown,
 
 /*
  * Perform a checkpoint --- either during shutdown, or on-the-fly
+ */
+/*
+ * 中文注释：
+ * 检查点或关闭时把两个 MultiXact SLRU 的所有脏页写回磁盘。
+ *
+ * 调用 SimpleLruWriteAll 分别处理 offsets 和 members；写回可能把 fsync 请求排入
+ * checkpointer 的同步队列，由 ProcessSyncRequests 统一完成。允许页面在写回期间
+ * 被重新弄脏（allow_redirtied=true），因为检查点不要求 MultiXact 页在那一刻完全
+ * 干净，只要相关 WAL 已持久化即可。
  */
 void
 CheckPointMultiXact(void)
@@ -2059,6 +2403,14 @@ CheckPointMultiXact(void)
  * and XLog replay, we take the lock in case any hot-standby backends are
  * examining the values.
  */
+/*
+ * 中文注释：
+ * 根据检查点记录或 bootstrap 信息，精确设置 nextMXact 和 nextOffset。
+ *
+ * 与 MultiXactAdvanceNextMXact 的“只增不减”不同，本函数允许直接赋值，用于恢复
+ * 到一个已知的精确起点。虽然主要在启动/重放中调用，仍获取排他锁，以防热备后端
+ * 同时读取这些计数器。
+ */
 void
 MultiXactSetNextMXact(MultiXactId nextMulti,
 					  MultiXactOffset nextMultiOffset)
@@ -2080,6 +2432,19 @@ MultiXactSetNextMXact(MultiXactId nextMulti,
  *
  * This also updates MultiXactState->oldestOffset, by looking up the offset of
  * MultiXactState->oldestMultiXactId.
+ */
+/*
+ * 中文注释：
+ * 根据全集群最老的 datminmxid 重新计算 MultiXact 回卷保护阈值。
+ *
+ * 以 oldest_datminmxid 为基准，把“回卷点”设为 ID 空间的一半处，然后计算：
+ *   - multiVacLimit：超过后触发 autovacuum（oldest + autovacuum_multixact_freeze_max_age）；
+ *   - multiWarnLimit：回卷点前 1 亿个 ID，开始 WARNING；
+ *   - multiStopLimit：回卷点前 300 万个 ID，拒绝分配新 MultiXact；
+ *   - multiWrapLimit：理论回卷点。
+ * 更新共享状态后，如果已经完成启动（finishedStartup），还会计算 oldestOffset，
+ * 并在超过 vac/warn 阈值时触发 autovacuum 或发出告警。告警需要数据库名，但本函数
+ * 可能在非事务上下文中调用，因此只有在 IsTransactionState() 时才查系统表。
  */
 void
 SetMultiXactIdLimit(MultiXactId oldest_datminmxid, Oid oldest_datoid)
@@ -2235,6 +2600,14 @@ SetMultiXactIdLimit(MultiXactId oldest_datminmxid, Oid oldest_datoid)
  * Although this is only called during XLog replay, we take the lock in case
  * any hot-standby backends are examining the values.
  */
+/*
+ * 中文注释：
+ * 在 WAL 重放中把 nextMXact/nextOffset 单调推进到至少给定值。
+ *
+ * 重放可能乱序或重复看到创建记录，因此不能直接赋值，只能取较大值；比较
+ * MultiXactId 时必须用 MultiXactIdPrecedes 处理回绕。持有排他锁是因为热备后端
+ * 可能同时读取这些计数器。
+ */
 void
 MultiXactAdvanceNextMXact(MultiXactId minMulti,
 						  MultiXactOffset minMultiOffset)
@@ -2262,6 +2635,13 @@ MultiXactAdvanceNextMXact(MultiXactId minMulti,
  *
  * This may only be called during WAL replay.
  */
+/*
+ * 中文注释：
+ * WAL 重放期间推进 oldestMultiXactId。
+ *
+ * 只有当重放记录中的 oldestMulti 比当前值更新时才调用 SetMultiXactIdLimit，
+ * 从而更新回卷阈值和 oldestOffset。该函数只允许在恢复期间调用（Assert(InRecovery)）。
+ */
 void
 MultiXactAdvanceOldest(MultiXactId oldestMulti, Oid oldestMultiDB)
 {
@@ -2278,6 +2658,16 @@ MultiXactAdvanceOldest(MultiXactId oldestMulti, Oid oldestMultiDB)
  * fast most of the time; even when it's not so fast, no actual I/O need
  * happen unless we're forced to write out a dirty log or xlog page to make
  * room in shared memory.
+ */
+/*
+ * 中文注释：
+ * 确保 offsets SLRU 有空间容纳新分配的 MultiXactId。
+ *
+ * 只有当新 ID 是某个 offsets 页的第一个条目（或回绕后的 FirstMultiXactId）时才
+ * 需要动作：在对应 bank 锁下清零该页，并写一条
+ * XLOG_MULTIXACT_ZERO_OFF_PAGE WAL 记录，告诉恢复端“这页被重新初始化”。
+ * 调用者持有 MultiXactGenLock，因此多个后端不会并发扩展同一个计数器；但 SLRU
+ * 页本身仍需自己的 bank 锁。大多数调用会在第一条判断处快速返回。
  */
 static void
 ExtendMultiXactOffset(MultiXactId multi)
@@ -2312,6 +2702,16 @@ ExtendMultiXactOffset(MultiXactId multi)
  *
  * Like the above routine, this is called while holding MultiXactGenLock;
  * same comments apply.
+ */
+/*
+ * 中文注释：
+ * 确保 members SLRU 有足够空间容纳新 MultiXact 的 nmembers 个成员。
+ *
+ * 成员可能跨多个页，因此循环处理：每当 offset 位于某页的第一个条目（flags 偏移和
+ * 位偏移都为 0）时，在对应 bank 锁下清零该页并写
+ * XLOG_MULTIXACT_ZERO_MEM_PAGE WAL 记录；然后计算当前页剩余槽位，推进 offset 并
+ * 减少 nmembers。调用者持有 MultiXactGenLock；与 offsets 扩展一样，正常路径只在
+ * 跨页时产生工作。
  */
 static void
 ExtendMultiXactMember(MultiXactOffset offset, int nmembers)
@@ -2374,6 +2774,16 @@ ExtendMultiXactMember(MultiXactOffset offset, int nmembers)
  * that VACUUM knows has no remaining MXIDs < the same value.  It is only safe
  * to truncate SLRUs when no table can possibly still have a referencing MXID.
  */
+/*
+ * 中文注释：
+ * 返回所有活跃事务仍可能看到的最老 MultiXactId。
+ *
+ * 取 nextMXact 与所有 OldestMemberMXactId、OldestVisibleMXactId 槽位中的最小值。
+ * 该值适合作为表的 relminmxid 下界（VACUUM 可据此判断元组中的 MultiXact 是否已
+ * 死亡），但不能直接作为 SLRU 截断点：截断还要求没有任何表可能引用更老的
+ * MultiXact，通常由 pg_class.relminmxid -> pg_database.datminmxid -> pg_control
+ * 的全局最小值决定。
+ */
 MultiXactId
 GetOldestMultiXactId(void)
 {
@@ -2412,6 +2822,19 @@ GetOldestMultiXactId(void)
 /*
  * Calculate the oldest member offset and install it in MultiXactState, where
  * it can be used to adjust multixid freezing cutoffs.
+ */
+/*
+ * 中文注释：
+ * 计算并安装“最老仍可能被引用的成员偏移”（oldestOffset）。
+ *
+ * oldestOffset 用于限制 members SLRU 的磁盘占用：即使 MultiXactId 数量还不多，
+ * 若每个 MultiXact 成员很多，也可能积累大量成员数据。
+ *
+ * 计算时需要防止并发截断，因此先拿 MultiXactTruncationLock 共享锁；然后读取
+ * oldestMultiXactId/nextMXact/nextOffset。若 oldest == next，说明当前没有任何
+ * MultiXact，下一个创建将使用 nextOffset；否则调用 find_multixact_start 查其起始
+ * 偏移。若查不到（历史 bug 或数据不一致），保持旧值并禁用成员截断，避免误删。
+ * 最后在排他锁下更新 MultiXactState->oldestOffset。
  */
 static void
 SetOldestOffset(void)
@@ -2499,6 +2922,15 @@ SetOldestOffset(void)
  * This function does not prevent concurrent truncation, so if that's
  * required, the caller has to protect against that.
  */
+/*
+ * 中文注释：
+ * 查找指定 MultiXactId 的成员起始偏移。
+ *
+ * 先把两个 SLRU 的脏页写回，确保 SimpleLruDoesPhysicalPageExist 能看到真实文件
+ * 状态；若 offsets 页不存在则返回 false。然后用只读方式读取对应 offset 页并取出
+ * 条目。函数本身不防止并发截断，调用者若需要保护必须自己持有
+ * MultiXactTruncationLock。
+ */
 static bool
 find_multixact_start(MultiXactId multi, MultiXactOffset *result)
 {
@@ -2541,6 +2973,15 @@ find_multixact_start(MultiXactId multi, MultiXactOffset *result)
  * nextOffset: Next-to-be-assigned offset
  * oldestMultiXactId: Oldest MultiXact ID still in use
  * oldestOffset: Oldest offset still in use
+ */
+/*
+ * 中文注释：
+ * 一次性读取 MultiXact 的统计信息：存活 MultiXact 数量、下一个 offset、最老
+ * MultiXactId 和最老 offset。
+ *
+ * 在 MultiXactGenLock 共享锁下复制字段，保证一致性；multixacts 由 nextMXact 减去
+ * oldestMultiXactId 得到，按 32 位无符号差值计算。该接口供 SQL 统计函数和
+ * MultiXactMemberFreezeThreshold 使用。
  */
 void
 GetMultiXactInfo(uint32 *multixacts, MultiXactOffset *nextOffset,
@@ -2585,6 +3026,17 @@ GetMultiXactInfo(uint32 *multixacts, MultiXactOffset *nextOffset,
  * when the members usage reaches MULTIXACT_MEMBER_HIGH_THRESHOLD, we clamp
  * freeze_max_age to zero, and every vacuum of any table will freeze every
  * multixact.
+ */
+/*
+ * 中文注释：
+ * 根据 members 空间使用量动态调整“多激进地冻结 MultiXact”。
+ *
+ * 正常情况下返回 autovacuum_multixact_freeze_max_age。当已用成员空间超过
+ * MULTIXACT_MEMBER_LOW_THRESHOLD 后，按线性比例降低有效 freeze age：空间越接近
+ * HIGH_THRESHOLD，返回值越接近 0；超过 HIGH 后直接返回 0，使每次 VACUUM 都尽量
+ * 冻结所有 MultiXact。这样即使 MultiXact 数量不多，只要单个 MultiXact 成员很多，
+ * 也能通过更积极的 vacuum 推进 relminmxid、释放成员空间，避免磁盘无限增长。
+ * 返回值不会大于配置的 autovacuum_multixact_freeze_max_age。
  */
 int
 MultiXactMemberFreezeThreshold(void)
@@ -2639,6 +3091,13 @@ MultiXactMemberFreezeThreshold(void)
 /*
  * Delete members segments older than newOldestOffset
  */
+/*
+ * 中文注释：
+ * 删除 members SLRU 中 newOldestOffset 之前的段。
+ *
+ * 把成员偏移换算成 members 页号，再交给通用的 SimpleLruTruncate。调用者必须已经
+ * 持有 MultiXactTruncationLock，并确保没有事务仍需要这些成员。
+ */
 static void
 PerformMembersTruncation(MultiXactOffset newOldestOffset)
 {
@@ -2648,6 +3107,14 @@ PerformMembersTruncation(MultiXactOffset newOldestOffset)
 
 /*
  * Delete offsets segments older than newOldestMulti
+ */
+/*
+ * 中文注释：
+ * 删除 offsets SLRU 中 newOldestMulti 之前的段。
+ *
+ * 这里先取 PreviousMultiXactId 再换算页号：若 oldestMulti 恰好是某页第一项且等于
+ * nextMulti，直接用它做 cutoff 可能触发 SimpleLruTruncate 的“回绕”安全检查，
+ * 导致截断被拒绝；回退一个 ID 可以避免这个边界问题。
  */
 static void
 PerformOffsetsTruncation(MultiXactId newOldestMulti)
@@ -2673,6 +3140,23 @@ PerformOffsetsTruncation(MultiXactId newOldestMulti)
  *
  * newOldestMulti is the oldest currently required multixact, newOldestMultiDB
  * is one of the databases preventing newOldestMulti from increasing.
+ */
+/*
+ * 中文注释：
+ * 按 VACUUM 计算出的新下界截断 MultiXact 的 offsets 和 members SLRU。
+ *
+ * 只在主库调用；备库通过重放这里写的 XLOG_MULTIXACT_TRUNCATE_ID 记录完成截断。
+ *
+ * 流程：
+ *   1. 获取 MultiXactTruncationLock 排他锁，保证同一时刻只有一个截断；
+ *   2. 读取 next/oldest 状态，如果新下界没有前进则直接返回；
+ *   3. 计算 newOldestOffset：若没有 MultiXact 则用 nextOffset，否则查
+ *      newOldestMulti 的起始偏移；查不到或偏移为 0 时记录 LOG 并跳过，等待下次；
+ *   4. 进入临界区，设置 DELAY_CHKPT_START 阻止检查点并发，写并 flush
+ *      XLOG_MULTIXACT_TRUNCATE_ID（必须在删除文件前持久化）；
+ *   5. 更新共享 oldestMulti/oldestOffset（必须在截断前，防止并发查询访问已删数据）；
+ *   6. 先截断 members，再截断 offsets；最后清除 delay 标志、结束临界区、释放锁。
+ * 先写 WAL、再更新内存、最后删除文件，保证崩溃后重放能恢复一致的截断状态。
  */
 void
 TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
@@ -2807,6 +3291,15 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
  * Offsetting the values is optional, because MultiXactIdPrecedes() has
  * translational symmetry.
  */
+/*
+ * 中文注释：
+ * offsets SLRU 的页优先级回调：判断 page1 是否在 page2 之前（考虑 32 位回绕）。
+ *
+ * 页号乘以每页条目数换算成 MultiXactId 区间，加上 FirstMultiXactId+1 的偏移后，
+ * 用 MultiXactIdPrecedes 比较区间起点；同时要求 page1 的起点也先于 page2 区间的
+ * 最后一个 ID，以避免两个页在回绕点附近部分重叠时误判。SimpleLruTruncate 用它
+ * 决定哪些段可以删除。
+ */
 static bool
 MultiXactOffsetPagePrecedes(int64 page1, int64 page2)
 {
@@ -2828,12 +3321,24 @@ MultiXactOffsetPagePrecedes(int64 page1, int64 page2)
  * purposes.  There is no "invalid offset number" and members never wrap
  * around, so use the numbers verbatim.
  */
+/*
+ * 中文注释：
+ * members SLRU 的页优先级回调。成员偏移是 64 位且从不回绕，因此直接按页号数值
+ * 比较即可，不需要 MultiXactId 的回绕逻辑。
+ */
 static bool
 MultiXactMemberPagePrecedes(int64 page1, int64 page2)
 {
 	return page1 < page2;
 }
 
+/*
+ * 中文注释：
+ * offsets SLRU 的 I/O 错误详情回调。
+ *
+ * opaque_data 指向出错时正在访问的 MultiXactId；返回 errdetail，告诉用户无法访问
+ * 哪个 MultiXact 的偏移。该回调由 SlruReportIOError 在构造错误消息时调用。
+ */
 static int
 MultiXactOffsetIoErrorDetail(const void *opaque_data)
 {
@@ -2842,6 +3347,14 @@ MultiXactOffsetIoErrorDetail(const void *opaque_data)
 	return errdetail("Could not access offset of multixact %u.", multixid);
 }
 
+/*
+ * 中文注释：
+ * members SLRU 的 I/O 错误详情回调。
+ *
+ * opaque_data 是 MultiXactMemberSlruReadContext，包含 MultiXactId 和成员偏移。
+ * 若 MultiXactId 有效，报告“无法访问某 MultiXact 在某偏移的成员”；否则只报告
+ * 偏移（例如启动修剪阶段还没有具体 MultiXact）。
+ */
 static int
 MultiXactMemberIoErrorDetail(const void *opaque_data)
 {
@@ -2861,6 +3374,13 @@ MultiXactMemberIoErrorDetail(const void *opaque_data)
  * XXX do we need to do something special for InvalidMultiXactId?
  * (Doesn't look like it.)
  */
+/*
+ * 中文注释：
+ * 判断两个 MultiXactId 的逻辑先后，正确处理 32 位回绕。
+ *
+ * 把差值转成有符号 32 位整数：若差值为负，说明 multi1 在 multi2 之前。该比较
+ * 假定两个 ID 相距小于 2^31；MultiXact 回卷保护保证活跃值不会跨越这个范围。
+ */
 bool
 MultiXactIdPrecedes(MultiXactId multi1, MultiXactId multi2)
 {
@@ -2874,6 +3394,11 @@ MultiXactIdPrecedes(MultiXactId multi1, MultiXactId multi2)
  *
  * XXX do we need to do something special for InvalidMultiXactId?
  * (Doesn't look like it.)
+ */
+/*
+ * 中文注释：
+ * 判断 multi1 是否逻辑上小于等于 multi2，使用与 MultiXactIdPrecedes 相同的
+ * 32 位有符号差值方法处理回绕。用于“只前进不后退”的边界检查。
  */
 bool
 MultiXactIdPrecedesOrEquals(MultiXactId multi1, MultiXactId multi2)
@@ -2889,6 +3414,15 @@ MultiXactIdPrecedesOrEquals(MultiXactId multi1, MultiXactId multi2)
  *
  * We must flush the xlog record to disk before returning --- see notes in
  * TruncateCLOG().
+ */
+/*
+ * 中文注释：
+ * 写一条 XLOG_MULTIXACT_TRUNCATE_ID 记录并立即 flush 到磁盘。
+ *
+ * 记录包含 oldestMultiDB、oldestMulti 和 oldestOffset，恢复端据此重放截断。
+ * 必须在删除任何 SLRU 段之前调用并完成 XLogFlush，否则崩溃后可能出现“文件已删、
+ * 但没有 WAL 证据”的不一致；这也是 MultiXact 模块少数严格遵循 WAL-before-data
+ * 的地方。调用者应处于临界区并已阻止检查点并发。
  */
 static void
 WriteMTruncateXlogRec(Oid oldestMultiDB,
@@ -2910,6 +3444,19 @@ WriteMTruncateXlogRec(Oid oldestMultiDB,
 
 /*
  * MULTIXACT resource manager's routines
+ */
+/*
+ * 中文注释：
+ * MultiXact 资源管理器的 redo 回调，按 WAL 记录子类型恢复 SLRU 状态。
+ *
+ * 支持四种记录：
+ *   - XLOG_MULTIXACT_ZERO_OFF_PAGE：清零指定 offsets 页；
+ *   - XLOG_MULTIXACT_ZERO_MEM_PAGE：清零指定 members 页；
+ *   - XLOG_MULTIXACT_CREATE_ID：把记录中的成员写回两个 SLRU，并推进
+ *     nextMXact/nextOffset，确保 nextXid 超过记录中出现的所有 XID；
+ *   - XLOG_MULTIXACT_TRUNCATE_ID：更新回卷下界并删除对应旧段。
+ * MultiXact 记录不使用 backup block，因此先断言没有 block reference。未知子类型
+ * 视为 WAL 损坏，直接 PANIC。
  */
 void
 multixact_redo(XLogReaderState *record)
@@ -2998,6 +3545,14 @@ multixact_redo(XLogReaderState *record)
 /*
  * Entrypoint for sync.c to sync offsets files.
  */
+/*
+ * 中文注释：
+ * offsets SLRU 提供给 sync.c 的同步入口。
+ *
+ * sync 机制只持有 FileTag 和输出路径缓冲区，不知道具体 SLRU 的目录/命名规则，
+ * 因此各 SLRU 提供薄包装，把正确的 SlruDesc 传给通用的 SlruSyncFileTag 完成
+ * 路径构造和 fsync。
+ */
 int
 multixactoffsetssyncfiletag(const FileTag *ftag, char *path)
 {
@@ -3006,6 +3561,11 @@ multixactoffsetssyncfiletag(const FileTag *ftag, char *path)
 
 /*
  * Entrypoint for sync.c to sync members files.
+ */
+/*
+ * 中文注释：
+ * members SLRU 提供给 sync.c 的同步入口，转发给 SlruSyncFileTag，并使用
+ * MultiXactMemberCtl 构造 pg_multixact/members 下的文件路径。
  */
 int
 multixactmemberssyncfiletag(const FileTag *ftag, char *path)
